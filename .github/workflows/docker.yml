@@ -41,3 +41,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          # GHCR 在推 attestation（provenance/sbom）时偶发 500，纯镜像推送更稳
+          provenance: false
+          sbom: false
