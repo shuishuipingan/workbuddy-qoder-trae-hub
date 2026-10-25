@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#12141a" />
+    <title>喵枢 · 三引擎合并网关</title>
+    <script>
+      // 首帧前定主题：避免"先白后黑"的闪烁（FOUC）。
+      (function () {
+        try {
+          var saved = localStorage.getItem("hub-theme");
+          var sys = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.setAttribute("data-theme", saved === "light" || saved === "dark" ? saved : sys);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

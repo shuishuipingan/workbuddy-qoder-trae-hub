@@ -1,0 +1,13 @@
+services:
+  hub:
+    image: ghcr.io/shuishuipingan/workbuddy-qoder-trae-hub:latest
+    build: .
+    container_name: wqt-hub
+    ports:
+      - "8817:8817"
+    volumes:
+      - ./data:/app/data
+    environment:
+      HUB_HOST: 0.0.0.0
+      HUB_PORT: "8817"
+    restart: unless-stopped

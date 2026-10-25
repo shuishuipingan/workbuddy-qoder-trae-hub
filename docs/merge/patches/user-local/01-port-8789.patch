@@ -1,0 +1,134 @@
+diff --git a/wb_proxy.py b/wb_proxy.py
+index c2511e6..0ad7688 100644
+--- a/wb_proxy.py
++++ b/wb_proxy.py
+@@ -8,5 +8,5 @@ login is needed. Exposes:
+     GET  /health
+ Only the Python standard library is required.
+-    python3 wb_proxy.py                    # bind 127.0.0.1:8788
++    python3 wb_proxy.py                    # bind 127.0.0.1:8789
+     python3 wb_proxy.py --port 9000
+     python3 wb_proxy.py --api-key sk-local # require a bearer token
+@@ -19050,5 +19050,5 @@ def _parse_cli_args():
+     ap.add_argument("--info", help="path to the WorkBuddy *.info credential file")
+     ap.add_argument("--host", default=os.environ.get("HOST") or "127.0.0.1")
+-    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT") or "8788"))
++    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT") or "8789"))
+     ap.add_argument("--lan", action="store_true",
+                     help="listen on every interface so other devices on the LAN can "
+warning: in the working copy of 'C:\Users\shuishui\Desktop\合并damo\wb\wb_proxy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:\Users\shuishui\Desktop\wb\wb_proxy.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/wb_agents.py b/wb_agents.py
+index e35c7df..f2e117d 100644
+--- a/wb_agents.py
++++ b/wb_agents.py
+@@ -14,5 +14,5 @@ gateway over the network:
+     python wb_agents.py list                    # what is installed here
+     python wb_agents.py apply --client codex \
+-        --base-url http://gateway:8788/v1 --key sk-...
++        --base-url http://gateway:8789/v1 --key sk-...
+     python wb_agents.py restore --client codex
+ 
+@@ -1230,5 +1230,5 @@ def main(argv=None):
+                          help="one of: " + ", ".join(sorted(CLIENTS)))
+     apply_p.add_argument("--base-url", required=True, dest="base_url",
+-                         help="gateway URL, e.g. http://gateway:8788/v1")
++                         help="gateway URL, e.g. http://gateway:8789/v1")
+     apply_p.add_argument("--key", default=None,
+                          help="gateway API key "
+warning: in the working copy of 'C:\Users\shuishui\Desktop\合并damo\wb\wb_agents.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:\Users\shuishui\Desktop\wb\wb_agents.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/README.md b/README.md
+index 5579685..0a42b25 100644
+--- a/README.md
++++ b/README.md
+@@ -32,7 +32,7 @@
+ ### 1. 本机运行
+ 
+-**Windows** 双击 **`start-wb-proxy.bat`**，保持窗口运行；**macOS** 双击 **`start-wb-proxy.command`**（首次被 Gatekeeper 拦截时右键 →「打开」确认一次），或在终端执行 `./start-wb-proxy.sh [端口]`（默认 8788）。
++**Windows** 双击 **`start-wb-proxy.bat`**，保持窗口运行；**macOS** 双击 **`start-wb-proxy.command`**（首次被 Gatekeeper 拦截时右键 →「打开」确认一次），或在终端执行 `./start-wb-proxy.sh [端口]`（默认 8789）。
+ 
+-启动后：**API 地址** `http://127.0.0.1:8788/v1`，**Web 看板** `http://127.0.0.1:8788/`。首次启动还没有账号，打开看板点「+ 添加账号 (OAuth)」完成授权即自动入库。
++启动后：**API 地址** `http://127.0.0.1:8789/v1`，**Web 看板** `http://127.0.0.1:8789/`。首次启动还没有账号，打开看板点「+ 添加账号 (OAuth)」完成授权即自动入库。
+ 
+ > 绿色包自带的精简 Python 运行时只覆盖 Windows；macOS / Linux 直接使用系统 Python，需要 **3.9+**（启动脚本找不到内置运行时会明确打印所用的解释器与版本）。Docker 部署自带基础镜像，不受影响。
+@@ -44,10 +44,10 @@
+ 看板需要**面板访问密码**（默认 `admin`），它与 API Key 相互独立：密码只用于打开看板，可在「设置」页修改（或启动时 `--panel-password` 指定），以 PBKDF2-SHA256 摘要存于 `accounts/settings.json`（不存明文），登录态只留在浏览器会话里。
+ 
+-本机 / 受信局域网自用可带 `?pwd=面板密码` 免手输直接进面板（如 `http://127.0.0.1:8788/?pwd=admin`）；公网暴露时不要用——密码会留在浏览器历史与反向代理日志里。注意它和局域网共享的 `?key=` 不同：`?key=` 只把 API Key 存给 `/v1` 用，不会自动登录面板。**首次登录后请立即改掉默认密码。**
++本机 / 受信局域网自用可带 `?pwd=面板密码` 免手输直接进面板（如 `http://127.0.0.1:8789/?pwd=admin`）；公网暴露时不要用——密码会留在浏览器历史与反向代理日志里。注意它和局域网共享的 `?key=` 不同：`?key=` 只把 API Key 存给 `/v1` 用，不会自动登录面板。**首次登录后请立即改掉默认密码。**
+ 
+ ### 3. 局域网共享
+ 
+ - **Windows** 双击 `start-wb-proxy-lan.bat`；**macOS** 双击 `start-wb-proxy-lan.command`，或 `./start-wb-proxy-lan.sh [端口] [Key]`；
+-- **Base URL** `http://<本机局域网IP>:8788/v1`；带密钥直达面板 `http://<IP>:8788/?key=生成的Key`；
++- **Base URL** `http://<本机局域网IP>:8789/v1`；带密钥直达面板 `http://<IP>:8789/?key=生成的Key`；
+ - **API Key**：首次启动生成高强度随机 Key，写入 `accounts/settings.json` 并打印在终端，重启复用；也可用第二个参数指定自己的 Key；
+ - **macOS 防火墙**：首次监听端口时选「允许」；macOS 15+ 还要在「系统设置 → 隐私与安全性 → 本地网络」允许终端，`./allow-firewall.command` 可查看状态并加白。
+@@ -91,8 +91,8 @@ services:
+     restart: unless-stopped
+     ports:
+-      - "8788:8788"          # 左侧宿主端口可自选；右侧必须与下面的 PORT 一致
++      - "8789:8789"          # 左侧宿主端口可自选；右侧必须与下面的 PORT 一致
+     environment:
+       - HOST=0.0.0.0
+-      - PORT=8788
++      - PORT=8789
+       # - API_KEY=your_secret_key   # 留空则自动生成并打印在启动日志
+       - TZ=Asia/Shanghai
+@@ -117,5 +117,5 @@ docker run -d --name wb-proxy-watchtower --restart unless-stopped \
+ - **docker run 快捷启动**：
+   ```bash
+-  docker run -d --name wb-proxy --restart unless-stopped -p 8788:8788 \
++  docker run -d --name wb-proxy --restart unless-stopped -p 8789:8789 \
+     -v $(pwd)/accounts:/app/accounts -v $(pwd)/usage:/app/usage \
+     ghcr.io/ardeyouxipianyi/workbuddy2api-hub:latest
+@@ -237,9 +237,9 @@ Codex App 这类客户端会在 Responses 请求里声明 `web_search` / `web_fe
+ ```bash
+ # 1. 取配置器（网关直接提供该文件；也可从仓库 / 绿色包复制 wb_agents.py）
+-curl -fsSL http://<网关地址>:8788/agents/cli -o wb_agents.py
++curl -fsSL http://<网关地址>:8789/agents/cli -o wb_agents.py
+ 
+ # 2. 一条命令接入（需要 Python 3.9+，Key 在「设置」页生成）
+ python wb_agents.py list                                   # 本机装了哪些客户端
+-python wb_agents.py apply --client codex --base-url http://<网关地址>:8788/v1 --key sk-xxxx
++python wb_agents.py apply --client codex --base-url http://<网关地址>:8789/v1 --key sk-xxxx
+ python wb_agents.py restore --client codex                 # 随时字节级还原
+ ```
+@@ -275,5 +275,5 @@ python wb_agents.py restore --client codex                 # 随时字节级还
+ ## 三、账号添加与管理
+ 
+-打开看板 `http://127.0.0.1:8788/`，在「账号」区域操作。若上游对某账号的单个模型返回 429，账号行会显示受限模型与预计恢复时间（浏览器本地时间），该账号仍可用于其他模型；模型冷却只在当前进程内保留，重启清空。
++打开看板 `http://127.0.0.1:8789/`，在「账号」区域操作。若上游对某账号的单个模型返回 429，账号行会显示受限模型与预计恢复时间（浏览器本地时间），该账号仍可用于其他模型；模型冷却只在当前进程内保留，重启清空。
+ 
+ ### 方式一：浏览器 OAuth 授权（推荐，免客户端）
+@@ -299,5 +299,5 @@ python wb_agents.py restore --client codex                 # 随时字节级还
+ ## 四、客户端配置与接入
+ 
+-- **API 接口地址 (Base URL)**：`http://127.0.0.1:8788/v1`（局域网为 `http://<局域网IP>:8788/v1`）
++- **API 接口地址 (Base URL)**：`http://127.0.0.1:8789/v1`（局域网为 `http://<局域网IP>:8789/v1`）
+ - **API Key**：本机单机模式（未配置 Key 且未开 LAN）可留空或填任意字符；已在看板配置 Key 或 LAN 模式，请用看板「设置」页里绑好出口的 Key；
+ - **模型名称**：填 `/v1/models` 里列出的任意官方对齐模型 ID（如 `deepseek-v4.1-flash`、`gpt-6-astra`、`glm-5.3`）。
+@@ -306,5 +306,5 @@ python wb_agents.py restore --client codex                 # 随时字节级还
+ 
+ ```bash
+-export OPENAI_BASE_URL="http://127.0.0.1:8788/v1"
++export OPENAI_BASE_URL="http://127.0.0.1:8789/v1"
+ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
+ ```
+@@ -313,5 +313,5 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
+ 
+ ```bash
+-export ANTHROPIC_BASE_URL="http://127.0.0.1:8788"
++export ANTHROPIC_BASE_URL="http://127.0.0.1:8789"
+ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
+ ```
+@@ -325,5 +325,5 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
+ ## 五、看板与接口一览
+ 
+-访问 `http://127.0.0.1:8788/` 使用集成看板：顶部页签默认是「网关与账号 / 数据看板 / 智能体配置 / 设置 / 运行日志」，每个主页面左侧有一条按页面区块现场生成的导航（点击直达、滚动高亮、地址栏带锚点，可收起成窄轨）。
++访问 `http://127.0.0.1:8789/` 使用集成看板：顶部页签默认是「网关与账号 / 数据看板 / 智能体配置 / 设置 / 运行日志」，每个主页面左侧有一条按页面区块现场生成的导航（点击直达、滚动高亮、地址栏带锚点，可收起成窄轨）。
+ 
+ 账号多起来之后（国际版十几个），账号列表与「当前禁用」总览会把网关页挤下去。设置页的「账号独立成一个页签」默认关闭，账号区就留在「网关与账号」页（位置与拆分前一致）；打开后它们和签到记录一起成为独立的「账号」页：添加 / 导入 / 导出、启用停用、凭证与积分刷新、代理出口绑定都在那里，顶部页签变成「网关 / 账号 / 数据看板 / 智能体配置 / 设置 / 运行日志」。页内的「签到与活跃记录」读 `GET /activity/history`，可按**区间 / 任务 / 结果 / 账号**筛选（筛选在服务端做），一行一次真实尝试，列出 时间 · 账号 · 区域 · 任务 · 来源 · 结果 · 说明，最新在前；超过一页时用「加载更多」往下翻，上限 1000 行——「这个账号昨天到底签成了没有」不用再去调度器日志里翻。
+warning: in the working copy of 'C:\Users\shuishui\Desktop\合并damo\wb\README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:\Users\shuishui\Desktop\wb\README.md', LF will be replaced by CRLF the next time Git touches it

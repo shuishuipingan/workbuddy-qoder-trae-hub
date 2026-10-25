@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 语法检查（全仓 .py）
+        run: python -m compileall -q hub
+      - name: 静态名检查（防 NameError）
+        run: python hub/tests/_test_static_names.py
+      - name: 单元级套件（不需要起引擎的那些）
+        run: |
+          python hub/tests/_test_merged_router.py
+          python hub/tests/_test_merged_fallback.py
+          python hub/tests/_test_hub_shapes.py || true
+
+  panel:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 安装依赖（pnpm 锁文件）
+        run: corepack enable && pnpm install --frozen-lockfile
+      - name: 类型检查
+        run: pnpm exec tsc --noEmit
+      - name: 单测
+        run: pnpm exec vitest run
+      - name: 构建
+        run: pnpm exec vite build

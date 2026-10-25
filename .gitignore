@@ -1,0 +1,38 @@
+# ── 运行时数据（绝不入库）──────────────────────────────
+accounts/
+usage/
+logs/
+state/
+data/
+*.log
+usage.jsonl
+usage-summary.json
+hub/settings.json
+hub/route-settings.json
+hub/engines/*/accounts/
+hub/engines/*/usage/
+hub/engines/*/accounts/settings.json
+
+# ── 构建产物 ─────────────────────────────────────────
+node_modules/
+.pnpm-store/
+admin/app/dist/
+admin/static/*.map
+
+# ── 依赖/缓存 ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ── 本地与备份 ──────────────────────────────────────
+_backup_*/
+.bug-data/
+.shots/
+.env
+.env.*
+*.local
+.DS_Store
+Thumbs.db

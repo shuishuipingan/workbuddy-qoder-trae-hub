@@ -1,0 +1,204 @@
+"""Smart realm routing: cn-first, fallback on exhausted pools, explicit wins.
+
+One key now covers both exits by default: an unbound request prefers the
+configured realm (default cn), and when that realm has no usable account
+(quota / breaker / cooldown / daily limits all count) the other realm is
+tried. Explicit realms (?realm= / key binding / X-Realm) are honored and
+only fall back when the bound realm's pool is genuinely empty. Exclusive
+models never cross realms.
+
+No network: pools and settings are stubbed, open_upstream is mocked.
+"""
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_TMP = tempfile.mkdtemp(prefix="wb-auto-realm-")
+os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
+os.environ["WB_PROXY_USAGE_DIR"] = _TMP
+os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
+
+import wb_proxy as P
+import wb_settings
+
+
+class StubPool(object):
+    """count_ready(realm, model) 可按 (realm, model) 精确编程的假池。"""
+
+    def __init__(self):
+        self.counts = {}
+
+    def set(self, realm, model, count):
+        self.counts[(realm, model)] = count
+
+    def count_ready(self, realm=None, model=None):
+        return self.counts.get((realm, model), 0)
+
+
+class RealmCandidatesTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_pool = P.POOL
+        self._saved_auto = P.AUTO_REALM_ENABLED
+        self._saved_current = P.CURRENT_REALM
+        P.POOL = StubPool()
+        P.AUTO_REALM_ENABLED = True
+        P.CURRENT_REALM = "cn"
+        patcher = mock.patch.object(wb_settings, "realm_routing",
+                                    return_value={"enabled": True, "prefer": "cn"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        P.POOL = self._saved_pool
+        P.AUTO_REALM_ENABLED = self._saved_auto
+        P.CURRENT_REALM = self._saved_current
+
+    def test_exclusive_intl_model_only_tries_intl(self):
+        self.assertEqual(P.realm_candidates("gpt-5.5"), ["intl"])
+        self.assertEqual(P.realm_candidates("gpt-5.4"), ["intl"])
+
+    def test_exclusive_cn_model_only_tries_cn(self):
+        self.assertEqual(P.realm_candidates("deepseek-v4-pro"), ["cn"])
+
+    def test_exclusive_wins_even_with_explicit_other(self):
+        # 显式指定了错误出口：候选表只含显式区，由 handler 的 _cross_realm_error 400
+        self.assertEqual(P.realm_candidates("deepseek-v4-pro", requested="intl"),
+                         ["intl"])
+        self.assertEqual(P.realm_candidates("gpt-5.5", requested="cn"), ["cn"])
+
+    def test_auto_prefers_cn_when_cn_has_accounts(self):
+        P.POOL.set("cn", "glm-5.3-flash", 3)
+        P.POOL.set("intl", "glm-5.3-flash", 1)
+        self.assertEqual(P.realm_candidates("glm-5.3-flash"), ["cn", "intl"])
+
+    def test_auto_flips_when_cn_pool_empty(self):
+        P.POOL.set("cn", "glm-5.3-flash", 0)
+        P.POOL.set("intl", "glm-5.3-flash", 2)
+        self.assertEqual(P.realm_candidates("glm-5.3-flash"), ["intl", "cn"])
+
+    def test_auto_keeps_cn_first_when_both_empty(self):
+        self.assertEqual(P.realm_candidates("glm-5.3-flash"), ["cn", "intl"])
+
+    def test_auto_disabled_single_candidate(self):
+        with mock.patch.object(wb_settings, "realm_routing",
+                               return_value={"enabled": False, "prefer": "cn"}):
+            self.assertEqual(P.realm_candidates("glm-5.3-flash"), ["cn"])
+        P.AUTO_REALM_ENABLED = False
+        self.assertEqual(P.realm_candidates("glm-5.3-flash"), ["cn"])
+
+    def test_explicit_realm_allows_fallback(self):
+        self.assertEqual(P.realm_candidates("glm-5.3-flash", requested="cn"),
+                         ["cn", "intl"])
+        self.assertEqual(P.realm_candidates("glm-5.3-flash", requested="intl"),
+                         ["intl", "cn"])
+
+    def test_explicit_bogus_realm_no_fallback(self):
+        self.assertEqual(P.realm_candidates("glm-5.3-flash", requested="mars"),
+                         ["mars"])
+
+    def test_prefer_intl_config(self):
+        with mock.patch.object(wb_settings, "realm_routing",
+                               return_value={"enabled": True, "prefer": "intl"}):
+            P.POOL.set("intl", "glm-5.3-flash", 1)
+            self.assertEqual(P.realm_candidates("glm-5.3-flash"),
+                             ["intl", "cn"])
+
+
+class OpenUpstreamAutoTests(unittest.TestCase):
+    def test_fallback_on_empty_pool(self):
+        holder = type("H", (), {})()
+        payload = {"model": "glm-5.3-flash"}
+        outcomes = {"cn": RuntimeError("no usable account for realm 'cn'")}
+
+        def fake_open(payload, session_key=None, target_realm=None,
+                      prebuilt_body=None):
+            if target_realm in outcomes:
+                raise outcomes[target_realm]
+            return ("up-%s" % target_realm, "acct-%s" % target_realm, None)
+
+        with mock.patch.object(P, "open_upstream", side_effect=fake_open):
+            up, acct, effort = P.Handler._open_upstream_auto(
+                holder, payload, ["cn", "intl"], model="glm-5.3-flash")
+        self.assertEqual(up, "up-intl")
+        self.assertEqual(acct, "acct-intl")
+        self.assertEqual(holder.realm_used, "intl")
+        self.assertEqual(holder.realm_reason, "no_account")
+
+    def test_fallback_on_rate_limited(self):
+        holder = type("H", (), {})()
+        payload = {"model": "glm-5.3-flash"}
+        outcomes = {"cn": P.RateLimited(None, "daily limit")}
+
+        def fake_open(payload, session_key=None, target_realm=None,
+                      prebuilt_body=None):
+            if target_realm in outcomes:
+                raise outcomes[target_realm]
+            return ("up-%s" % target_realm, "acct-%s" % target_realm, None)
+
+        with mock.patch.object(P, "open_upstream", side_effect=fake_open):
+            up, acct, _ = P.Handler._open_upstream_auto(
+                holder, payload, ["cn", "intl"], model="glm-5.3-flash")
+        self.assertEqual(up, "up-intl")
+        self.assertEqual(holder.realm_reason, "no_account")
+
+    def test_first_candidate_sets_no_reason(self):
+        holder = type("H", (), {})()
+        with mock.patch.object(P, "open_upstream",
+                               return_value=("up-cn", "acct-cn", None)):
+            P.Handler._open_upstream_auto(holder, {"model": "m"},
+                                          ["cn", "intl"], model="m")
+        self.assertEqual(holder.realm_used, "cn")
+        self.assertEqual(holder.realm_reason, "")
+
+    def test_other_errors_do_not_fallback(self):
+        holder = type("H", (), {})()
+        boom = P.ContentRejected("content rejected")
+        with mock.patch.object(P, "open_upstream", side_effect=boom):
+            with self.assertRaises(P.ContentRejected):
+                P.Handler._open_upstream_auto(holder, {"model": "m"},
+                                              ["cn", "intl"], model="m")
+
+    def test_all_failures_reraises_first(self):
+        holder = type("H", (), {})()
+        first = RuntimeError("no usable account for realm 'cn'")
+        with mock.patch.object(
+                P, "open_upstream",
+                side_effect=[first, P.RateLimited(None, "intl too")]):
+            with self.assertRaises(RuntimeError) as ctx:
+                P.Handler._open_upstream_auto(holder, {"model": "m"},
+                                              ["cn", "intl"], model="m")
+        self.assertIs(ctx.exception, first)
+
+
+class RealmSettingsTests(unittest.TestCase):
+    def test_roundtrip(self):
+        d = os.environ["ACCOUNTS_DIR"]
+        wb_settings.set_realm_routing(d, {"enabled": False, "prefer": "intl"})
+        self.assertEqual(wb_settings.realm_routing(d),
+                         {"enabled": False, "prefer": "intl"})
+        wb_settings.set_realm_routing(d, {"enabled": True, "prefer": "cn"})
+        self.assertEqual(wb_settings.realm_routing(d),
+                         {"enabled": True, "prefer": "cn"})
+
+    def test_defaults_when_absent(self):
+        d = os.environ["ACCOUNTS_DIR"]
+        wb_settings.set_realm_routing(d, {"enabled": True, "prefer": "cn"})
+        data = wb_settings.load(d)
+        data.pop("realm_routing", None)
+        wb_settings.save(d, data)
+        self.assertEqual(wb_settings.realm_routing(d),
+                         {"enabled": True, "prefer": "cn"})
+
+    def test_bad_values_rejected(self):
+        d = os.environ["ACCOUNTS_DIR"]
+        with self.assertRaises(ValueError):
+            wb_settings.set_realm_routing(d, {"prefer": "mars"})
+        with self.assertRaises(ValueError):
+            wb_settings.set_realm_routing(d, "cn")
+
+
+if __name__ == "__main__":
+    unittest.main()

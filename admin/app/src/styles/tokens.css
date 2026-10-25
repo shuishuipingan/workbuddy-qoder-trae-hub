@@ -1,0 +1,410 @@
+@import "tailwindcss";
+
+/* ==================================================================
+ * 设计令牌 —— 参照 Linear / Vercel / Stripe 的产品界面语言：
+ *   · 暗色是「近黑冷调」而不是中灰，靠层次而不是描边区分块面
+ *   · 强调色只给主操作与当前项，其余用中性灰阶
+ *   · 圆角克制（6/8/12），字号基准 13px，行高 1.5，信息密度优先
+ *   · 组件里零硬编码颜色，一律走这些变量
+ * ================================================================== */
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* 暖炭灰：与浅色纸质调同源，避免"性冷淡灰" */
+  --canvas: oklch(17.6% 0.008 75);
+  --surface: oklch(21.2% 0.009 75);
+  --surface-2: oklch(25.2% 0.011 75);
+  --overlay: oklch(28.4% 0.012 75);
+
+  --fg: oklch(94% 0.006 80);
+  --fg-dim: oklch(76% 0.008 80);
+  --fg-mute: oklch(62% 0.01 80);
+  --fg-invert: oklch(18% 0.01 75);
+
+  --line-faint: oklch(27.5% 0.009 75);
+  --line: oklch(33% 0.011 75);
+  --line-strong: oklch(44% 0.013 75);
+
+  /* 赭红 #a14427 在暗底提亮；橄榄绿与雾紫作次级强调 */
+  --accent: oklch(64% 0.135 38);
+  --accent-2: oklch(64% 0.09 140);
+  --accent-3: oklch(66% 0.07 312);
+  --accent-fg: oklch(99% 0.004 80);
+  --accent-soft: oklch(64% 0.135 38 / 0.16);
+  --accent-2-soft: oklch(64% 0.09 140 / 0.16);
+  --accent-3-soft: oklch(66% 0.07 312 / 0.16);
+
+  /* 三家引擎的识别色（暗色下统一提亮，保证小尺寸图形也认得出来） */
+  --brand-wb: oklch(66% 0.13 250);
+  --brand-qd: oklch(70% 0.11 190);
+  --brand-trae: oklch(72% 0.14 45);
+
+  --ok: oklch(72% 0.1 145);
+  --ok-soft: oklch(72% 0.1 145 / 0.15);
+  --warn: oklch(78% 0.12 75);
+  --warn-soft: oklch(78% 0.12 75 / 0.15);
+  --err: oklch(70% 0.15 30);
+  --err-soft: oklch(70% 0.15 30 / 0.15);
+  --info: oklch(72% 0.07 240);
+  --info-soft: oklch(72% 0.07 240 / 0.15);
+
+  --danger-bg: oklch(54% 0.16 30);
+  --danger-fg: oklch(99% 0.004 80);
+  --danger-bg-hover: oklch(58% 0.16 30);
+
+  --shadow-1: 0 1px 1px oklch(0% 0 0 / 0.3);
+  --shadow-2: 0 10px 28px -14px oklch(0% 0 0 / 0.72), 0 2px 6px -3px oklch(0% 0 0 / 0.5);
+  --shadow-3: 0 28px 64px -24px oklch(0% 0 0 / 0.86), 0 10px 22px -12px oklch(0% 0 0 / 0.6);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* 纸质暖调（取自 wb 看板：#efebe0 / #ffffff / #a14427） */
+  --canvas: oklch(93.8% 0.012 85);
+  --surface: oklch(100% 0 0);
+  --surface-2: oklch(91.8% 0.014 85);
+  --overlay: oklch(100% 0 0);
+
+  --fg: oklch(24% 0.008 80);
+  --fg-dim: oklch(46% 0.01 80);
+  --fg-mute: oklch(58% 0.012 80);
+  --fg-invert: oklch(99% 0.004 80);
+
+  --line-faint: oklch(89.5% 0.014 85);
+  --line: oklch(85% 0.016 85);
+  --line-strong: oklch(79% 0.018 85);
+
+  --accent: oklch(47% 0.14 35);
+  --accent-2: oklch(47% 0.09 140);
+  --accent-3: oklch(48% 0.06 312);
+  --accent-fg: oklch(100% 0 0);
+  --accent-soft: oklch(47% 0.14 35 / 0.1);
+  --accent-2-soft: oklch(47% 0.09 140 / 0.1);
+  --accent-3-soft: oklch(48% 0.06 312 / 0.1);
+
+  --brand-wb: oklch(55% 0.14 250);
+  --brand-qd: oklch(56% 0.11 190);
+  --brand-trae: oklch(60% 0.15 45);
+  --ok: oklch(47% 0.09 140);
+  --ok-soft: oklch(47% 0.09 140 / 0.12);
+  --warn: oklch(53% 0.11 70);
+  --warn-soft: oklch(53% 0.11 70 / 0.14);
+  --err: oklch(50% 0.15 30);
+  --err-soft: oklch(50% 0.15 30 / 0.1);
+  --info: oklch(46% 0.08 240);
+  --info-soft: oklch(46% 0.08 240 / 0.1);
+
+  --danger-bg: oklch(50% 0.15 30);
+  --danger-fg: oklch(100% 0 0);
+  --danger-bg-hover: oklch(46% 0.15 30);
+
+  --shadow-1: 0 1px 2px oklch(30% 0.02 80 / 0.06);
+  --shadow-2: 0 8px 24px -12px oklch(30% 0.02 80 / 0.18), 0 2px 6px -3px oklch(30% 0.02 80 / 0.08);
+  --shadow-3: 0 24px 56px -20px oklch(30% 0.02 80 / 0.24), 0 8px 18px -10px oklch(30% 0.02 80 / 0.1);
+}
+
+:root {
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+
+  --dur-fast: 110ms;
+  --dur-base: 170ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.3, 1.15);
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-overlay: var(--overlay);
+  --color-fg: var(--fg);
+  --color-fg-dim: var(--fg-dim);
+  --color-fg-mute: var(--fg-mute);
+  --color-fg-invert: var(--fg-invert);
+  --color-line-faint: var(--line-faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-brand-wb: var(--brand-wb);
+  --color-brand-qd: var(--brand-qd);
+  --color-brand-trae: var(--brand-trae);
+  --color-accent-3: var(--accent-3);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-2-soft: var(--accent-2-soft);
+  --color-accent-3-soft: var(--accent-3-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-err: var(--err);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-fg: var(--danger-fg);
+  --color-danger-bg-hover: var(--danger-bg-hover);
+  --color-err-soft: var(--err-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --radius-xs: var(--r-xs);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+  --shadow-1: var(--shadow-1);
+  --shadow-2: var(--shadow-2);
+  --shadow-3: var(--shadow-3);
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Consolas, monospace;
+}
+
+@layer base {
+  html {
+    background: var(--canvas);
+  }
+
+  body {
+    text-autospace: normal;
+    margin: 0;
+    background: var(--canvas);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* 焦点环：全局统一，绝不用 outline:none 抹掉 */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--r-sm);
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--fg);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-thumb {
+    background: color-mix(in oklab, var(--line-strong) 70%, transparent);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklab, var(--line-strong) 95%, transparent);
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-track { background: transparent; }
+
+  .tnum, table, [data-num] {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  .mix-space {
+    text-autospace: ideograph-alpha ideograph-numeric;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (hover: hover) {
+  .hover-lift:hover { transform: translateY(-1px); }
+}
+
+@keyframes hub-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes hub-fade-out { from { opacity: 1 } to { opacity: 0 } }
+@keyframes hub-pop-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98) }
+  to { opacity: 1; transform: translateY(0) scale(1) }
+}
+@keyframes hub-pop-out {
+  from { opacity: 1; transform: translateY(0) scale(1) }
+  to { opacity: 0; transform: translateY(6px) scale(0.985) }
+}
+
+.hub-overlay[data-state="open"] { animation: hub-fade-in var(--dur-base) var(--ease-out) both; }
+.hub-overlay[data-state="closed"] { animation: hub-fade-out 140ms ease-in both; }
+.hub-content[data-state="open"] { animation: hub-pop-in var(--dur-base) var(--ease-spring) both; }
+.hub-content[data-state="closed"] { animation: hub-pop-out 140ms ease-in both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hub-overlay, .hub-content { animation: none !important; }
+}
+
+@keyframes hub-route-in { from { opacity: 0; transform: translateY(4px) } to { opacity: 1; transform: none } }
+.hub-route { animation: hub-route-in 160ms var(--ease-out) both; }
+@media (prefers-reduced-motion: reduce) { .hub-route { animation: none !important; } }
+
+/* 触屏命中区 ≥ 44×44（桌面鼠标用紧凑尺寸，手指才放大） */
+@media (pointer: coarse) {
+  button, [role="tab"], a[href], input, select { min-height: 44px; }
+}
+
+[role="switch"] { position: relative; }
+[role="switch"]::after {
+  content: "";
+  position: absolute;
+  inset: -10px 0;
+}
+
+.link-underline {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  background-size: 0 1px;
+  transition: background-size 180ms var(--ease-out);
+}
+@media (hover: hover) {
+  .link-underline:hover { background-size: 100% 1px; }
+}
+.link-underline:focus-visible { background-size: 100% 1px; }
+
+/* ---------------------------------------------------------------
+ * 悬浮胶囊 / 贴边按钮 / 图标微交互
+ * 统一用 --ease-out 与 --ease-spring：进出场用前者，按下回弹用后者。
+ * --------------------------------------------------------------- */
+@keyframes hub-pill-in {
+  from { opacity: 0; transform: translate(-8px, -4px) scale(0.985) }
+  to { opacity: 1; transform: none }
+}
+/* 贴顶锚定：浮动面板要"挂"在左上，垂直居中会让它在长页面里像飘着的组件 */
+.nav-pill { top: 12px; animation: hub-pill-in 200ms var(--ease-out) both; }
+
+@keyframes hub-fab-in {
+  from { opacity: 0; transform: scale(0.86) }
+  to { opacity: 1; transform: scale(1) }
+}
+.fab {
+  top: 12px;
+  animation: hub-fab-in 220ms var(--ease-spring) both;
+  transition: transform 200ms var(--ease-spring), box-shadow 200ms var(--ease-out), background-color 160ms;
+}
+@media (hover: hover) {
+  .fab:hover { transform: scale(1.07); box-shadow: var(--shadow-3); }
+}
+.fab:active { transform: scale(0.94); }
+
+.logo-bob { transition: transform 280ms var(--ease-spring); }
+@media (hover: hover) {
+  .logo-bob:hover { transform: rotate(-7deg) scale(1.07); }
+}
+
+.icon-btn svg { transition: transform 200ms var(--ease-spring); }
+.icon-btn { transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out), transform 140ms var(--ease-out); }
+@media (hover: hover) {
+  .icon-btn:hover { background: var(--surface-2); color: var(--fg); transform: scale(1.1); box-shadow: var(--shadow-1); }
+.icon-btn:hover svg { transform: scale(1.12) rotate(-6deg); }
+}
+.icon-btn:active { transform: scale(0.9); }
+
+/* 导航项：图标轻微放大 + 文字右移 1px，悬停有"活"的感觉 */
+.nav-link svg { transition: transform 180ms var(--ease-spring), color 140ms; }
+@media (hover: hover) {
+  .nav-link:hover svg { transform: scale(1.12); }
+}
+.nav-link:active { transform: scale(0.985); }
+.nav-link { transition: background-color 130ms var(--ease-out), color 130ms var(--ease-out), transform 130ms var(--ease-out); }
+
+/* 卡片：可点的卡片才有抬升，纯展示卡片不动 */
+.card-lift { transition: transform 180ms var(--ease-out), box-shadow 180ms var(--ease-out), border-color 180ms; }
+@media (hover: hover) {
+  .card-lift:hover { transform: translateY(-1px); box-shadow: var(--shadow-2); border-color: var(--line); }
+}
+
+/* 胶囊内滚动区：滚动条更细，别撑破圆角 */
+.nav-scroll { scrollbar-width: thin; }
+.nav-scroll::-webkit-scrollbar { width: 6px; }
+
+/* 表格行右侧的操作按钮组：静止时略淡，行悬停时整体变清晰并轻微右移 --
+   这是"右边部分划过去没有反应"的直接修复。 */
+.row-actions { transition: opacity 160ms var(--ease-out), transform 160ms var(--ease-out); opacity: 0.86; }
+@media (hover: hover) {
+  .row-actions:hover { opacity: 1; transform: none; }
+  tr:hover .row-actions { opacity: 1; transform: translateX(-2px); }
+  .row-actions .icon-btn:hover { transform: scale(1.12); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .row-actions, .icon-btn, .icon-btn svg { transition: none !important; }
+}
+
+/* ── 统一交互层（第 32 轮）─────────────────────────────────────────
+   用户反馈「图标划过去没有交互」「右边一片没有反应」。此前位移用的是
+   Tailwind 的 translate 属性（不是 transform），视觉上几乎看不出来。
+   这里给行内操作、分段按钮、开关统一加上可感知的缩放与图标放大。 */
+.row-actions button { transition: transform 150ms var(--ease-spring), background-color 140ms var(--ease-out), color 140ms var(--ease-out); }
+.row-actions button svg { transition: transform 200ms var(--ease-spring); }
+@media (hover: hover) {
+  .row-actions button:hover { transform: scale(1.1); }
+  .row-actions button:hover svg { transform: scale(1.18); }
+  .row-actions button:active { transform: scale(0.94); }
+}
+/* 分段控件 / 页签 / 表格头里的可点按钮 */
+@media (hover: hover) {
+  [role="tab"]:hover, .seg-btn:hover { transform: translateY(-1px); }
+}
+[role="tab"], .seg-btn { transition: transform 150ms var(--ease-out), background-color 140ms var(--ease-out), color 140ms var(--ease-out); }
+@media (prefers-reduced-motion: reduce) {
+  .row-actions button, .row-actions button svg, [role="tab"], .seg-btn, .card-lift { transition: none !important; transform: none !important; }
+}
+
+/* ── 数据页入场：卡片错峰上浮（只在允许动效时启用） ───────────── */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .metrics-page > * { animation: rise 280ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+  .metrics-page > *:nth-child(1) { animation-delay: 0ms; }
+  .metrics-page > *:nth-child(2) { animation-delay: 40ms; }
+  .metrics-page > *:nth-child(3) { animation-delay: 80ms; }
+  .metrics-page > *:nth-child(4) { animation-delay: 120ms; }
+  .metrics-page > *:nth-child(5) { animation-delay: 160ms; }
+  .metrics-page > *:nth-child(6) { animation-delay: 200ms; }
+}
+
+/* ── 图表动效 ──────────────────────────────────────────────── */
+@keyframes chart-draw {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+@keyframes chart-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes bar-grow {
+  from { width: 0 !important; }
+}
+@keyframes donut-draw {
+  from { stroke-dasharray: 0 9999; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .chart-line { stroke-dasharray: 1; animation: chart-draw 720ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+  .chart-fade { animation: chart-fade 520ms ease-out both; }
+  .chart-dot { animation: chart-fade 160ms ease-out both; }
+  .bar-grow { animation: bar-grow 520ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+  .donut-arc { animation: donut-draw 640ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+}

@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+admin/app/node_modules
+admin/app/dist
+__pycache__
+*.pyc
+accounts
+usage
+logs
+state
+data
+_backup_*
+.bug-data
+.shots

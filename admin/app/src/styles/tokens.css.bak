@@ -1,0 +1,316 @@
+@import "tailwindcss";
+
+/* 主题变体：本项目用 data-theme 切换，而不是 Tailwind 默认的 .dark 类 */
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ------------------------------------------------------------------
+ * 语义令牌（暗色为默认）
+ * 数值移植自 admin/css/tokens.css，保持既有视觉基线不漂移。
+ * 规则：组件里零硬编码颜色，一律走这些变量。
+ * ------------------------------------------------------------------ */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --canvas: oklch(14.5% 0.008 265);
+  --surface: oklch(18.5% 0.01 265);
+  --surface-2: oklch(23% 0.012 265);
+  --overlay: oklch(25.5% 0.014 265);
+
+  --fg: oklch(96% 0.006 265);
+  --fg-dim: oklch(75% 0.01 265);
+  --fg-mute: oklch(63% 0.012 265);
+  --fg-invert: oklch(18% 0.03 265);
+
+  --line-faint: oklch(26% 0.012 265);
+  --line: oklch(32% 0.014 265);
+  --line-strong: oklch(42% 0.016 265);
+
+  --accent: oklch(70% 0.16 265);
+  --accent-2: oklch(74% 0.13 195);
+  --accent-3: oklch(76% 0.15 62);
+  --accent-fg: oklch(18% 0.03 265);
+  --accent-soft: oklch(70% 0.16 265 / 0.13);
+  --accent-2-soft: oklch(74% 0.13 195 / 0.13);
+  --accent-3-soft: oklch(76% 0.15 62 / 0.13);
+
+  --ok: oklch(76% 0.14 158);
+  --ok-soft: oklch(76% 0.14 158 / 0.13);
+  --warn: oklch(80% 0.13 75);
+  --warn-soft: oklch(80% 0.13 75 / 0.13);
+  --err: oklch(71% 0.16 19);
+  /* 危险按钮专用：浅红底 + 白字对比度不够，单独给一对 */
+  --danger-bg: oklch(56% 0.2 22);
+  --danger-fg: oklch(99% 0.004 265);
+  --danger-bg-hover: oklch(60% 0.2 22);
+  --err-soft: oklch(71% 0.16 19 / 0.13);
+  --info: oklch(77% 0.1 232);
+  --info-soft: oklch(77% 0.1 232 / 0.13);
+
+  --shadow-1: 0 1px 2px oklch(0% 0 0 / 0.4);
+  --shadow-2: 0 8px 20px -10px oklch(0% 0 0 / 0.62), 0 2px 4px -2px oklch(0% 0 0 / 0.42);
+  --shadow-3: 0 24px 56px -22px oklch(0% 0 0 / 0.78), 0 8px 18px -10px oklch(0% 0 0 / 0.55);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --canvas: oklch(96.5% 0.003 265);
+  --surface: oklch(100% 0 0);
+  --surface-2: oklch(96.5% 0.004 265);
+  --overlay: oklch(100% 0 0);
+
+  --fg: oklch(21% 0.018 265);
+  --fg-dim: oklch(46% 0.018 265);
+  --fg-mute: oklch(50% 0.016 265);
+  --fg-invert: oklch(99% 0.005 265);
+
+  --line-faint: oklch(93% 0.007 265);
+  --line: oklch(89% 0.009 265);
+  --line-strong: oklch(79% 0.012 265);
+
+  --accent: oklch(52% 0.19 265);
+  --accent-2: oklch(50% 0.13 195);
+  --accent-3: oklch(56% 0.16 62);
+  --accent-fg: oklch(99% 0.005 265);
+  --accent-soft: oklch(52% 0.19 265 / 0.1);
+  --accent-2-soft: oklch(50% 0.13 195 / 0.1);
+  --accent-3-soft: oklch(56% 0.16 62 / 0.1);
+
+  --ok: oklch(50% 0.13 158);
+  --ok-soft: oklch(50% 0.13 158 / 0.1);
+  --warn: oklch(52% 0.14 68);
+  --warn-soft: oklch(52% 0.14 68 / 0.1);
+  --err: oklch(53% 0.18 22);
+  --danger-bg: oklch(51% 0.2 24);
+  --danger-fg: oklch(99% 0.004 265);
+  --danger-bg-hover: oklch(46% 0.2 24);
+  --err-soft: oklch(53% 0.18 22 / 0.1);
+  --info: oklch(50% 0.12 232);
+  --info-soft: oklch(50% 0.12 232 / 0.1);
+
+  --shadow-1: 0 1px 2px oklch(20% 0.02 265 / 0.05);
+  --shadow-2: 0 6px 16px -8px oklch(20% 0.02 265 / 0.16), 0 1px 3px -1px oklch(20% 0.02 265 / 0.08);
+  --shadow-3: 0 22px 48px -20px oklch(20% 0.02 265 / 0.24), 0 6px 16px -10px oklch(20% 0.02 265 / 0.14);
+}
+
+/* 与主题无关的尺度令牌 */
+:root {
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  --sp-8: 64px;
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 280ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --sidebar-w: 232px;
+  --header-h: 56px;
+}
+
+/* 把语义令牌映射成 Tailwind 工具类（bg-surface / text-fg-dim / border-line …） */
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-overlay: var(--overlay);
+  --color-fg: var(--fg);
+  --color-fg-dim: var(--fg-dim);
+  --color-fg-mute: var(--fg-mute);
+  --color-fg-invert: var(--fg-invert);
+  --color-line-faint: var(--line-faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-accent-3: var(--accent-3);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-err: var(--err);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-fg: var(--danger-fg);
+  --color-danger-bg-hover: var(--danger-bg-hover);
+  --color-err-soft: var(--err-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --radius-xs: var(--r-xs);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+  --shadow-1: var(--shadow-1);
+  --shadow-2: var(--shadow-2);
+  --shadow-3: var(--shadow-3);
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Consolas, monospace;
+}
+
+@layer base {
+  html {
+    background: var(--canvas);
+  }
+
+  body {
+    /* 中西文混排：整个界面统一留白，而不是逐处加 .mix-space */
+    text-autospace: normal;
+    margin: 0;
+    background: var(--canvas);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* 焦点环：全局统一，绝不用 outline:none 抹掉 */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--r-sm);
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--fg);
+  }
+
+  /* 细滚动条：暗色下别太突兀 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: color-mix(in oklab, var(--line-strong) 70%, transparent);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklab, var(--line-strong) 95%, transparent);
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* 数字一律等宽，避免刷新时跳位 */
+  .tnum, table, [data-num] {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* 中英文混排：给中文与西文之间留一点呼吸 */
+  .mix-space {
+    text-autospace: ideograph-alpha ideograph-numeric;
+  }
+}
+
+/* 尊重系统「减少动效」 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 触屏上不做 hover 悬停位移（避免"点完还留着高亮"） */
+@media (hover: hover) {
+  .hover-lift:hover {
+    transform: translateY(-1px);
+  }
+}
+
+/* ---- 动效关键帧（弹层/轻提示；只动 transform/opacity） ---- */
+@keyframes hub-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes hub-fade-out { from { opacity: 1 } to { opacity: 0 } }
+@keyframes hub-pop-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98) }
+  to { opacity: 1; transform: translateY(0) scale(1) }
+}
+@keyframes hub-pop-out {
+  from { opacity: 1; transform: translateY(0) scale(1) }
+  to { opacity: 0; transform: translateY(6px) scale(0.985) }
+}
+
+.hub-overlay[data-state="open"] { animation: hub-fade-in var(--dur-base) var(--ease-out) both; }
+.hub-overlay[data-state="closed"] { animation: hub-fade-out 140ms ease-in both; }
+.hub-content[data-state="open"] { animation: hub-pop-in var(--dur-base) var(--ease-spring) both; }
+.hub-content[data-state="closed"] { animation: hub-pop-out 140ms ease-in both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hub-overlay, .hub-content { animation: none !important; }
+}
+
+/* 路由切换：CSS 动画（合成器层，不占 JS 主线程） */
+@keyframes hub-route-in { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: none } }
+.hub-route { animation: hub-route-in 180ms var(--ease-out) both; }
+@media (prefers-reduced-motion: reduce) { .hub-route { animation: none !important; } }
+
+/* ---------------------------------------------------------------
+ * 触屏命中区（用户要求 ≥ 44×44）
+ *
+ * 桌面鼠标可以小一点，但粗指针（手指）必须够大。用 pointer: coarse 判断，
+ * 而不是按视口宽度猜设备 —— 平板接鼠标也算"精确指针"。
+ * --------------------------------------------------------------- */
+@media (pointer: coarse) {
+  button,
+  [role="tab"],
+  a[href],
+  input,
+  select {
+    min-height: 44px;
+  }
+}
+
+/* 开关的视觉是 44×24 的药丸，直接改高度会变形，用伪元素把命中区上下各扩 10px。 */
+[role="switch"] {
+  position: relative;
+}
+[role="switch"]::after {
+  content: "";
+  position: absolute;
+  inset: -10px 0;
+}
+
+/* ---------------------------------------------------------------
+ * 链接：hover 时下划线从左往右长出来（用 background-size 动，不触发重排）
+ * --------------------------------------------------------------- */
+.link-underline {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  background-size: 0 1px;
+  transition: background-size 180ms var(--ease-out);
+}
+@media (hover: hover) {
+  .link-underline:hover {
+    background-size: 100% 1px;
+  }
+}
+.link-underline:focus-visible {
+  background-size: 100% 1px;
+}

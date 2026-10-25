@@ -1,0 +1,50 @@
+diff --git a/wb_settings.py b/wb_settings.py
+index 7aaeeac..eea8991 100644
+--- a/wb_settings.py
++++ b/wb_settings.py
+@@ -1700,6 +1700,45 @@ def set_auto_switch_product(accounts_dir, enabled):
+ AUTO_SWITCH_PRODUCTS = ("workbuddy", "vscode", "cli")
+ 
+ 
++
++def realm_routing(accounts_dir):
++    """区域自动路由配置：{"enabled": bool, "prefer": "cn"|"intl"}。
++
++    默认开启、默认国内优先：一个 key 同时覆盖国内版与国际版时，未显式指定
++    区域的请求先走 prefer（cn），国内无可用账号（额度 / 熔断 / 冷却 / 日限额
++    全算）自动回退另一区。配置写在 settings.json 的 realm_routing 键；
++    环境变量 WB_AUTO_REALM=0 可整体关闭（进程级）。
++    """
++    try:
++        data = load(accounts_dir)
++        cfg = data.get("realm_routing")
++        if not isinstance(cfg, dict):
++            cfg = {}
++        enabled = cfg.get("enabled", True) is not False
++        prefer = str(cfg.get("prefer") or "cn").strip().lower()
++        if prefer not in ("cn", "intl"):
++            prefer = "cn"
++        return {"enabled": bool(enabled), "prefer": prefer}
++    except Exception:
++        return {"enabled": True, "prefer": "cn"}
++
++
++def set_realm_routing(accounts_dir, cfg):
++    """Persist the realm-routing block. Returns the stored config."""
++    if not isinstance(cfg, dict):
++        raise ValueError("realm_routing must be an object")
++    enabled = cfg.get("enabled", True) is not False
++    prefer = str(cfg.get("prefer") or "cn").strip().lower()
++    if prefer not in ("cn", "intl"):
++        raise ValueError("realm_routing.prefer must be cn or intl")
++    stored = {"enabled": bool(enabled), "prefer": prefer}
++    with _lock:
++        data = load(accounts_dir)
++        data["realm_routing"] = stored
++        save(accounts_dir, data)
++    return stored
++
++
+ def auto_switch_products(accounts_dir):
+     """Allowed target identities for the 429 auto-switch.
+ 

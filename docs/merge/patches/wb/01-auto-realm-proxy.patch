@@ -1,0 +1,301 @@
+diff --git a/wb_proxy.py b/wb_proxy.py
+index 3dac4f8..d525e3c 100644
+--- a/wb_proxy.py
++++ b/wb_proxy.py
+@@ -189,6 +189,12 @@ def port_owner_hint(port):
+         return "netstat -ano | findstr :%d" % port
+     return "lsof -nP -iTCP:%d -sTCP:LISTEN" % port
+ CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
++# 区域自动路由（对标 qd 的 #26）：默认开启。**显式指定永远优先** —— 本开关只
++# 作用于「用户没指定区域」时的兜底路径（?realm= / Key 绑定 / X-Realm 任一存在时
++# 都优先于本逻辑）。prefer 默认 cn：一个 key 同时打国内/国际时默认先走国内，
++# 国内无可用账号（额度/熔断/冷却/日限额全算）自动回退国际。
++AUTO_REALM_ENABLED = os.environ.get("WB_AUTO_REALM", "1").lower() not in (
++    "0", "false", "no", "off")
+ def detect_model_realm(model_id):
+     if not model_id:
+         return CURRENT_REALM
+@@ -228,6 +234,44 @@ CN_EXCLUSIVE = {
+     "kimi-k3-1", "kimi-k2.7", "minimax-m3",
+     "hy3-x", "hy4-preview-dev", "hy4-preview-x",
+ }
++def realm_candidates(model, requested=None):
++    """本次请求应尝试的区域（按顺序）。智能路由规则：
++
++      1. 区域独占模型：只试它所在的区域（另一区上游根本没有这个模型）。
++      2. 显式指定（?realm= / Key 绑定 / X-Realm）：尊重显式，但允许在
++         「该区无可用账号」时回退另一区（前提是另一区有这个模型）。
++      3. 自动（未显式指定）：prefer（默认 cn）优先；若 prefer 区当前一个
++         可用账号都没有而另一区有，直接换序 —— 一次命中，不必先撞一次失败。
++    返回列表至少有一个元素；自动路由关闭时等价于旧行为（单元素）。
++    """
++    owner = exclusive_realm(model)
++    try:
++        cfg = wb_settings.realm_routing(ACCOUNTS_DIR)
++    except Exception:
++        cfg = {"enabled": True, "prefer": "cn"}
++    enabled = bool(cfg.get("enabled")) and AUTO_REALM_ENABLED
++    if requested:
++        realms = [requested]
++        if not enabled or requested not in ("cn", "intl")                 or owner not in ("", requested):
++            return realms
++        other = "intl" if requested == "cn" else "cn"
++        return [requested, other]
++    if owner:
++        return [owner]
++    if not enabled:
++        return [CURRENT_REALM]
++    prefer = cfg.get("prefer") or "cn"
++    other = "intl" if prefer == "cn" else "cn"
++    try:
++        if POOL is not None \
++                and POOL.count_ready(prefer, model=model or None) == 0 \
++                and POOL.count_ready(other, model=model or None) > 0:
++            return [other, prefer]
++    except Exception as exc:
++        log("auto realm readiness probe skipped: %s" % exc)
++    return [prefer, other]
++
++
+ def exclusive_realm(model_id):
+     """"intl"/"cn" when only that exit serves the model, else ""."""
+     if not model_id:
+@@ -807,7 +851,7 @@ def _best_cached_tokens(usage):
+ 
+ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
+                 account=None, outcome="completed", key=None, effort=None,
+-                requested_model=None):
++                realm_reason=None, requested_model=None):
+     """Record one finished request as exactly one JSONL row.
+ 
+     A request without a usage block still gets a row (flagged usage_missing):
+@@ -862,6 +906,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
+     # existed; the dashboard reports those as two different buckets, and a
+     # missing field is the only evidence of the cutover that survives.
+     row["key"] = key or ""
++    if realm_reason is not None:
++        # 区域自动路由：本次是否换区及原因（""=没换区；键不存在=旧行）
++        row["realm_reason"] = str(realm_reason)
+     # The price policy this request is measured against, stored as a reference
+     # so the table can be de-duplicated and swept. A row written before the
+     # table existed has no reference and falls back to the timeline.
+@@ -10125,6 +10172,10 @@ def runtime_settings_view():
+         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
+         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
+         "auto_switch_products": wb_settings.auto_switch_products(ACCOUNTS_DIR),
++        # 区域智能换区（本地补丁）：面板要能读到状态才能渲染开关与首选区。
++        "realm_routing": (lambda cfg: dict(cfg, effective=bool(cfg.get("enabled")) and AUTO_REALM_ENABLED,
++                                           auto_env="WB_AUTO_REALM"))(
++            wb_settings.realm_routing(ACCOUNTS_DIR)),
+         "free_model_credit_fallback": wb_settings.free_model_credit_fallback(ACCOUNTS_DIR),
+         "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
+         "filter_models_by_key": wb_settings.filter_models_by_key(ACCOUNTS_DIR),
+@@ -17686,6 +17737,13 @@ class Handler(BaseHTTPRequestHandler):
+         self.send_response(code)
+         self.send_header("Content-Type", "application/json; charset=utf-8")
+         self.send_header("Content-Length", str(len(body)))
++        realm_used = getattr(self, "realm_used", "") or ""
++        if realm_used:
++            # 区域自动路由（对标 qd #26）：本次实际出口 + 原因，随响应可见
++            self.send_header("X-WB-Realm", realm_used)
++            realm_reason = getattr(self, "realm_reason", "") or ""
++            if realm_reason:
++                self.send_header("X-WB-Realm-Reason", realm_reason)
+         # 只有 _json_cached() 覆盖的只读接口才有校验符；其余调用点保持原样，
+         # 一个头都不多发。
+         etag = self._json_etag
+@@ -18052,6 +18110,54 @@ class Handler(BaseHTTPRequestHandler):
+         rows written before the key field existed.
+         """
+         return (self.key_entry or {}).get("id") or None
++    def _open_upstream_auto(self, payload, realms, session_key=None,
++                            prebuilt_body=None, model=None,
++                            defer_egress_success=False, **open_kwargs):
++        """按顺序尝试多个区域打开上游；当前区拿不到可用账号时自动回退。
++
++        只在「池子真的空了/被封死」的两类失败上换区：
++          * RuntimeError("no usable account ...") —— open_upstream 的池空结论
++          * RateLimited —— 全区每日额度用尽 / 模型频控
++        其他错误（内容 403、参数 4xx、上游 502）不换区：换区不会改变结果，
++        只会把同一个错再撞一遍。全部区域失败时重抛第一个异常。
++        成功后把实际出口与原因写到 self.realm_used / self.realm_reason，
++        响应头（X-WB-Realm / X-WB-Realm-Reason）与用量行据此可见。
++        """
++        model = model or str(payload.get("model") or "")
++        first_exc = None
++        for index, realm in enumerate(realms):
++            try:
++                extra = {}
++                if defer_egress_success:
++                    # 只在需要时传：老的调用方/测试替身没有这个形参。
++                    extra["defer_egress_success"] = True
++                upstream, account, effort = open_upstream(
++                    payload, session_key=session_key, target_realm=realm,
++                    prebuilt_body=prebuilt_body, **extra, **open_kwargs)
++                reason = ""
++                if index > 0:
++                    reason = "no_account"
++                    log("auto realm fallback: realm %s unavailable -> serving "
++                        "%s (model=%s)" % (realms[0], realm, model), tag="realm")
++                self.realm_used = realm
++                self.realm_reason = reason
++                return upstream, account, effort
++            except RateLimited as exc:
++                if first_exc is None:
++                    first_exc = exc
++                log("auto realm fallback: realm %s rate-limited; trying next"
++                    % realm, tag="realm")
++                continue
++            except RuntimeError as exc:
++                if str(exc).startswith("no usable account"):
++                    if first_exc is None:
++                        first_exc = exc
++                    log("auto realm fallback: realm %s has no usable account; "
++                        "trying next" % realm, tag="realm")
++                    continue
++                raise
++        raise first_exc
++
+     def _cross_realm_error(self, model, realm):
+         """Explain a model/exit mismatch instead of letting upstream reject it.
+         Sending gpt-6-astra to the domestic exit (or deepseek-v4-pro to the
+@@ -18394,7 +18500,14 @@ class Handler(BaseHTTPRequestHandler):
+     # differ in whether they append "/v1" themselves.
+ 
+     def _get_realm(self):
+-        return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
++        try:
++            cfg = wb_settings.realm_routing(ACCOUNTS_DIR)
++        except Exception:
++            cfg = {"enabled": True, "prefer": "cn"}
++        return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"],
++                                "auto_enabled": bool(cfg.get("enabled")) and AUTO_REALM_ENABLED,
++                                "auto_env": "WB_AUTO_REALM",
++                                "prefer": cfg.get("prefer") or "cn"})
+ 
+     def _get_v1_models(self):
+         if not self._authorized():
+@@ -19095,6 +19208,10 @@ class Handler(BaseHTTPRequestHandler):
+         if "auth_disabled" in payload:
+             wb_settings.set_auth_disabled(ACCOUNTS_DIR, payload.get("auth_disabled"))
+             reply["auth_disabled"] = bool(payload.get("auth_disabled"))
++        if "realm_routing" in payload:
++            # 区域自动路由（自动换区开关 + 首选区）：面板设置页的「智能路由」卡
++            wb_settings.set_realm_routing(ACCOUNTS_DIR, payload.get("realm_routing"))
++            reply["realm_routing"] = wb_settings.realm_routing(ACCOUNTS_DIR)
+ 
+         # The four guards can arrive grouped under "limits" (the panel's own
+         # shape) or as the flat top-level keys older clients still send, which
+@@ -21069,6 +21186,12 @@ class Handler(BaseHTTPRequestHandler):
+         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+         self.send_header("Cache-Control", "no-cache")
+         self.send_header("Connection", "close")
++        realm_used = getattr(self, "realm_used", "") or ""
++        if realm_used:
++            self.send_header("X-WB-Realm", realm_used)
++            realm_reason = getattr(self, "realm_reason", "") or ""
++            if realm_reason:
++                self.send_header("X-WB-Realm-Reason", realm_reason)
+         if cors_origin_allowed(self.path):
+             self.send_header("Access-Control-Allow-Origin", "*")
+         self.end_headers()
+@@ -21117,7 +21240,7 @@ class Handler(BaseHTTPRequestHandler):
+                          ttft_ms=first_ms,
+                          gen_ms=(wall - first_ms) if first_ms is not None else None,
+                          fp=fp, account=account.uid,
+-                         outcome="client_aborted", key=self._key_id(), effort=effort)
++                         outcome="client_aborted", key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+             return
+         except Exception as exc:
+             wall = int((time.time() - t_start) * 1000)
+@@ -21325,7 +21448,7 @@ class Handler(BaseHTTPRequestHandler):
+             result = chat_to_messages(chat_obj)
+             wall = int((time.time() - t_start) * 1000)
+             record_upstream_usage(upstream, model, chat_obj.get("usage"), stream=False, elapsed_ms=wall,
+-                         fp=fp, account=account.uid, key=self._key_id(), effort=effort)
++                         fp=fp, account=account.uid, key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+             return self._json(200, result)
+         except Exception as exc:
+             wall = int((time.time() - t_start) * 1000)
+@@ -21345,6 +21468,12 @@ class Handler(BaseHTTPRequestHandler):
+         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+         self.send_header("Cache-Control", "no-cache")
+         self.send_header("Connection", "close")
++        realm_used = getattr(self, "realm_used", "") or ""
++        if realm_used:
++            self.send_header("X-WB-Realm", realm_used)
++            realm_reason = getattr(self, "realm_reason", "") or ""
++            if realm_reason:
++                self.send_header("X-WB-Realm-Reason", realm_reason)
+         if cors_origin_allowed(self.path):
+             self.send_header("Access-Control-Allow-Origin", "*")
+         self.end_headers()
+@@ -21362,7 +21491,7 @@ class Handler(BaseHTTPRequestHandler):
+                          ttft_ms=first_ms,
+                          gen_ms=(wall - first_ms) if first_ms is not None else None,
+                          fp=fp, account=account.uid,
+-                         outcome="client_aborted", key=self._key_id(), effort=effort)
++                         outcome="client_aborted", key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+             return
+         except Exception as exc:
+             wall = int((time.time() - t_start) * 1000)
+@@ -21387,7 +21516,7 @@ class Handler(BaseHTTPRequestHandler):
+         record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
+                      ttft_ms=first_ms,
+                      gen_ms=(wall - first_ms) if first_ms is not None else None,
+-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort)
++                     fp=fp, account=account.uid, key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+         return
+ 
+     def do_POST(self):
+@@ -21614,8 +21743,11 @@ class Handler(BaseHTTPRequestHandler):
+         model = payload.get("model") or "hy4-preview"
+         t_start = time.time()
+         try:
++            # 合并（v1.7.28）：上游引入了 explicit_realm，我们的自动路由需要 realms 列表 —— 两者都保留。
+             explicit_realm = self._request_realm()
+-            req_realm = explicit_realm or CURRENT_REALM
++            requested = explicit_realm
++            realms = realm_candidates(payload.get("model"), requested)
++            req_realm = realms[0] or CURRENT_REALM
+             blocked = self._cross_realm_error(payload.get("model"), req_realm)
+             if blocked:
+                 return self._error(400, blocked, "invalid_request_error")
+@@ -21625,11 +21757,15 @@ class Handler(BaseHTTPRequestHandler):
+             key_blocked = self._key_model_error(payload.get("model"))
+             if key_blocked:
+                 return self._error(400, key_blocked, "invalid_request_error")
+-            upstream, account, effort = open_upstream_with_fallback(
+-                payload, session_key=session_key, target_realm=req_realm,
+-                allow_realm_fallback=not explicit_realm,
+-                prebuilt_body=forwarded, defer_egress_success=True,
++            # 合并（v1.7.28）：上游把回退收进 open_upstream_with_fallback，但它只支持"换一次区"；
++            # 我们的 _open_upstream_auto 支持多区排序（prefer + 就绪探测）并写 X-WB-Realm-Reason，
++            # 面板依赖后者。这里保留我们的实现，参数语义等价（都只在 RateLimited / 池空时换区）。
++            upstream, account, effort = self._open_upstream_auto(
++                payload, realms, session_key=session_key,
++                prebuilt_body=forwarded, model=payload.get("model"),
++                defer_egress_success=True,
+                 **key_open_kwargs(getattr(self, "key_entry", None)))
++            req_realm = getattr(self, "realm_used", "") or req_realm
+         except PinnedAccountError as exc:
+             record_error(model, exc.status, exc.message[:200],
+                          elapsed_ms=int((time.time() - t_start) * 1000),
+@@ -21816,7 +21952,7 @@ class Handler(BaseHTTPRequestHandler):
+                              elapsed_ms=wall, ttft_ms=first_ms,
+                              gen_ms=(wall - first_ms) if first_ms is not None else None,
+                              fp=fp, account=account.uid,
+-                             outcome="client_aborted", key=self._key_id(), effort=effort)
++                             outcome="client_aborted", key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                 return
+             except Exception as exc:
+                 # Upstream quit mid-stream (timeout, incomplete read, ...).
+@@ -21897,7 +22033,7 @@ class Handler(BaseHTTPRequestHandler):
+                 record_upstream_usage(upstream, model, last_usage, stream=True,
+                              elapsed_ms=wall, ttft_ms=first_ms,
+                              gen_ms=(wall - first_ms) if first_ms is not None else None,
+-                             fp=fp, account=account.uid, key=self._key_id(), effort=effort)
++                             fp=fp, account=account.uid, key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+             return
+ 
+     def _chat_nonstream_response(self, upstream, model, fp, account, t_start, effort=None):
