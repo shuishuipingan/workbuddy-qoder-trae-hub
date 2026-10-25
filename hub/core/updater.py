@@ -90,7 +90,11 @@ def check(force=False):
     now = time.time()
     cache = _read_cache()
     if not force and cache.get("checked_at") and now - float(cache["checked_at"]) < CACHE_TTL:
+        # 缓存里存的是"上次检查时"的 current；升级后进程里的 HUB_VERSION 已经变了，
+        # 直接回旧值会让面板一直显示老版本号。current 必须每次用实时值覆盖。
         cache["cached"] = True
+        cache["current"] = HUB_VERSION
+        cache["update_available"] = version_tuple(cache.get("latest")) > version_tuple(HUB_VERSION)
         return cache
     out = {"current": HUB_VERSION, "latest": HUB_VERSION, "update_available": False,
            "url": "", "notes": "", "checked_at": now, "error": None, "cached": False}
