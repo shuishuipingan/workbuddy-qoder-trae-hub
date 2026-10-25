@@ -27,7 +27,7 @@ This repo vendors all three under `hub/engines/` and adds a thin **merge layer**
 ./start-hub.sh
 
 # Docker
-docker run -d -p 8817:8817 -v "$PWD/data:/app/data" \
+docker run -d -p 18791:8817 -v "$PWD/data:/app/data" \
   ghcr.io/shuishuipingan/workbuddy-qoder-trae-hub:latest
 ```
 

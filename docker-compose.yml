@@ -3,11 +3,23 @@ services:
     image: ghcr.io/shuishuipingan/workbuddy-qoder-trae-hub:latest
     build: .
     container_name: wqt-hub
+    command: python -m hub.server --host 0.0.0.0 --wb-port 8811 --qd-port 8812 --trae-port 8792 --portal-port 8817
     ports:
-      - "8817:8817"
+      # 宿主侧一律用高位端口，避开本机可能已在跑的 8811/8812/8817
+      - "${HUB_PORT:-18791}:8817"
+      - "${HUB_WB_PORT:-18789}:8811"
+      - "${HUB_QD_PORT:-18790}:8812"
+      - "${HUB_TRAE_PORT:-18792}:8792"
     volumes:
       - ./data:/app/data
     environment:
-      HUB_HOST: 0.0.0.0
-      HUB_PORT: "8817"
+      - HUB_HOST=0.0.0.0
+      - HUB_PORT=8817
+      - HUB_DATA_ROOT=/app/data
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u,sys;sys.exit(0 if u.urlopen('http://127.0.0.1:8817/api/hub/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
     restart: unless-stopped

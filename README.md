@@ -105,9 +105,10 @@ WorkBuddy x Qoder x Trea-hub.bat
 
 ```bash
 docker run -d --name wqt-hub \
-  -p 8817:8817 \
+  -p 18791:8817 \
   -v "$PWD/data:/app/data" \
   ghcr.io/shuishuipingan/workbuddy-qoder-trae-hub:latest
+# 宿主机 18791 → 容器门户 8817；另外 18789/18790/18792 是三家引擎（调试时才用）
 ```
 
 或 `docker compose up -d`（见仓库内 `docker-compose.yml`）。
