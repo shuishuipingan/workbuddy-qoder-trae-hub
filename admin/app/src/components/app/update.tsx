@@ -33,6 +33,15 @@ export function UpdateCard({ t }: { t: (k: string, v?: Record<string, string | n
       if (!res.updated) { toast.push('ok', t('update.alreadyLatest')); return; }
       toast.push('ok', t('update.updated', { from: String(res.from || ''), to: String(res.to || '') }));
       void qc.invalidateQueries({ queryKey: ['hub-update'] });
+      // 用户点的是"更新"，不是"只下载"：更新成功后自动重启，几秒后页面自己刷新
+      window.setTimeout(function () {
+        hubRestart().then(function () {
+          toast.push('warn', t('update.restarting'));
+          window.setTimeout(function () { location.reload(); }, 6000);
+        }).catch(function () {
+          toast.push('warn', t('update.restartFailed'));
+        });
+      }, 600);
     },
     onError: function (err) { toast.push('err', (err as Error).message); },
   });
@@ -98,6 +107,14 @@ export function UpdateBanner({ t }: { t: (k: string, v?: Record<string, string |
       if (!res.ok) { toast.push('err', String(res.reason || t('update.failed'))); return; }
       toast.push('ok', res.updated ? t('update.updated', { from: String(res.from || ''), to: String(res.to || '') }) : t('update.alreadyLatest'));
       void qc.invalidateQueries({ queryKey: ['hub-update'] });
+      if (res.updated) {
+        window.setTimeout(function () {
+          hubRestart().then(function () {
+            toast.push('warn', t('update.restarting'));
+            window.setTimeout(function () { location.reload(); }, 6000);
+          }).catch(function () { toast.push('warn', t('update.restartFailed')); });
+        }, 600);
+      }
     },
     onError: function (err) { toast.push('err', (err as Error).message); },
   });
