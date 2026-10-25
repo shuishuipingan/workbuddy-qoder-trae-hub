@@ -10146,16 +10146,6 @@ class Handler(BaseHTTPRequestHandler):
                                            platform=platform)
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
-            # >>> hub-patch: login-unsupported
-            # 该构建可能没有 start_login 的 state：直接 started["state"] 会 KeyError，
-            # 到了面板上会被包装成 500「accounts save failed」，与实际原因不符。
-            _hub_state = (started or {}).get("state")
-            if not _hub_state:
-                return self._error(501,
-                                   "this engine build does not support OAuth device login; "
-                                   "add the account by pasting a token / refresh token instead",
-                                   "not_implemented")
-            # <<< hub-patch: login-unsupported
             log("oauth device login started (realm=%s, state=%s)"
                 % (target_realm, started["state"][:8]))
             return self._json(200, started)

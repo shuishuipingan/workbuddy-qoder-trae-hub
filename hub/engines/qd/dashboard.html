@@ -461,10 +461,10 @@ a:hover{text-decoration:underline}
 .stat-panel>header h2{margin:0;font-size:13px;color:var(--fg);font-weight:600;line-height:1.3;
   text-transform:none;letter-spacing:normal}
 .stat-panel-sub{font-size:11px;color:var(--dim);margin-left:auto}
-.hint{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;
+.hint-icon{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;
   font-size:9px;color:var(--dim);border:1px solid var(--line);cursor:help;
   transition:color .18s ease,border-color .18s ease}
-.hint:hover{color:var(--accent);border-color:rgba(56,189,248,.5)}
+.hint-icon:hover{color:var(--accent);border-color:rgba(56,189,248,.5)}
 
 .rank-list{display:flex;flex-direction:column;gap:8px;min-height:56px}
 .rank-row{display:grid;grid-template-columns:1fr auto;gap:4px 10px;align-items:center;
@@ -664,7 +664,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
    长数字列（TTFT 的 P50、思考 Token）用显式 <br> 换到第二行，短标签
    （区域/账号/tok/s）单独锁 nowrap，避免浏览器把「全部账 / 号」或
    「825 / ms)」这种切断。 */
-#perfMatrix table,#keyMatrix table{font-size:12px}
+#keyMatrix table{font-size:12px}
 .cell-nowrap{white-space:nowrap}
 .cell-sub{display:block;font-size:10px;color:var(--dim);line-height:1.35}
 
@@ -1356,29 +1356,29 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 
   <div class="stat-grid2">
     <section class="stat-panel">
-      <header><h2>Top 账号 <span class="hint" title="按 Token 用量排序，取前 5 名">?</span></h2>
+      <header><h2>Top 账号 <span class="hint-icon" title="按 Token 用量排序，取前 5 名">?</span></h2>
         <span class="stat-panel-sub" id="topAcctSum"></span></header>
       <div class="rank-list" id="topAccounts"></div>
     </section>
     <section class="stat-panel">
-      <header><h2>Top 提供商 <span class="hint" title="按模型归属的上游厂商汇总">?</span></h2>
+      <header><h2>Top 提供商 <span class="hint-icon" title="按模型归属的上游厂商汇总">?</span></h2>
         <span class="stat-panel-sub" id="topProvSum"></span></header>
       <div class="rank-list" id="topProviders"></div>
     </section>
     <section class="stat-panel">
-      <header><h2>模型用量 <span class="hint" title="所选区间内各模型的 Token 占比">?</span></h2>
+      <header><h2>模型用量 <span class="hint-icon" title="所选区间内各模型的 Token 占比">?</span></h2>
         <span class="stat-panel-sub" id="modelSum"></span></header>
       <div class="rank-list" id="modelUsage"></div>
     </section>
     <section class="stat-panel">
-      <header><h2>提供商用量 <span class="hint" title="按厂商汇总（厂商由模型名推断）">?</span></h2>
+      <header><h2>提供商用量 <span class="hint-icon" title="按厂商汇总（厂商由模型名推断）">?</span></h2>
         <span class="stat-panel-sub" id="provSum"></span></header>
       <div class="rank-list" id="providerUsage"></div>
     </section>
   </div>
 
     <section class="stat-panel" style="grid-column:1/-1">
-      <header><h2>按 Key 档位分布 <span class="hint" title="口径：最近请求样本（每 5 秒刷新），不是全量聚合">?</span></h2>
+      <header><h2>按 Key 档位分布 <span class="hint-icon" title="口径：最近请求样本（每 5 秒刷新），不是全量聚合">?</span></h2>
         <span class="stat-panel-sub" id="effortSub"></span></header>
       <div id="effortByKey"></div>
     </section>
@@ -1390,7 +1390,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   </section>
 
   <section class="stat-panel">
-    <header><h2>缓存命中率 <span class="hint" title="命中 = 上游报告的缓存命中 input token；输入 = 全部 input token">?</span></h2>
+    <header><h2>缓存命中率 <span class="hint-icon" title="命中 = 上游报告的缓存命中 input token；输入 = 全部 input token">?</span></h2>
       <span class="stat-panel-sub">只统计成功请求</span></header>
     <div class="cache-cards" id="cacheCards"></div>
   </section>
@@ -2794,6 +2794,8 @@ async function saveSchedule(btn){
 let INSIGHT_GRANTS = [];
 let INSIGHT_REMAIN = [];
 let INSIGHT_ACTIVITY = [];
+let INSIGHT_SIG = "";        // 上次渲染的数据签名（issue #98：不变就不重绘）
+let INSIGHT_ANIMATE = true;   // 只有首屏与手动刷新播放数字滚动
 
 // 图标卡片的 SVG（内联，零依赖）
 const INSIGHT_ICONS = {
@@ -2882,6 +2884,18 @@ async function loadInsights(showToast){
     const minDays = days.length ? Math.min.apply(null, days) : null;
     const tightest = INSIGHT_REMAIN.filter(r => r.days_left === minDays)[0];
 
+    // issue #98：5 秒轮询时数据没变就不重绘（否则数字滚动/进度条每 5 秒重播）
+    const _sig = JSON.stringify([cost, unpriced.length, gs.count, gs.remain, gs.size,
+      minDays, asum.ok, asum.failed, asum.earned_credits,
+      INSIGHT_GRANTS.length, INSIGHT_REMAIN.length, INSIGHT_ACTIVITY.length]);
+    const _animate = !!showToast || INSIGHT_ANIMATE;
+    if(_sig === INSIGHT_SIG){
+      if(showToast) toast('用量洞察已刷新', 'ok');
+      return;
+    }
+    INSIGHT_SIG = _sig;
+    INSIGHT_ANIMATE = false;
+
     cards.innerHTML =
       _insightCard({ icon: INSIGHT_ICONS.cost, id: "insCost", bar: "insCostBar",
         label: "API 等价花费（参考 OpenRouter 价）",
@@ -2901,13 +2915,16 @@ async function loadInsights(showToast){
         sub: "成功 " + fmt(asum.ok) + " · 失败 " + fmt(asum.failed)
              + " · 累计积分 " + fmt(asum.earned_credits) });
 
-    _countUp(document.getElementById("insCost"), cost,
-      v => v == null ? "—" : _usd(v));
-    _countUp(document.getElementById("insGrants"), gs.count || 0, v => fmt(Math.round(v)));
-    _countUp(document.getElementById("insDays"), minDays,
-      v => v == null ? "—" : (Number(v).toFixed(1) + " 天"));
-    _countUp(document.getElementById("insAct"),
-      (asum.ok || 0) + (asum.failed || 0) ? (asum.ok || 0) : 0, v => fmt(Math.round(v)));
+    const _insNum = (id, val, fn) => {
+      const el = document.getElementById(id);
+      if(!el) return;
+      if(_animate){ _countUp(el, val, fn); } else { el.textContent = fn(val); }
+    };
+    _insNum("insCost", cost, v => v == null ? "—" : _usd(v));
+    _insNum("insGrants", gs.count || 0, v => fmt(Math.round(v)));
+    _insNum("insDays", minDays, v => v == null ? "—" : (Number(v).toFixed(1) + " 天"));
+    _insNum("insAct", (asum.ok || 0) + (asum.failed || 0) ? (asum.ok || 0) : 0,
+      v => fmt(Math.round(v)));
 
     _bar("insCostBar", pricedTotal ? Math.max(0.05, 1 - unpriced.length / pricedTotal) : 0);
     _bar("insGrantsBar", gs.size ? Math.min(1, (gs.remain || 0) / gs.size) : 0);
@@ -3938,27 +3955,32 @@ function renderDesktopScan(list){
 async function doImportDesktop(btn, path, realm){
   btn.disabled = true;
   btn.textContent = '导入中...';
+  // 导入本身和导入后的界面刷新要分开兜错：导入一旦返回成功，后面刷新面板
+  // 任何一个环节抛错都不该让用户看到「导入失败」——账号其实已经进去了。
+  let a = {};
   try{
     const r = await postJSON('/accounts/import/desktop', {path: path, realm: realm});
-    const a = (r.imported || [])[0] || {};
-    toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (a.realm === 'cn' ? '国内版' : '国际版'));
-    if(a.uid && window.SCAN_POOL) window.SCAN_POOL.add(a.uid);
-    await loadAccounts();
-    await refresh();
-    try {
-      const s = await postJSON('/accounts/import/desktop', {});
-      if(s.pool_uids) window.SCAN_POOL = new Set(s.pool_uids);
-      renderDesktopScan(s.detected || []);
-    } catch(e2) { /* keep the refreshed toasts; list will refresh on next scan */ }
-    if(a.realm && a.realm !== window.VIEW_REALM){
-      toast('该账号属于' + (a.realm === 'cn' ? '国内版' : '国际版')
-            + '列表，点击上方选项卡即可查看', 'warn');
-    }
+    a = (r.imported || [])[0] || {};
   }catch(e){
     toast('导入失败: ' + e.message, 'bad');
     btn.disabled = false;
     btn.textContent = '导入';
+    return;
   }
+  toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (a.realm === 'cn' ? '国内版' : '国际版'));
+  if(a.uid && window.SCAN_POOL) window.SCAN_POOL.add(a.uid);
+  if(a.realm && a.realm !== window.VIEW_REALM){
+    toast('该账号属于' + (a.realm === 'cn' ? '国内版' : '国际版')
+          + '列表，点击上方选项卡即可查看', 'warn');
+  }
+  // 以下全是「让界面追上已落盘的数据」，失败只记日志，不改变导入结论。
+  try { await loadAccounts(); } catch(e){ console.warn('导入后刷新账号列表失败:', e); }
+  try { await refresh(); } catch(e){ console.warn('导入后刷新面板失败:', e); }
+  try {
+    const s = await postJSON('/accounts/import/desktop', {});
+    if(s.pool_uids) window.SCAN_POOL = new Set(s.pool_uids);
+    renderDesktopScan(s.detected || []);
+  } catch(e2) { /* keep the refreshed toasts; list will refresh on next scan */ }
 }
 
 /* ---------------------------- PAT 导入弹窗 ---------------------------- */
@@ -4126,144 +4148,6 @@ async function refreshInner(){
     card('网关调用量', fmt(t.requests) + ' <span style="font-size:13px;font-weight:400;color:var(--dim)">次</span>', '累计消耗 ' + fmt(t.total_tokens) + ' Token', '') +
     card('请求成功率', succStr, errSub, perf.errors ? 'warn' : 'accent2');
 
-  const matrixEl = document.getElementById("perfMatrix");
-  const bmPerf = (perf && perf.by_model) || {};
-  const validModels = new Set(MODELS_DATA.map(m => m.id));
-  const modelMap = {};
-  Object.entries(t.by_model || {}).forEach(([id, m]) => {
-    if((!validModels.size || validModels.has(id)) && m.requests > 0 && !id.endsWith('-model')){
-      modelMap[id] = Object.assign({id: id}, m);
-    }
-  });
-  Object.entries(bmPerf).forEach(([id, p]) => {
-    if((!validModels.size || validModels.has(id)) && p.requests > 0 && !id.endsWith('-model') && !modelMap[id]){
-      modelMap[id] = {
-        id: id,
-        requests: p.requests || 0,
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        reasoning_tokens: 0,
-        cached_tokens: 0,
-        total_tokens: 0
-      };
-    }
-  });
-  const models = Object.values(modelMap)
-    .sort((a,b) => (b.total_tokens || b.requests) - (a.total_tokens || a.requests));
-
-  const countEm = document.getElementById("matrixModelCount");
-  if(countEm) countEm.textContent = models.length ? "(有调用的模型: " + models.length + " 个)" : "";
-
-  if(!models.length){
-    matrixEl.innerHTML = '<div class="empty">当前版本暂无模型请求或性能数据</div>';
-  } else {
-    // 进度条按「占窗口总量的比例」画，不是「相对最大的那个模型」：之前用
-    // maxTok 归一化，于是最大的模型永远 100%、而它实际可能只占总量的 35%——
-    // 列名叫「用量占比」，读起来就是错的。小比例保留一位小数（3.2% 比 3% 准），
-    // 条宽给 2% 地板，否则 0.4% 的行看不见。
-    // 分母用**表内可见行之和**而不是 t.total_tokens：models 已被过滤掉
-    // 「不在当前目录的模型 / 以 -model 结尾 / requests=0」这几类行，拿未过滤的
-    // 总量当分母会让行内百分比加起来不到汇总行的 100%，读者一验算就发现对不上。
-    const rowTotalTok = models.reduce((s2, m) => s2 + (Number(m.total_tokens) || 0), 0);
-    const pctOf = (v) => {
-      if(!rowTotalTok) return null;
-      return (Number(v) || 0) / rowTotalTok * 100;
-    };
-    const pctText = pctLabel;
-    // 汇总行 (Total / All Models)
-    // TTFT / 输入输出这类双值列用显式 <br> 断行：交给浏览器自动折行会在
-    // "P50 825" 和 "ms)" 之间断开，"ms)" 孤零零一行。
-    const ttftCell = (blk) => blk
-      ? (ms(blk.avg) + '<span class="cell-sub">P50 ' + ms(blk.p50) + '</span>')
-      : '-'
-    const ioCell = (prompt, completion, reasoning) =>
-      (fmt(prompt) + ' / ' + fmt(completion)
-        + (Number(reasoning)
-            ? '<span class="cell-sub" style="color:var(--think)">思考 ' + fmt(reasoning) + '</span>'
-            : ''))
-    const totTtft = ttftCell(perf.ttft_ms);
-    const totTps = perf.tokens_per_sec ? (perf.tokens_per_sec.avg.toFixed(1)) : "-";
-    const totWall = perf.wall_ms ? ms(perf.wall_ms.avg) : "-";
-    const totCache = perf.cache_hit_pct ? (perf.cache_hit_pct.avg.toFixed(1) + "%") : "-";
-    const summaryRow = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
-      + '<td style="text-align:left"><b>全部模型合计 (Total)</b></td>'
-      + '<td style="text-align:center"><span style="color:var(--dim)">—</span></td>'
-      + '<td style="text-align:left"><span class="cell-nowrap" style="color:var(--dim)">全部账号</span></td>'
-      + '<td>' + fmt(t.requests) + '</td>'
-      + '<td><b style="color:var(--accent)">' + fmt(t.total_tokens) + '</b></td>'
-      + '<td>' + ioCell(t.prompt_tokens, t.completion_tokens, t.reasoning_tokens) + '</td>'
-      + '<td>' + totTtft + '</td>'
-      + '<td><b style="color:var(--accent2)">' + totTps + '</b><span class="cell-sub">tok/s</span></td>'
-      + '<td>' + totWall + '</td>'
-      + '<td>' + totCache + '</td>'
-      + '<td class="pct-cell"><span class="pct-num">100%</span></td>'
-      + '</tr>';
-    const rows = models.map(m => {
-      const mp = bmPerf[m.id] || {};
-      const m_ttft = ttftCell(mp.ttft_ms);
-      const m_tps = mp.tokens_per_sec ? ('<b style="color:var(--accent2)">' + mp.tokens_per_sec.avg.toFixed(1) + '</b><span class="cell-sub">tok/s</span>') : "-";
-      const m_wall = mp.wall_ms ? ms(mp.wall_ms.avg) : "-";
-      const m_cache = (m.prompt_tokens > 0) ? pct(m.cached_tokens / m.prompt_tokens * 100) : (mp.cache_hit_pct ? mp.cache_hit_pct.avg.toFixed(1) + "%" : "-");
-      const pctTok = pctOf(m.total_tokens);
-      const errText = mp.errors ? (' <span class="badge bad" style="font-size:10px">' + mp.errors + ' 失败</span>') : '';
-      const acctsMap = t.accounts_map || {};
-      const mAccts = m.accounts || {};
-      const acctEntries = Object.entries(mAccts);
-      let realmCell = '<span style="color:var(--dim)">—</span>';
-      let acctCell = '<span style="color:var(--dim)">—</span>';
-      const realms = new Set();
-      acctEntries.forEach(([uid]) => {
-        const info = acctsMap[uid] || {};
-        if(info.realm) realms.add(info.realm);
-      });
-      if(realms.size === 1){
-        const r = Array.from(realms)[0];
-        realmCell = r === 'cn' ? '<span class="realm-badge-cn">国内版</span>' : '<span class="realm-badge-intl">国际版</span>';
-      } else if(realms.size > 1){
-        realmCell = '<span class="realm-badge-intl">国际版</span> <span class="realm-badge-cn">国内版</span>';
-      } else {
-        const isIntlOnly = false;  // Qoder 双区共享模型清单，无区域独占
-        realmCell = isIntlOnly ? '<span class="realm-badge-intl">国际版</span>' : (window.VIEW_REALM === 'cn' ? '<span class="realm-badge-cn">国内版</span>' : '<span class="realm-badge-intl">国际版</span>');
-      }
-      if(acctEntries.length === 1){
-        const [uid, count] = acctEntries[0];
-        const info = acctsMap[uid] || {};
-        const name = esc(info.nickname || uid.slice(0, 8));
-        acctCell = '<b>' + name + '</b>';
-      } else if(acctEntries.length > 1){
-        acctCell = acctEntries.map(([uid, count]) => {
-          const info = acctsMap[uid] || {};
-          const name = esc(info.nickname || uid.slice(0, 6));
-          return '<span class="badge mini" style="margin:1px 2px">' + name + ' <span style="color:var(--dim)">(' + count + ')</span></span>';
-        }).join('');
-      }
-      return '<tr>'
-        + '<td style="text-align:left" class="mono cell-nowrap"><b>' + esc(m.id) + '</b>' + errText + '</td>'
-        + '<td style="text-align:center;white-space:nowrap">' + realmCell + '</td>'
-        + '<td style="text-align:left">' + acctCell + '</td>'
-        + '<td>' + fmt(m.requests) + '</td>'
-        + '<td><b>' + fmt(m.total_tokens) + '</b></td>'
-        + '<td>' + ioCell(m.prompt_tokens, m.completion_tokens, m.reasoning_tokens) + '</td>'
-        + '<td>' + m_ttft + '</td>'
-        + '<td>' + m_tps + '</td>'
-        + '<td>' + m_wall + '</td>'
-        + '<td>' + m_cache + '</td>'
-        + '<td class="pct-cell">'
-        +   ((pctTok == null || pctTok <= 0) ? '' :
-              '<span class="bar-fill" style="width:calc((100% - 48px) * '
-              + Math.min(100, pctTok) / 100 + ')"></span>')
-        +   '<span class="pct-num">' + pctText(pctTok) + '</span></td>'
-        + '</tr>';
-    }).join('');
-
-    matrixEl.innerHTML = '<table><thead><tr>'
-      + '<th style="text-align:left">模型名称</th>'
-      + '<th style="text-align:center;width:76px">区域</th>'
-      + '<th style="text-align:left">账号</th>'
-      + '<th>请求数</th><th>总 Token</th><th>输入 / 输出 (思考)</th>'
-      + '<th>首字延迟 (TTFT)</th><th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th class="pct-cell">用量占比</th>'
-      + '</tr></thead><tbody>' + summaryRow + rows + '</tbody></table>';
-  }
 
   const total = recent.total || 0;
   RECENT_PAGE = recent.page || 1;
@@ -5021,8 +4905,8 @@ function pageNavLabel(section, index){
   if(h2){
     const clone = h2.cloneNode(true);
     // 去掉副标题与「?」提示标记（提示文字不该进侧栏锚点）
-    clone.querySelectorAll('em, .hint').forEach(el => el.remove());
-    const text = (clone.textContent || '').replace(/s+/g, ' ').trim();
+    clone.querySelectorAll('em, .hint-icon').forEach(el => el.remove());
+    const text = (clone.textContent || '').replace(/\s+/g, ' ').trim();
     if(text) return text;
   }
   return '未命名区块 ' + (index + 1);
@@ -5780,7 +5664,11 @@ let statFrom = "";
 let statTo = "";
 let statData = null;
 let statSeq = 0;
-let statAnimate = true;   // 仅首屏与换区间时做数字滚动
+let statAnimate = true;   // 仅首屏 / 换区间 / 手动刷新时播放动画
+// 分区块签名：5 秒轮询拿到的数据没变就整段跳过渲染（否则数字滚动、
+// 柱状图增长、折线描边每 5 秒重播一次，观感像在抽搐 —— issue #98）。
+const STAT_SIG = {};
+let statAnimateOnce = true;
 
 function statDayStr(d){
   const p = n => (n < 10 ? "0" + n : "" + n);
@@ -5893,6 +5781,19 @@ function statNum(el, value, fmtFn){
 function statFmt(v){ return v == null ? "—" : fmt(Math.round(v)); }
 function statPct(v){ return v == null ? "—" : (Number(v).toFixed(1) + "%"); }
 
+function statSetText(el, text){
+  if(!el) return;
+  const v = String(text == null ? "" : text);
+  if(el.textContent !== v) el.textContent = v;
+}
+
+function statSig(key, value){
+  const sig = JSON.stringify(value);
+  if(STAT_SIG[key] === sig) return false;   // 没变 -> 不重绘
+  STAT_SIG[key] = sig;
+  return true;
+}
+
 function statKpiTiles(d){
   const k = d.kpi || {};
   const win = STAT_LABELS[statRange] || "所选区间";
@@ -5918,32 +5819,37 @@ function statKpiTiles(d){
 function renderStatKpis(d){
   const box = document.getElementById("statKpis");
   if(!box) return;
-  box.innerHTML = statKpiTiles(d).map(t =>
-    '<div class="stat-kpi" title="' + esc(t.k) + '">'
-    + '<div class="k">' + esc(t.k) + '</div>'
-    + '<div class="v" id="' + t.id + '">—</div>'
-    + '<div class="s">' + esc(t.s) + '</div></div>').join("");
-  statKpiTiles(d).forEach(t => {
+  const tiles = statKpiTiles(d);
+  const animate = statAnimateOnce;
+  const sig = tiles.map(t => [t.k, t.text != null ? t.text : t.v, t.s]);
+  if(statSig("kpis", sig)){
+    box.innerHTML = tiles.map(t =>
+      '<div class="stat-kpi" title="' + esc(t.k) + '">'
+      + '<div class="k">' + esc(t.k) + '</div>'
+      + '<div class="v" id="' + t.id + '">—</div>'
+      + '<div class="s">' + esc(t.s) + '</div></div>').join("");
+  }
+  tiles.forEach(t => {
     const el = document.getElementById(t.id);
     if(!el) return;
-    if(t.text != null){ el.textContent = t.text; }
-    else if(statAnimate){ statNum(el, t.v, t.fmt); }
-    else { el.textContent = t.fmt(t.v); }
+    if(t.text != null){ statSetText(el, t.text); return; }
+    if(animate){ statNum(el, t.v, t.fmt); }
+    else { statSetText(el, t.fmt(t.v)); }
   });
-  statAnimate = false;
 }
-
 function renderRankList(id, rows, emptyText, sumElId){
   const box = document.getElementById(id);
   if(!box) return;
+  const animate = statAnimateOnce;
   const sum = document.getElementById(sumElId);
-  if(sum) sum.textContent = rows && rows.length ? (fmt(rows.reduce((a, r) => a + (r.tokens || 0), 0)) + " tokens") : "";
+  if(sum) statSetText(sum, rows && rows.length ? (fmt(rows.reduce((a, r) => a + (r.tokens || 0), 0)) + " tokens") : "");
+  if(!statSig("rank:" + id, rows || [])) return;   // 榜单没变：不重建、不重播增长动画
   if(!rows || !rows.length){
     box.innerHTML = '<div class="stat-empty">' + esc(emptyText) + '</div>';
     return;
   }
   const max = Math.max.apply(null, rows.map(r => r.tokens || 0)) || 1;
-  box.innerHTML = rows.map((r, i) => {
+  box.innerHTML = rows.map(r => {
     const pct = Math.max(2, Math.round((r.tokens || 0) * 100 / max));
     const tip = esc(r.name) + "<br>" + fmt(r.tokens) + " tokens · " + fmt(r.requests) + " 次请求";
     return '<div class="rank-row" data-tip="' + tip + '">'
@@ -5953,11 +5859,11 @@ function renderRankList(id, rows, emptyText, sumElId){
   }).join("");
   box.querySelectorAll(".rank-bar > i").forEach((bar, i) => {
     const w = bar.dataset.w;
-    setTimeout(() => { bar.style.width = w + "%"; }, 30 + i * 40);
+    if(animate){ setTimeout(() => { bar.style.width = w + "%"; }, 30 + i * 40); }
+    else { bar.style.width = w + "%"; }
   });
   statBindTip(box);
 }
-
 function statHeatLevel(v, max){
   if(!v) return 0;
   if(max <= 0) return 1;
@@ -5979,6 +5885,9 @@ function renderHeatmap(d){
     return;
   }
   const max = (d.heatmap && d.heatmap.max) || 0;
+  // 365 格 × 每秒重算会明显掉帧；数据没变就直接返回（issue #98）
+  const heatSum = days.reduce((a, x) => a + (x.tokens || 0), 0);
+  if(!statSig("heat", [days.length, max, heatSum, days[days.length - 1] && days[days.length - 1].date])) return;
   // 首列按周一补齐，保证「行 = 星期几」稳定
   const first = new Date(days[0].date + "T00:00:00");
   const lead = (first.getDay() + 6) % 7;   // 周一=0
@@ -6028,6 +5937,7 @@ function renderCacheCards(d){
   const box = document.getElementById("cacheCards");
   if(!box) return;
   const wins = (d.cache && d.cache.windows) || [];
+  if(!statSig("cache", wins)) return;
   box.innerHTML = wins.map(w => {
     const pct = w.pct == null ? "—" : Number(w.pct).toFixed(1) + "%";
     return '<div class="cache-card">'
@@ -6051,6 +5961,8 @@ function renderHourlyChart(d){
   if(!box) return;
   const pts = (d.hourly && d.hourly.points) || [];
   if(!pts.length){ box.innerHTML = '<div class="stat-empty">最近 24 小时没有请求</div>'; return; }
+  const animate = statAnimateOnce;
+  if(!statSig("hourly", pts.map(p => [p.label, p.pct, p.tokens]))) return;
   const W = 720, H = 190, L = 46, R = 52, T = 12, B = 24;
   const iw = W - L - R, ih = H - T - B;
   const maxPctRaw = Math.max.apply(null, pts.map(p => p.pct == null ? 0 : p.pct));
@@ -6094,7 +6006,7 @@ function renderHourlyChart(d){
     + dots + hot + "</svg>";
   statBindTip(box);
   const path = box.querySelector(".stat-line");
-  if(path && !_prefersReduced()){
+  if(path && animate && !_prefersReduced()){
     try{
       const len = path.getTotalLength();
       path.style.strokeDasharray = len;
@@ -6116,12 +6028,14 @@ function renderDailyChart(d){
   if(lo) rows = rows.filter(x => new Date(x.date + "T00:00:00") >= new Date(lo.getFullYear(), lo.getMonth(), lo.getDate()));
   if(hi) rows = rows.filter(x => new Date(x.date + "T00:00:00") <= new Date(hi.getFullYear(), hi.getMonth(), hi.getDate()));
   if(rows.length > 90) rows = rows.slice(-90);
-  if(lbl) lbl.textContent = rows.length
-    ? (rows[0].date + " ~ " + rows[rows.length - 1].date) : "";
+  if(lbl) statSetText(lbl, rows.length
+    ? (rows[0].date + " ~ " + rows[rows.length - 1].date) : "");
   if(!rows.length || !rows.some(r => r.tokens > 0)){
     box.innerHTML = '<div class="stat-empty">所选范围内暂无请求</div>';
     return;
   }
+  const animate = statAnimateOnce;
+  if(!statSig("daily", rows.map(r => [r.date, r.tokens]))) return;
   const max = Math.max.apply(null, rows.map(r => r.tokens || 0)) || 1;
   box.innerHTML = '<div class="daily-bars">' + rows.map(r => {
     const h = Math.max(1, Math.round((r.tokens || 0) * 100 / max));
@@ -6130,7 +6044,8 @@ function renderDailyChart(d){
   }).join("") + "</div>";
   requestAnimationFrame(() => {
     box.querySelectorAll(".daily-bar").forEach((el, i) => {
-      setTimeout(() => el.classList.add("grown"), _prefersReduced() ? 0 : 20 + i * 6);
+      if(!animate || _prefersReduced()){ el.classList.add("grown"); return; }
+      setTimeout(() => el.classList.add("grown"), 20 + i * 6);
     });
   });
   statBindTip(box);
@@ -6152,8 +6067,8 @@ async function loadQuality(){
     if(det){
       const qr = (q.queue_rate == null) ? '-' : (q.queue_rate * 100).toFixed(1) + '%';
       const rec = q.recovery || {};
-      det.textContent = '排队 ' + qr + ' · 回读 ' + (rec.leak || 0) + '+' + (rec.dsml || 0) +
-        ' · 模式 ' + (q.queue_mode || '-');
+      statSetText(det, '排队 ' + qr + ' · 回读 ' + (rec.leak || 0) + '+' + (rec.dsml || 0) +
+        ' · 模式 ' + (q.queue_mode || '-'));
     }
   }catch(e){ /* 面板静默：健康检查失败不该刷错误 */ }
 }
@@ -6180,6 +6095,12 @@ function renderEffortByKey(){
   const box = document.getElementById("effortByKey");
   if(!box) return;
   const snap = RECENT_SNAPSHOT;
+  // issue #98：refresh() 每 5 秒调一次，样本没变就别重建这张表
+  if(snap && snap.rows && snap.rows.length){
+    const head = snap.rows[0] || {}, tail = snap.rows[snap.rows.length - 1] || {};
+    if(!statSig("effortView", [snap.page, snap.total, snap.rows.length, head.at,
+                                head.key_id, head.reasoning_effort, tail.at])) return;
+  }
   if(!snap || !snap.rows || !snap.rows.length){
     box.innerHTML = '<div class="stat-empty">等待最近请求数据（每 5 秒刷新；需要至少一次对话请求）…</div>';
     return;
@@ -6249,8 +6170,11 @@ async function loadAnalytics(force){
   try{
     const d = await getJSON("/usage/stats?" + statQuery());
     if(seq !== statSeq) return;      // 手快连点：只认最后一次
+    // 首屏 / 换区间 / 手动刷新才播放动画；5 秒轮询一律「静默更新」（issue #98）
+    statAnimateOnce = !!force || !statData;
     statData = d;
     renderStats(d);
+    statAnimateOnce = false;
   }catch(err){
     console.error("loadAnalytics failed:", err);
     if(box) box.innerHTML = '<div class="stat-empty" style="grid-column:1/-1">统计加载失败：'
@@ -6260,9 +6184,13 @@ async function loadAnalytics(force){
     const rec = await getJSON("/usage/recent?limit=100");
     if(rec && rec.rows){
       RECENT_SNAPSHOT = {rows: rec.rows, page: 1, total: rec.total || rec.rows.length};
-      renderEffortByKey();
+      const head = rec.rows[0] || {};
+      if(statSig("effort", [rec.total, rec.rows.length, head.at, head.key_id,
+                            head.reasoning_effort, rec.rows[rec.rows.length - 1] && rec.rows[rec.rows.length - 1].at])){
+        renderEffortByKey();
+      }
       const sub = document.getElementById("effortSub");
-      if(sub) sub.textContent = "样本 " + rec.rows.length + " 条";
+      if(sub) statSetText(sub, "样本 " + rec.rows.length + " 条");
     }
   }catch(e){ /* 样本取不到不影响主看板 */ }
   loadQuality();
