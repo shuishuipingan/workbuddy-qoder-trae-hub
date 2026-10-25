@@ -18,30 +18,36 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 登录 ghcr.io
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: 生成标签
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+      - name: 版本标签
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ -z "$TAG" ] || [ "$TAG" = "$GITHUB_REF_NAME" ]; then TAG="$(python - <<PY
+          import re, io
+          s = io.open("hub/__init__.py", encoding="utf-8").read()
+          print(re.search(r'HUB_VERSION = "([^"]+)"', s).group(1))
+          PY
+          )"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "版本: $TAG"
 
-      - name: 构建并推送
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
-          # GHCR 在推 attestation（provenance/sbom）时偶发 500，纯镜像推送更稳
-          provenance: false
-          sbom: false
+      # 用经典 docker build / docker push（不用 buildx）：
+      # buildx 走 OCI 推送 + attestation，GHCR 侧曾连续 500；经典路径只推 manifest+blobs。
+      - name: 构建
+        run: |
+          docker build -t "$IMAGE:${{ steps.ver.outputs.tag }}" -t "$IMAGE:latest" .
+
+      - name: 推送（先带版本号，再 latest）
+        run: |
+          for i in 1 2 3; do
+            docker push "$IMAGE:${{ steps.ver.outputs.tag }}" && break || { echo "第 $i 次失败，10s 后重试"; sleep 10; }
+          done
+          for i in 1 2 3; do
+            docker push "$IMAGE:latest" && break || { echo "第 $i 次失败，10s 后重试"; sleep 10; }
+          done
+
+      - name: 校验标签
+        run: |
+          docker buildx imagetools inspect "$IMAGE:${{ steps.ver.outputs.tag }}" || true
