@@ -37,7 +37,14 @@ jobs:
       # buildx 走 OCI 推送 + attestation，GHCR 侧曾连续 500；经典路径只推 manifest+blobs。
       - name: 构建
         run: |
-          docker build -t "$IMAGE:${{ steps.ver.outputs.tag }}" -t "$IMAGE:latest" .
+          docker build \
+            --label "org.opencontainers.image.title=WorkBuddy x Qoder x Trae-hub" \
+            --label "org.opencontainers.image.description=三引擎融合网关：一个进程、一个端口、一把 Key 调三家" \
+            --label "org.opencontainers.image.version=${{ steps.ver.outputs.tag }}" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            -t "$IMAGE:${{ steps.ver.outputs.tag }}" -t "$IMAGE:latest" .
 
       - name: 推送（先带版本号，再 latest）
         run: |
