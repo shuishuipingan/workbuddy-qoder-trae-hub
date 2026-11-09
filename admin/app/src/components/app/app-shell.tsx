@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Outlet, useLocation } from 'react-router-dom';
+import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 
 const LOGO = (import.meta.env.BASE_URL || './') + 'logo.jpg';
 import { ChevronLeft, Menu, Moon, PanelLeft, Sun, X } from 'lucide-react';
@@ -48,6 +48,7 @@ export function AppShell() {
     try { return window.matchMedia('(max-width: 1151px)').matches; } catch { return false; }
   });
   const location = useLocation();
+  const navigate = useNavigate();
 
   const current = ROUTES.find(function (r) { return location.pathname.startsWith(r.path); }) ?? ROUTES[0];
   const title = t(current.labelKey);
@@ -176,6 +177,25 @@ export function AppShell() {
             </div>
           </div>
         </header>
+        {/* 顶栏主标签（CPAMC 形态）：一级导航平铺在页头，二级仍在侧栏。 */}
+        <nav className="cp-tabs border-b border-line-faint bg-canvas px-3 sm:px-4" aria-label={t('app.panel')}>
+          {(["main", "ops", "config"] as const).map(function (g) {
+            const first = ROUTES.find(function (r) { return r.group === g; });
+            const active = ROUTES.some(function (r) { return r.group === g && location.pathname.startsWith(r.path); });
+            if (!first) return null;
+            return (
+              <button
+                key={g}
+                type="button"
+                className="cp-tab"
+                data-active={active ? 'true' : 'false'}
+                onClick={function () { navigate(first.path); }}
+              >
+                {t(GROUP_LABEL[g])}
+              </button>
+            );
+          })}
+        </nav>
 
         {navOpen ? (
           <div className="border-b border-line-faint bg-surface lg:hidden" data-mobile-nav="1">

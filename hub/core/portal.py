@@ -52,6 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from hub import ENGINES, ENGINE_LABELS  # noqa: E402  引擎注册表（唯一真源）
 from hub.core import paths  # noqa: E402
+from hub.core import orchestrator
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -415,8 +416,13 @@ class PortalHandler(BaseHTTPRequestHandler):
             if method not in ("GET", "HEAD"):
                 # 聚合端点默认只读；允许的两个写入口是白名单（不是"前缀匹配"）：
                 #   /settings/save 存合并层配置 · /try 就地试打（真的往自己的 /api/v1 发一条）
-                allowed_post = (HUB_PREFIX + "/settings/save", HUB_PREFIX + "/try")
-                if not (method == "POST" and path in allowed_post):
+                allowed_post = (HUB_PREFIX + "/settings/save", HUB_PREFIX + "/try",
+                                HUB_PREFIX + "/routing",
+                                HUB_PREFIX + "/routing/preview")
+                # 路由编排是用户可编辑配置：PUT /api/hub/routing 整表保存（乐观锁）。
+                allowed_put = (HUB_PREFIX + "/routing",)
+                if not ((method == "POST" and path in allowed_post)
+                        or (method == "PUT" and path in allowed_put)):
                     return self._json(405, {"error": "hub endpoints are read-only "
                                                     "(GET/HEAD; POST /settings/save or /try)",
                                             "path": path})
@@ -446,6 +452,42 @@ class PortalHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(query or "")
         realm = (params.get("realm") or [None])[0] or None
 
+        if rest == "routing/preview":
+            import json as _json
+            if method == "POST":
+                try:
+                    body = _json.loads(self._read_body() or "{}")
+                except ValueError:
+                    return self._json(400, {"error": "invalid JSON body"}, head_only=head_only)
+            else:
+                body = {"model": ""}
+            # 干跑必须基于**新快照**：面板点一次就看到真实链，不能依赖 30 秒缓存。
+            _up = {e: (keys.upstream_key(e) or "") for e in ENGINES}
+            snap = router.refresh_snapshot(self.server.ports, _up,
+                                          self.server.route_snapshot, force=True)
+            result = orchestrator.preview(
+                str(body.get("model") or "").strip().lower(),
+                str(body.get("realm") or "").strip().lower() or None,
+                list(ENGINES), list(router.REALMS),
+                snap.ready,
+                lambda e, r, m: router.engine_holds(snap, e, r, m),
+                lambda m, r: router.candidates_for(m, snap, settings.routing(), r))
+            return self._json(200, result, head_only=head_only)
+        if rest == "routing":
+            engines = list(ENGINES)
+            realms = list(router.REALMS)
+            if method == "PUT":
+                try:
+                    body = __import__('json').loads(self._read_body() or '{}')
+                except ValueError:
+                    return self._json(400, {'error': 'invalid JSON body'}, head_only=head_only)
+                try:
+                    doc = orchestrator.save(body, engines, realms,
+                                            expected_revision=body.get("revision"))
+                except ValueError as exc:
+                    return self._json(400, {"error": str(exc)}, head_only=head_only)
+                return self._json(200, doc, head_only=head_only)
+            return self._json(200, orchestrator.load(engines, realms), head_only=head_only)
         if rest in ("health", ""):
             return self._json(200, aggregator.hub_health(ports), head_only=head_only)
         if rest == "engines":
@@ -1131,6 +1173,20 @@ class PortalHandler(BaseHTTPRequestHandler):
         # 但另一区仍留在链尾兜底（「显式优先，不把路走死」）。
         requested = (params.get("realm") or [None])[0] or self.headers.get("X-Realm")
         candidates = router.candidates_for(model, snapshot, cfg, requested)
+        # 路由编排（第 200 轮）：用户规则把默认候选链重排/收窄。命中就用规则的
+        # 顺序，未命中保持原链；规则里 stop_on_miss 才会 fail-closed。
+        try:
+            _cfg = orchestrator.load(list(ENGINES), list(router.REALMS))
+            _ready = set()
+            for _c in candidates:
+                if router.engine_holds(snapshot, _c[0], _c[1], model):
+                    _ready.add(_c)
+            candidates, _rule = orchestrator.reorder(candidates, model, requested, _ready, _cfg)
+            if _rule:
+                sys.stderr.write("[portal] routing rule=%s model=%s hops=%d\n"
+                                 % (_rule.get("id"), model, len(candidates)))
+        except Exception as _exc:
+            sys.stderr.write("[portal] routing skipped: %s\n" % (_exc,))
         if scope_engines:
             _all = candidates
             candidates = [c for c in candidates if str(c[0]).lower() in scope_engines]

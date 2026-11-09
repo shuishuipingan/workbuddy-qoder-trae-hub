@@ -1,0 +1,105 @@
+/* ==================================================================
+ * cpamc.css —— 参照 CLIProxyAPI Management Center 的版式覆盖层。
+ *
+ * 只做「形状」不做「配色」：颜色一律沿用 tokens.css 的变量，
+ * 这样深浅两套主题、三家引擎识别色都不受影响。
+ *
+ * 目的：把散落各页的卡片/表格/按钮/输入框收敛到同一套节奏，
+ * 不必逐页改 JSX —— 覆盖层命中的是已有的工具类。
+ * ================================================================== */
+
+:root {
+  --r-card: 12px;
+  --r-ctl: 8px;
+  --r-pill: 999px;
+  --pad-card: 15px;
+  --row-h: 34px;
+  --label-size: 10.5px;
+}
+
+/* —— 卡片：细边框 + 极浅阴影，靠留白分块而不是投影 —— */
+.rounded-lg.border.border-line,
+.rounded-lg.border.border-line-faint,
+.rounded-xl.border.border-line,
+.rounded-xl.border.border-line-faint {
+  border-radius: var(--r-card);
+  border-color: var(--line-faint);
+  box-shadow: none;
+}
+
+/* —— 表格：表头小号大写 + 行 hover 提亮，行高收紧 —— */
+table thead th {
+  font-size: var(--label-size);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+  background: transparent;
+  border-bottom: 1px solid var(--line-faint);
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+table tbody tr { transition: background-color 120ms ease; }
+table tbody tr:hover { background: var(--surface-2); }
+table tbody td { border-bottom: 1px solid var(--line-faint); }
+table tbody tr:last-child td { border-bottom: 0; }
+
+/* —— 控件：统一高度与圆角（只碰原生控件，不动已经定制的按钮组件） —— */
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  border-radius: var(--r-ctl);
+  border-color: var(--line-faint);
+  background: var(--surface-2);
+  min-height: 30px;
+}
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+/* —— 数字：等宽，表格里对齐 —— */
+.tabular-nums, td .num, [data-num] { font-variant-numeric: tabular-nums; }
+
+/* —— 滚动条：细、悬停才显形 —— */
+* { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--line); border-radius: var(--r-pill); }
+*::-webkit-scrollbar-thumb:hover { background: var(--line-strong); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* —— 小标签（页面里到处在用 text-[9.5px] uppercase）—— */
+.uppercase.tracking-\[0\.09em\] { letter-spacing: 0.06em; }
+
+/* —— 三段式骨架：顶栏主标签 + 页内二级栏（CPAMC 的形态）—— */
+.cp-tabs {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line-faint);
+  padding-bottom: 0;
+}
+.cp-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--fg-mute);
+  font-size: 12.5px;
+  padding: 8px 12px;
+  border-radius: var(--r-ctl) var(--r-ctl) 0 0;
+  cursor: pointer;
+  white-space: nowrap;
+  position: relative;
+}
+.cp-tab:hover { color: var(--fg); background: var(--surface-2); }
+.cp-tab[data-active="true"] { color: var(--fg); font-weight: 600; }
+.cp-tab[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  left: 8px; right: 8px; bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 2px;
+}

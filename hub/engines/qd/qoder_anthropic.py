@@ -22,6 +22,26 @@ import os
 import time
 import uuid
 
+
+_host_log = None
+
+
+def log(*args, **kwargs):
+    """日志转发：宿主在 import 后调用 _bind_log(log) 注入（保持本模块零依赖、
+    只 import 标准库）；未注入时静默丢弃——日志绝不能影响协议输出。"""
+    fn = _host_log
+    if fn is None:
+        return None
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _bind_log(fn):
+    global _host_log
+    _host_log = fn
+
 # ---------------------------------------------------------------------------
 # 常量与开关
 # ---------------------------------------------------------------------------
@@ -43,18 +63,37 @@ def _new_id(prefix):
     return prefix + uuid.uuid4().hex[:24]
 
 
-def thinking_mode():
+def thinking_mode(override=None):
     """QD_ANTHROPIC_THINKING：off（默认，不发 thinking block）/ empty（发空签名）。
 
-    设计文档 §5：我们生成不了 Anthropic 要求的 signature，默认降级为「不暴露思考」。
+    设计文档 §5 及 issue #146：我们生成不了 Anthropic 要求的 signature，默认降级为「不暴露思考」。
+    可按请求 key_entry / 面板全局设置覆盖。
     伪造签名（raw）**不提供**。
     """
+    if override:
+        cand = str(override).strip().lower()
+        if cand in ("empty", "off"):
+            return cand
     raw = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
     return raw if raw in ("empty",) else "off"
 
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
+def _parse_tool_arguments(args):
+    """解析参数 JSON，额外解开一层对象/数组编码；语法错误交给调用方处理。"""
+    inp = json.loads(args)
+    if isinstance(inp, str):
+        try:
+            decoded = json.loads(inp)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if isinstance(decoded, (dict, list)):
+                inp = decoded
+    return inp
+
+
 def _text_of_blocks(blocks):
     """Anthropic content blocks -> 纯文本（text 块拼接；其余块忽略）。"""
     if isinstance(blocks, str):
@@ -261,13 +300,37 @@ def effort_from_anthropic(payload, catalog_meta=None, supported=None):
         return None
     if target in allowed:
         return target
-    # clamp：取 rank 最接近且不超过的档；全超 -> 取最高档
-    tr = EFFORT_RANK[target]
-    lower = [x for x in allowed if EFFORT_RANK[x] <= tr]
-    if lower:
-        return max(lower, key=lambda x: EFFORT_RANK[x])
-    return min(allowed, key=lambda x: EFFORT_RANK[x])
+    # issue #126：clamp 必须**双向就近**（同距时偏向模型默认档），与
+    # qoder_proxy.normalize_reasoning_effort 同一策略。旧实现只向下取，
+    # dfmodel（low/high/max）上的 medium/high 会被压成 low —— 静默降档。
+    _def = _default_effort_from(catalog_meta, allowed)
+    want = EFFORT_RANK[target]
+    ref = EFFORT_RANK.get(_def, want)
 
+    def _key(cand):
+        return (abs(EFFORT_RANK[cand] - want), abs(EFFORT_RANK[cand] - ref))
+
+    return sorted(allowed, key=_key)[0]
+
+
+def _default_effort_from(catalog_meta, allowed):
+    """该模型的默认档（thinking_config.is_default），否则取允许表中间档。
+
+    与 qoder_proxy.default_effort 同一策略；本模块只 import 标准库，无法反向
+    引用 proxy，所以这里保留一份最小实现（两处口径由测试交叉校验，issue #126）。
+    """
+    tc = (catalog_meta or {}).get("thinking_config")
+    tc = tc if isinstance(tc, dict) else {}
+    en = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
+    efforts = en.get("efforts") if isinstance(en.get("efforts"), dict) else {}
+    for name, cfg in efforts.items():
+        if isinstance(cfg, dict) and cfg.get("is_default"):
+            cand = str(name).strip().lower()
+            if cand in EFFORT_RANK:
+                return cand
+    if not allowed:
+        return ""
+    return allowed[len(allowed) // 2]
 
 def _efforts_from_meta(meta):
     """从 catalog 元数据读档位（fallback；接线时应显式传 supported 以避免双实现）。
@@ -339,6 +402,15 @@ def messages_to_chat(payload, catalog_meta=None, supported=None):
                     images.append(uri)
             elif bt == "tool_use":
                 args = b.get("input")
+                if isinstance(args, str):
+                    # 修复旧历史里多编码一层的对象，避免继续示范字符串参数。
+                    try:
+                        decoded = _parse_tool_arguments(args)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        if isinstance(decoded, (dict, list)):
+                            args = decoded
                 if not isinstance(args, str):
                     args = json.dumps(args if args is not None else {},
                                       ensure_ascii=False)
@@ -438,7 +510,8 @@ def chat_usage_to_anthropic(usage):
         except (TypeError, ValueError):
             return 0
     prompt = max(0, _int(u.get("prompt_tokens")))
-    cached = _int(u.get("prompt_cache_hit_tokens")) or _int(
+    cached = _int(u.get("cached_tokens")) or _int(
+        u.get("prompt_cache_hit_tokens")) or _int(
         details.get("cached_tokens")) or _int(pdet.get("cached_tokens"))
     cached = max(0, min(cached, prompt))
     return {
@@ -455,7 +528,7 @@ def _stop_reason(finish_reason):
     return _STOP_REASON.get(str(finish_reason or "stop"), "end_turn")
 
 
-def chat_to_messages(chat_obj, model=None):
+def chat_to_messages(chat_obj, model=None, thinking_mode_override=None):
     """chat.completion -> Anthropic message（非流式出站，§3.2）。"""
     chat_obj = chat_obj if isinstance(chat_obj, dict) else {}
     choice = (chat_obj.get("choices") or [{}])[0]
@@ -469,7 +542,7 @@ def chat_to_messages(chat_obj, model=None):
                        if isinstance(p, dict))
     if isinstance(text, str) and text:
         content.append({"type": "text", "text": text})
-    if thinking_mode() == "empty" and msg.get("reasoning_content"):
+    if thinking_mode(thinking_mode_override) == "empty" and msg.get("reasoning_content"):
         content.append({"type": "thinking",
                         "thinking": str(msg["reasoning_content"]),
                         "signature": ""})
@@ -480,14 +553,21 @@ def chat_to_messages(chat_obj, model=None):
         fn = fn if isinstance(fn, dict) else {}
         args = fn.get("arguments")
         try:
-            inp = json.loads(args) if isinstance(args, str) and args.strip() else {}
+            inp = _parse_tool_arguments(args) if isinstance(args, str) and args.strip() else {}
         except Exception:
             inp = {}
-        if not isinstance(inp, (dict, list)):
+        if not isinstance(inp, dict):
             inp = {"value": inp}
+        _tool_name = str(fn.get("name") or "")
+        if not _tool_name:
+            # issue #116（非流式侧）：空 name 会让下游整轮 malformed —— 宁可
+            # 不还原这一个调用，也不发坏块。
+            log("anthropic: dropped tool_use without name (id=%s) - issue #116"
+                % (tc.get("id") or "-"), level="WARN", tag="anthropic")
+            continue
         content.append({"type": "tool_use",
                         "id": str(tc.get("id") or _new_id("toolu_")),
-                        "name": str(fn.get("name") or ""),
+                        "name": _tool_name,
                         "input": inp})
     return {
         "id": _new_id("msg_"),
@@ -501,23 +581,29 @@ def chat_to_messages(chat_obj, model=None):
     }
 
 
-def stream_anthropic_events(inner_lines, model="", holder=None):
+def stream_anthropic_events(inner_lines, model="", holder=None, thinking_mode_override=None):
     """把**已清洗**的 chat chunk 行翻译成 Anthropic SSE 事件（§4.3）。
 
     inner_lines 的契约：`data: {chat.chunk}` 行（bytes 或 str），**必须来自
     iter_inner_sse -> recover_leaked_tool_calls 之后**（本模块不做吞掉/回读）。
       · 以 ":" 开头的心跳注释行**原样透传**；
       · `[DONE]` 丢弃（Anthropic 客户端不认）；
-      · arguments 是**增量字符串**，逐片 input_json_delta，不要逐片 json.loads。
+      · 对象 arguments 逐片输出；其它形态缓冲到块尾，规范化成对象后再输出。
     """
     msg_id = _new_id("msg_")
     next_index = 0
     text_index = None
     thinking_index = None
     tool_index = {}
+    # issue #116：上游偶发「新 index 的首帧不带 name」，而 content_block_start
+    # 一旦发出就不能再补 name（Anthropic 协议不允许改已发出的块）——下游会拿到
+    # 空 name 并把整轮判成 malformed。所以先缓冲：name 非空才发 start，期间到达的
+    # arguments 先攒着，start 之后按序补发。
+    pending_tools = {}      # ci -> {ai, id, name, args, args_object}
+    dropped_tools = []      # 流结束仍无 name 的块（丢弃并记日志）
     open_blocks = []
     finish = "stop"
-    mode = thinking_mode()
+    mode = thinking_mode(thinking_mode_override)
 
     def ev(etype, obj):
         body = dict(obj)
@@ -595,25 +681,78 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
                 fn = tc.get("function")
                 fn = fn if isinstance(fn, dict) else {}
                 args = fn.get("arguments") or ""
-                if ci not in tool_index:
+                if ci not in pending_tools:
                     ai = next_index
                     next_index += 1
                     tool_index[ci] = ai
-                    open_blocks.append(ai)
-                    yield ev("content_block_start", {
-                        "index": ai,
-                        "content_block": {"type": "tool_use",
-                                          "id": str(tc.get("id")
-                                                    or _new_id("toolu_")),
-                                          "name": str(fn.get("name") or ""),
-                                          "input": {}}})
+                    pending_tools[ci] = {"ai": ai,
+                                         "id": str(tc.get("id") or ""),
+                                         "name": str(fn.get("name") or ""),
+                                         "args": [], "args_object": None}
+                slot = pending_tools[ci]
+                if not slot["name"]:
+                    slot["name"] = str(fn.get("name") or "")
+                if not slot["id"]:
+                    slot["id"] = str(tc.get("id") or "")
                 if args:
-                    yield ev("content_block_delta", {
-                        "index": tool_index[ci],
-                        "delta": {"type": "input_json_delta",
-                                  "partial_json": args}})
+                    slot["args"].append(args)
+                    # 只看首个非空白字符：正常对象继续即时透传，其余形态在
+                    # 输出任何参数前缓冲，避免客户端把字符串 input 写进历史。
+                    if slot["args_object"] is None and args.lstrip():
+                        slot["args_object"] = args.lstrip().startswith("{")
+                # name 已知 -> 需要时才开块，然后把队列里的分片按序发完；
+                # name 未知 -> 继续攒（绝不发空 name 的 start）。
+                if slot["name"]:
+                    if slot["ai"] not in open_blocks:
+                        open_blocks.append(slot["ai"])
+                        yield ev("content_block_start", {
+                            "index": slot["ai"],
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": slot["id"] or _new_id("toolu_"),
+                                "name": slot["name"],
+                                "input": {}}})
+                    if slot["args_object"]:
+                        _queued = slot["args"]
+                        slot["args"] = []
+                        for piece in _queued:
+                            yield ev("content_block_delta", {
+                                "index": slot["ai"],
+                                "delta": {"type": "input_json_delta",
+                                          "partial_json": piece}})
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+    # issue #116：仍有块没等到 name —— 不发 start（发了就是空 name），整块丢弃并
+    # 降级 stop_reason，避免下游一直等一个永远不会到来的工具结果。
+    for _ci, _slot in list(pending_tools.items()):
+        if _slot["ai"] in open_blocks:
+            if _slot["args"]:
+                _queued = _slot["args"]
+                try:
+                    inp = _parse_tool_arguments("".join(_queued))
+                except (TypeError, ValueError):
+                    # 截断/非法 JSON 沿用现有处理，不编造工具参数。
+                    pass
+                else:
+                    if not isinstance(inp, dict):
+                        inp = {"value": inp}
+                    _queued = [json.dumps(inp, ensure_ascii=False)]
+                for piece in _queued:
+                    yield ev("content_block_delta", {
+                        "index": _slot["ai"],
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": piece}})
+            continue
+        dropped_tools.append(_slot)
+        log("anthropic stream: dropped tool_use block without name "
+            "(index=%s, id=%s, args_chars=%d) - issue #116"
+            % (_ci, _slot["id"] or "-",
+               sum(len(a) for a in _slot["args"])),
+            level="WARN", tag="anthropic")
+    if dropped_tools and finish == "tool_calls":
+        _kept_text = text_index is not None or thinking_index is not None
+        if not _kept_text:
+            finish = "stop"
     for i in sorted(open_blocks):
         yield ev("content_block_stop", {"index": i})
     final = chat_usage_to_anthropic(

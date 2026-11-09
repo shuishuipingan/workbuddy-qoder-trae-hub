@@ -3,7 +3,7 @@
 数据来源（完全跟官方走）：本机官方客户端模型目录缓存解密快照
   国际版  ~/.qoder/.models/<uid>/catalog-v6   （QMC v1: HKDF-SHA256(uid)+AES-256-GCM）
   国内版  ~/.qoder-cn/.models/<uid>/catalog-v6
-取 chat 场景、**逐字段原样保留**（含 promotion 峰谷价、context_config 多窗口、
+取 chat 与 app-only 对话条目、**逐字段原样保留**（含 promotion 峰谷价、context_config 多窗口、
 thinking_config 思考档位、is_free/is_new/icon、strategies 等）。
 
 快照存放：运行时优先读取同目录的 qoder_catalog_intl.json / qoder_catalog_cn.json
@@ -47,6 +47,7 @@ thinking_config 思考档位、is_free/is_new/icon、strategies 等）。
 
 import json
 import os
+import threading
 
 # 国际版 (qoder.com / api1.qoder.sh) 官方 chat 场景全字段快照（冻结回退副本；
 # 运行时优先读取同目录 qoder_catalog_intl.json / qoder_catalog_cn.json）
@@ -880,6 +881,54 @@ _INTL_JSON = r'''
         "token_count": 400000
       }
     }
+  },
+  {
+    "key": "lmodel",
+    "status": "idle",
+    "format": "openai",
+    "source": "system",
+    "enable": true,
+    "icon": "QoderQoduckFill",
+    "display_name": "QoDuck",
+    "is_vl": true,
+    "is_reasoning": true,
+    "is_default": false,
+    "is_new": true,
+    "price_factor": 0.0,
+    "original_price_factor": 0.5,
+    "max_input_tokens": 180000,
+    "is_sensitive": true,
+    "tags": [
+      "free"
+    ],
+    "is_free": true,
+    "is_lite_plan": true,
+    "is_editable": true,
+    "context_config": {
+      "1M": {
+        "token_count": 1000000
+      },
+      "200K": {
+        "token_count": 200000,
+        "is_default": true
+      },
+      "400K": {
+        "token_count": 400000
+      }
+    },
+    "thinking_config": {
+      "disabled": {},
+      "enabled": {
+        "efforts": {
+          "xhigh": {},
+          "high": {
+            "is_default": true
+          },
+          "low": {}
+        },
+        "is_default": true
+      }
+    }
   }
 ]
 '''
@@ -1491,6 +1540,54 @@ _CN_JSON = r'''
         "is_default": true
       }
     }
+  },
+  {
+    "key": "lmodel",
+    "status": "idle",
+    "format": "openai",
+    "source": "system",
+    "enable": true,
+    "icon": "QoderQoduckFill",
+    "display_name": "QoDuck",
+    "is_vl": true,
+    "is_reasoning": true,
+    "is_default": false,
+    "is_new": true,
+    "price_factor": 0.0,
+    "original_price_factor": 0.5,
+    "max_input_tokens": 180000,
+    "is_sensitive": true,
+    "tags": [
+      "free"
+    ],
+    "is_free": true,
+    "is_lite_plan": true,
+    "is_editable": true,
+    "context_config": {
+      "1M": {
+        "token_count": 1000000
+      },
+      "200K": {
+        "token_count": 200000,
+        "is_default": true
+      },
+      "400K": {
+        "token_count": 400000
+      }
+    },
+    "thinking_config": {
+      "disabled": {},
+      "enabled": {
+        "efforts": {
+          "xhigh": {},
+          "high": {
+            "is_default": true
+          },
+          "low": {}
+        },
+        "is_default": true
+      }
+    }
   }
 ]
 '''
@@ -1514,6 +1611,31 @@ _SNAPSHOT_FILENAMES = {"intl": "qoder_catalog_intl.json",
                        "cn": "qoder_catalog_cn.json"}
 _SNAPSHOT_SOURCES = {}          # filename -> SNAPSHOT_SOURCE_*
 _SNAPSHOT_DEGRADE_REASONS = {}  # filename -> SNAPSHOT_DEGRADE_*
+
+
+def dialogue_models(payload):
+    """Official conversational catalog: chat first, app-only additions second.
+
+    Qoder may launch a conversational model in its desktop app scene before
+    chat. Never union inline/assistant/quest/BYOK scenes or overwrite chat
+    permissions/prices with app metadata. Return copies, preserve all fields.
+    """
+    if not isinstance(payload, dict):
+        return []
+    rows, seen = [], set()
+    for scene in ("chat", "app"):
+        candidates = payload.get(scene)
+        if not isinstance(candidates, list):
+            continue
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("key")
+            if not isinstance(key, str) or not key.strip() or key in seen:
+                continue
+            seen.add(key)
+            rows.append(dict(entry))
+    return rows
 
 
 def _load_snapshot(filename, embedded):
@@ -1609,6 +1731,7 @@ MODEL_ALIASES = {
     "glm-5.2": "gm51model",
     # Kimi
     "kimi-k3": "kmodel_latest",
+    "kimi-k3.1-pro": "kmodel_latest",
     "kimi-k2.8-preview": "kmodel",
     "kimi-k2.7": "kmodel",
     "kimi-k2.7-code": "kmodel",
@@ -1631,6 +1754,84 @@ def _display_name_index():
 
 
 _DISPLAY_INDEX = _display_name_index()
+
+
+# ---------------------------------------------------------------------------
+# 动态显示名索引（官方改显示名、快照未跟上的窗口期兜底）
+#
+# /v1/models 的 id 用**动态清单**的 display_name（官方随时可能改：实测
+# kmodel_latest 从 Kimi-K3 改成 Kimi-K3.1-Pro），而 _DISPLAY_INDEX 由冻结
+# 快照构建。两者不一致时，客户端拿 /v1/models 广告的新名字来请求，
+# resolve_upstream_key 解析不到就把显示名**原样当上游 key**发出去——上游
+# 不认识，静默按 auto 路由/计费（kmodel_latest 实测，其它模型因显示名
+# 没改而正常）。网关在动态清单拉取成功后调用 register_live_display_names
+# 把「display_name -> key」注册进来；解析顺序：别名 -> 冻结显示名 -> 动态
+# 显示名。快照用 _refresh_catalog.py 跟上官方后，这里的注册自然与之同值。
+# ---------------------------------------------------------------------------
+_LIVE_DISPLAY_LOCK = threading.Lock()
+_LIVE_DISPLAY_INDEX = {}
+
+
+def register_live_display_names(pairs):
+    """注册动态清单的 (display_name, key) 对；返回本次实际更新的条数。
+
+    同名后注册的覆盖先注册的（动态接口 > 本机缓存 > 快照的降级顺序由
+    调用方保证，后注册的通常更新；解析兜底场景里略旧的映射最多让新名字
+    解析不到，不会解析错）。
+    """
+    updated = 0
+    with _LIVE_DISPLAY_LOCK:
+        for name, key in pairs or []:
+            n = str(name or "").strip().lower()
+            k = str(key or "").strip()
+            if not n or not k:
+                continue
+            if _LIVE_DISPLAY_INDEX.get(n) != k:
+                _LIVE_DISPLAY_INDEX[n] = k
+                updated += 1
+    return updated
+
+
+def live_display_names():
+    """当前已注册的动态显示名映射（快照用，勿修改返回值）。"""
+    with _LIVE_DISPLAY_LOCK:
+        return dict(_LIVE_DISPLAY_INDEX)
+
+
+def clear_live_display_names():
+    """清空动态显示名索引（测试隔离用；运行期没有清空的理由）。"""
+    with _LIVE_DISPLAY_LOCK:
+        _LIVE_DISPLAY_INDEX.clear()
+
+
+def _live_display_lookup(name):
+    if not name:
+        return ""
+    with _LIVE_DISPLAY_LOCK:
+        return _LIVE_DISPLAY_INDEX.get(name) or ""
+
+
+_ALIAS_TARGETS = frozenset(MODEL_ALIASES.values())
+
+
+def is_known_upstream_key(key, realm=None):
+    """key 是否为已知上游 key（本区域清单 / 双区静态清单 / 别名目标 / 动态清单）。
+
+    网关用它判断「resolve_upstream_key 的返回是不是没解析出来的原样透传」，
+    从而只在真未知（BYOK 自定义模型等）时才走透传路径。
+    """
+    if not key:
+        return False
+    for m in (models_for_realm(realm) if realm in ("cn", "intl") else ()):
+        if m.get("key") == key:
+            return True
+    for m in STATIC_INTL_MODELS + STATIC_CN_MODELS:
+        if m.get("key") == key:
+            return True
+    if key in _ALIAS_TARGETS:
+        return True
+    with _LIVE_DISPLAY_LOCK:
+        return key in {v for v in _LIVE_DISPLAY_INDEX.values()}
 
 
 def resolve_upstream_key(model, realm=None):
@@ -1667,6 +1868,10 @@ def resolve_upstream_key(model, realm=None):
         return _DISPLAY_INDEX[tail]
     if low in _DISPLAY_INDEX:
         return _DISPLAY_INDEX[low]
+    # 动态清单显示名（官方改显示名、快照未跟上的窗口期，如 Kimi-K3.1-Pro）
+    live = _live_display_lookup(tail) or _live_display_lookup(low)
+    if live:
+        return live
     # 官方本地化名（zh.label）——惰性查询官方文案资源
     try:
         labels = load_official_text().get("labels") or {}
@@ -1686,6 +1891,9 @@ def resolve_upstream_key(model, realm=None):
             return MODEL_ALIASES[part]
         if part in _DISPLAY_INDEX:
             return _DISPLAY_INDEX[part]
+        live = _live_display_lookup(part)
+        if live:
+            return live
     return m_key
 
 

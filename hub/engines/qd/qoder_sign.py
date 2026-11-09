@@ -525,7 +525,11 @@ def rsa_pkcs1v15_encrypt(plain: bytes, n: int = None, e: int = None) -> bytes:
 COSY_VERSION = (os.environ.get("QD_COSY_VERSION") or "1.1.75").strip() or "1.1.75"
 # 官方 CLI 的推理/模型请求不设 User-Agent：签名 WASM 的头表里没有它，请求经
 # 打包的 undici fetch 发出，由 undici 补默认值 "undici"。
-COSY_USER_AGENT = "undici"
+COSY_USER_AGENT = (os.environ.get("QD_COSY_UA") or "undici").strip() or "undici"
+# issue #113：上游按「客户端身份」决定模型授权（kmodel_latest 对桌面端是 vsc:
+# 999.999.999 = 未放量，CLI 才放行）。clienttype 与 version 一样允许覆盖，
+# 这样用户能把自己的 CLI 身份原样搬过来验证，而不必改代码。
+COSY_CLIENT_TYPE = (os.environ.get("QD_COSY_CLIENTTYPE") or "5").strip() or "5"
 # issue #64（逆向官方客户端）：官方请求层对所有请求注入 Cosy-MachineOS，
 # Cosy-MachineHostname 只在 infer-sse 场景带；QD_COSY_OS_HEADERS=0 可关。
 def _cosy_os_headers():
@@ -650,7 +654,7 @@ class CosySession(object):
             "cosy-business-product": "cli",
             "cosy-business-type": "agent",
             "cosy-scene": "assistant",
-            "cosy-clienttype": "5",
+            "cosy-clienttype": COSY_CLIENT_TYPE,
             "cosy-date": date,
             "cosy-user": self.uid,
             "cosy-key": self.cosy_key,

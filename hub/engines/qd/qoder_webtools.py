@@ -12,6 +12,8 @@ Qoder 上游只认 function 类型，这类声明此前被直接丢弃（#63）�
   · 响应体与正文都有字节上限，超时固定；
   · 引擎链轮换 + TTL 缓存 + single-flight + 冷却，避免被限流。
 """
+import ipaddress
+import http.client
 import html
 import json
 import os
@@ -98,47 +100,46 @@ def _engine_penalise(name, blocked=False):
 
 
 # ---------------------------------------------------------------- SSRF 守卫
-_PRIVATE_PREFIXES = ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
-                  "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-                  "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
-                  "172.30.", "172.31.", "192.168.", "127.", "0.", "169.254.",
-                   "100.64.", "224.", "240.")
+# issue #131-6：三条绕过路径（DNS 重绑定 / 代理模式跳过检查 / 非公网段分类不全）
+# 一次性收口：
+#   1) 用 ipaddress 判「全球单播」，不再手写字符串前缀；
+#   2) 解析一次并把**解析结果钉死**到实际连接（不再 check 一次、connect 再解析一次）；
+#   3) 不再信任环境代理：本地网页工具一律直连钉好的 IP（要代理请显式给
+#      QD_WEB_TOOLS_PROXY，且同样受地址校验约束）。
+_MAX_REDIRECTS = 5
 
 
 def _ip_is_public(ip):
+    """是否**全球可路由单播**地址（issue #131-6）。"""
     try:
-        ip = str(ip or "").strip()
-        if not ip:
-            return False
-        if ":" in ip:      # IPv6：只允许全球单播 2000::/3
-            low = ip.lower()
-            return low.startswith("2") or low.startswith("3")
-        if ip in ("::1", "localhost"):
-            return False
-        return not ip.startswith(_PRIVATE_PREFIXES)
+        addr = ipaddress.ip_address(str(ip or "").strip().strip("[]"))
     except Exception:
         return False
+    # is_global 已排除 私网/环回/链路本地/保留/基准测试网段/CGNAT（100.64/10）；
+    # 组播与未指定地址在部分版本里 is_global 仍为 True，显式再挡一次。
+    return bool(addr.is_global and not addr.is_multicast
+                and not addr.is_unspecified and not addr.is_reserved)
 
 
-def _resolve_public(host):
-    """域名解析后必须是公网地址；解析失败按不安全处理。"""
+def _resolve_public_ip(host):
+    """解析主机名并返回一个可连接的全球单播 IP；任何一条记录非公网就整体拒绝。
+
+    issue #131-6：**所有**解析结果都必须通过校验（不只是取第一条），否则
+    「第一条公网、第二条内网」的多记录域名仍可被利用。
+    """
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except Exception:
-        return False
+        return None, "host does not resolve"
+    ips = []
     for info in infos:
         addr = info[4][0]
         if not _ip_is_public(addr):
-            return False
-    return bool(infos)
-
-
-def _has_proxy():
-    for key in ("QD_WEB_TOOLS_PROXY", "HTTPS_PROXY", "https_proxy",
-                "HTTP_PROXY", "http_proxy"):
-        if str(os.environ.get(key) or "").strip():
-            return True
-    return False
+            return None, "host resolves to a non-public address"
+        ips.append(addr)
+    if not ips:
+        return None, "host does not resolve"
+    return ips[0], ""
 
 
 def check_url(url):
@@ -157,41 +158,130 @@ def check_url(url):
     if host in ("localhost", "localhost.localdomain"):
         return False, "localhost is not allowed"
     try:
-        ipaddress_like = bool(re.match(r"^[0-9.]+$", host)) or ":" in host
+        literal_ip = str(ipaddress.ip_address(host))
     except Exception:
-        ipaddress_like = False
-    if ipaddress_like and not _ip_is_public(host):
-        return False, "private/loopback address is not allowed"
-    # 走代理时由代理解析域名：本地 DNS 失败不代表不安全（沙箱/内网 DNS 常见）。
-    # 但仍然拦住字面私网地址与 localhost（上面两道），代理无法把它们变成公网。
-    if _has_proxy():
+        literal_ip = ""
+    if literal_ip:
+        if not _ip_is_public(literal_ip):
+            return False, "private/loopback address is not allowed"
         return True, ""
-    if not _resolve_public(host):
-        return False, "host resolves to a non-public address"
+    # 域名：**无论是否配置代理**都要解析并校验（代理不再豁免检查，issue #131-6）
+    _ip, reason = _resolve_public_ip(host)
+    if not _ip:
+        return False, reason
     return True, ""
 
 
-class _SafeRedirect(urllib.request.HTTPRedirectHandler):
-    """重定向逐跳复检：防止 302 到内网。"""
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """连到**已校验**的 IP，但按原域名发 Host（issue #131-6：防 DNS 重绑定）。"""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        ok, reason = check_url(newurl)
+    def __init__(self, host, port, pinned_ip, timeout=HTTP_TIMEOUT):
+        http.client.HTTPConnection.__init__(self, host, port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port),
+                                             self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """同上；TLS 的 SNI / 证书校验仍按原域名（用 server_hostname）。"""
+
+    def __init__(self, host, port, pinned_ip, timeout=HTTP_TIMEOUT,
+                 context=None):
+        http.client.HTTPSConnection.__init__(self, host, port, timeout=timeout,
+                                             context=context)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port),
+                                             self.timeout)
+        self.sock = self._context.wrap_socket(self.sock,
+                                              server_hostname=self.host)
+
+
+class _PinnedResponse(object):
+    """把 http.client 的响应包装成 urllib 那样可 with/read 的对象。"""
+
+    def __init__(self, status, headers, body, url):
+        self.status = status
+        self.headers = headers
+        self._body = body
+        self.url = url
+
+    def read(self, n=None):
+        if n is None:
+            return self._body
+        return self._body[:n]
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _pinned_open(url, data=None, headers=None, max_bytes=MAX_BODY_BYTES):
+    """带钉死 IP 的 GET/POST；逐跳跟随重定向并对每一跳重新校验。
+
+    返回 _PinnedResponse。任何一跳不合格都直接抛 ValueError（调用方转成错误）。
+    """
+    current = str(url or "").strip()
+    for _hop in range(_MAX_REDIRECTS + 1):
+        ok, reason = check_url(current)
         if not ok:
-            raise urllib.error.HTTPError(newurl, code,
-                                         "redirect blocked: %s" % reason,
-                                         headers, fp)
-        return super(_SafeRedirect, self).redirect_request(
-            req, fp, code, msg, headers, newurl)
-
-
-_OPENER = urllib.request.build_opener(_SafeRedirect)
+            raise ValueError("blocked: %s" % reason)
+        parsed = urllib.parse.urlparse(current)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            literal_ip = str(ipaddress.ip_address(host))
+        except Exception:
+            literal_ip = ""
+        pinned, why = (literal_ip, "") if literal_ip else _resolve_public_ip(host)
+        if not pinned:
+            raise ValueError("blocked: %s" % (why or "unresolved host"))
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        send = dict({"User-Agent": _UA,
+                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                     "Host": parsed.netloc}, **(headers or {}))
+        if parsed.scheme == "https":
+            conn = _PinnedHTTPSConnection(host, port, pinned)
+        else:
+            conn = _PinnedHTTPConnection(host, port, pinned)
+        try:
+            conn.request("POST" if data else "GET", path,
+                         body=data, headers=send)
+            resp = conn.getresponse()
+            body = resp.read(max_bytes)
+            status = resp.status
+            hdrs = resp.headers
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if status in (301, 302, 303, 307, 308):
+            nxt = hdrs.get("Location") or ""
+            if not nxt:
+                raise ValueError("redirect without location")
+            current = urllib.parse.urljoin(current, nxt)
+            data = None if status in (301, 302, 303) else data
+            continue
+        return _PinnedResponse(status, hdrs, body, current)
+    raise ValueError("too many redirects")
 
 
 def _open(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, headers=dict(
-        {"User-Agent": _UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
-        **(headers or {})))
-    return _OPENER.open(req, timeout=HTTP_TIMEOUT)
+    """兼容旧调用点：钉死 IP + 逐跳校验的新实现（issue #131-6）。"""
+    return _pinned_open(url, data=data, headers=headers)
+
+
 # ---------------------------------------------------------------- 搜索引擎
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")

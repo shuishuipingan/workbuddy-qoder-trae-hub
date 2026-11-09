@@ -31,6 +31,7 @@ import re
 import shutil
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -243,8 +244,43 @@ def _yaml_upsert_at(lines, start, end, indent, keys, value_json):
     return lines
 
 
+def _yaml_scalar(value):
+    """把值渲染成**始终带双引号**的 YAML 标量。
+
+    YAML 1.2 core schema 会把 `13638719007`、`007`、`1e5`、`0x1f`、`-1`、
+    `true`、`false`、`null`、`~` 这类裸值解析成非字符串类型。DSH 的
+    credentials-local 对 `refs` 的值做硬校验（typeof !== "string" 直接抛
+    TypeError），写入一个纯数字 Key 就会让 `credentials` 插件不激活，
+    进而 connection / authorization / 全部 tauri 与 mcp 插件级联 waiting，
+    dsh 完全无法启动（issue #103）。
+
+    JSON 的双引号标量同时是合法的 YAML double-quoted scalar，转义规则也
+    覆盖换行、引号、反斜杠与控制字符，比手写 `'%s'` 安全。
+    """
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def refs_value_is_scalar_string(text, key):
+    """refs: 块里该键的值是不是一个带引号的标量（issue #103 写后自检）。
+
+    只做本文件写入格式的自检：我们一律用 JSON 双引号标量写值，所以只要该行
+    的值不是以 `"` 开头并以 `"` 结尾，就说明序列化路径被改坏了（或不慎写了
+    裸值），DSH 的 credentials-local 会直接抛 TypeError。
+    """
+    for line in str(text or "").split("\n"):
+        stripped = line.strip()
+        if not stripped.startswith(key + ":"):
+            continue
+        value = stripped.partition(":")[2].strip()
+        if len(value) >= 2 and value.startswith(chr(34)) and value.endswith(chr(34)):
+            return True
+        return False
+    return False
+
+
 def yaml_refs_upsert(text, key, value):
     """Upsert 顶层 `refs:` 块内的键（DSH credentials.yaml 专用）。"""
+    rendered = _yaml_scalar(value)
     lines = text.split("\n")
     idx = 0
     while idx < len(lines):
@@ -261,17 +297,17 @@ def yaml_refs_upsert(text, key, value):
             while j < end:
                 if lines[j].strip() and _yaml_indent(lines[j]) == 2 \
                         and _yaml_key(lines[j]) == key:
-                    lines[j] = "  %s: %s" % (key, value)
+                    lines[j] = "  %s: %s" % (key, rendered)
                     return "\n".join(lines)
                 j += 1
             insert = _yaml_insert_point(lines, idx + 1, end, 2)
-            lines[insert:insert] = ["  %s: %s" % (key, value)]
+            lines[insert:insert] = ["  %s: %s" % (key, rendered)]
             return "\n".join(lines)
         idx += 1
     while lines and not lines[-1].strip():
         lines.pop()
     lines.append("refs:")
-    lines.append("  %s: %s" % (key, value))
+    lines.append("  %s: %s" % (key, rendered))
     return "\n".join(lines) + "\n"
 
 
@@ -372,8 +408,7 @@ def _load_state(accounts_dir):
 def _save_state(accounts_dir, state):
     path = _state_path(accounts_dir)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, indent=2)
+    _atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def _backup_dir(accounts_dir, client_id):
@@ -466,17 +501,20 @@ def _apply_codex(paths, ctx):
 def _apply_opencode(paths, ctx):
     path = paths["config"]
     data = _load_json(path, "opencode config")
-    models = []
-    for entry in ctx.get("models") or []:
+    models = {}
+    for entry in ctx.get("models") or ([{"id":ctx.get("model") or "auto"}]):
         mid = entry.get("id")
         if not mid:
             continue
-        item = {"id": mid, "name": mid}
+        item = {"name": mid}
+        limits = {}
         if entry.get("context_window"):
-            item["contextWindow"] = entry["context_window"]
+            limits["context"] = entry["context_window"]
         if entry.get("max_output"):
-            item["limit"] = entry["max_output"]
-        models.append(item)
+            limits["output"] = entry["max_output"]
+        if limits:
+            item["limit"] = limits
+        models[mid] = item
     provider = {
         "npm": "@ai-sdk/openai-compatible",
         "name": PROVIDER_NAME,
@@ -487,6 +525,8 @@ def _apply_opencode(paths, ctx):
         "models": models,
     }
     data = deep_merge(data, {"provider": {PROVIDER_ID: provider}})
+    if ctx.get("model"):
+        data["model"] = PROVIDER_ID + "/" + ctx["model"]
     return {path: _dump_json(data)}
 
 
@@ -523,6 +563,13 @@ def _apply_dsh(paths, ctx):
     credentials_path = paths["credentials"]
     cred_text = _read_text(credentials_path)
     cred_text = yaml_refs_upsert(cred_text, CREDENTIAL_REF, ctx["api_key"])
+    # issue #103：写后自检——DSH 要求 refs 的值必须是字符串标量；
+    # 这里失败就当场报错，绝不把「配置成功」写进面板。
+    if not refs_value_is_scalar_string(cred_text, CREDENTIAL_REF):
+        raise ValueError(
+            "DSH credentials 自检失败：refs.%s 未写成带引号的字符串标量"
+            "（纯数字/布尔 Key 会被 YAML 解析成非字符串，DSH 将无法启动）"
+            % CREDENTIAL_REF)
     return {settings_path: text, credentials_path: cred_text}
 
 
@@ -639,6 +686,221 @@ CLIENTS = {
 }
 
 
+def extend_clients(core):
+    clients = core.CLIENTS
+    config_root = lambda home: os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    def json_adapter(build):
+        def apply(paths, ctx):
+            path = paths["config"]
+            return {path: core._dump_json(build(core._load_json(path, "client config"), ctx))}
+        return apply
+    def model_rows(ctx):
+        rows = [dict(m) for m in ctx.get("models") or [] if m.get("id")]
+        selected = ctx.get("model") or (rows[0]["id"] if rows else "auto")
+        if not any(m["id"] == selected for m in rows):
+            rows.insert(0, {"id": selected})
+        return rows, selected
+    def path(home, *parts):
+        return os.path.join(home, *parts)
+    def register(cid, label, protocol, parts, apply, docs, desc, command=None, dirs=None):
+        files = parts if callable(parts) else lambda home: {"config": path(home, *parts)}
+        clients[cid] = {"id": cid, "label": label, "protocol": protocol,
+            "desc": desc, "files": files, "apply": apply, "docs_url": docs,
+            "category": "CLI / Harness" if cid != "continue" else "IDE 扩展",
+            "mode": "automatic", "commands": [command or cid], "probe_dirs": dirs or [],
+            "probe": lambda home: any(os.path.exists(p) for p in files(home).values())
+                or bool(shutil.which(command or cid)) or any(os.path.isdir(path(home, d)) for d in (dirs or []))}
+    def aider(paths, ctx):
+        p = paths["config"]
+        text = core._read_text(p)
+        for name, value in (("openai-api-base",ctx["base_url_v1"]), ("openai-api-key",ctx["api_key"]),
+                            ("model","openai/"+(ctx.get("model") or "auto"))):
+            text = core.yaml_upsert_inline(text, name, value)
+        return {p:text}
+    register("aider", "Aider", "openai", (".aider.conf.yml",), aider,
+        "https://aider.chat/docs/config/options.html", "更新用户 .aider.conf.yml；保留原注释与其他设置。")
+    def continue_apply(paths, ctx):
+        p=paths["config"];text=core._read_text(p)
+        # Continue accepts inline JSON as YAML sequence values; preserve other model blocks.
+        rows, selected=model_rows(ctx)
+        model={"name":"Qoder Gateway", "provider":"openai", "model":selected,
+               "apiBase":ctx["base_url_v1"], "apiKey":ctx["api_key"],
+               "roles":["chat","edit","apply"], "useResponsesApi":False}
+        text=managed_block(text, "continue-model", "  - "+json.dumps(model,ensure_ascii=False))
+        # Managed block must be under models, not arbitrarily below the last top-level key.
+        begin="# qoder-proxy:continue-model:begin";end="# qoder-proxy:continue-model:end"
+        block=re.search(r"(?m)^"+re.escape(begin)+r"\n[\s\S]*?^"+re.escape(end)+r"\n?",text)
+        if not block:raise core.AgentConfigError("Continue managed block missing")
+        model_block=block.group(0);text=text[:block.start()]+text[block.end():]
+        lines=text.splitlines(keepends=True)
+        indices=[i for i,l in enumerate(lines) if re.match(r"^models\s*:",l)]
+        if len(indices)>1:raise core.AgentConfigError("duplicate Continue models keys")
+        if indices:
+            i=indices[0]
+            if not re.match(r"^models\s*:\s*(?:#.*)?$",lines[i].rstrip()):
+                raise core.AgentConfigError("Continue models is not a block list; use manual merge")
+            j=i+1
+            while j<len(lines) and (not lines[j].strip() or lines[j].startswith((" ","#"))):j+=1
+            lines.insert(j,model_block if model_block.endswith("\n") else model_block+"\n")
+            text="".join(lines)
+        else:
+            if not text.strip():text='name: Qoder Local\nversion: 1.0.0\nschema: v1\n'
+            text=text.rstrip()+"\nmodels:\n"+model_block
+        return {p:text}
+    register("continue", "Continue", "openai", (".continue","config.yaml"), continue_apply,
+        "https://docs.continue.dev/reference", "向 Continue 用户 YAML 增量添加网关模型；不改项目配置。", command="cn", dirs=[".continue"])
+    def pi(data,ctx):
+        rows,_=model_rows(ctx)
+        provider={"baseUrl":ctx["base_url_v1"],"api":"openai-completions","apiKey":ctx["api_key"],
+                  "models":[dict({"id":m["id"]},**({"contextWindow":m["context_window"]} if m.get("context_window") else {})) for m in rows]}
+        return core.deep_merge(data,{"providers":{core.PROVIDER_ID:provider}})
+    register("pi", "Pi Coding Agent", "openai", lambda h:{"config":path(os.environ.get("PI_CODING_AGENT_DIR") or path(h,".pi","agent"),"models.json")},json_adapter(pi),
+        "https://pi.dev/docs/latest/models", "注册 models.json 自定义 provider；不触碰 auth.json。",dirs=[".pi"])
+    def factory(data,ctx):
+        rows,_=model_rows(ctx)
+        previous=data.get("customModels",[])
+        if not isinstance(previous,list):raise core.AgentConfigError("customModels must be an array")
+        keep=[m for m in previous if not (isinstance(m,dict) and str(m.get("displayName","")).startswith("Qoder Gateway · "))]
+        data=dict(data);data["customModels"]=keep+[{"model":m["id"],"displayName":"Qoder Gateway · "+m["id"],
+            "baseUrl":ctx["base_url_v1"],"apiKey":ctx["api_key"],"provider":"generic-chat-completion-api",
+            "maxOutputTokens":int(m.get("max_output") or 8192)} for m in rows]
+        return data
+    register("factory-droid", "Factory Droid", "openai", (".factory","settings.json"),json_adapter(factory),
+        "https://docs.factory.com/model-independence/byok", "保留已有 customModels，添加网关 BYOK 模型。",command="droid",dirs=[".factory"])
+    def copilot(data,ctx):
+        rows,_=model_rows(ctx);data=dict(data)
+        providers=data.get("providers",[]);models=data.get("models",[])
+        if not isinstance(providers,list) or not isinstance(models,list):raise core.AgentConfigError("Copilot providers/models must be arrays")
+        data["providers"]=[p for p in providers if not isinstance(p,dict) or p.get("name")!=core.PROVIDER_ID]+[{"name":core.PROVIDER_ID,"type":"openai","baseUrl":ctx["base_url_v1"],"apiKey":ctx["api_key"]}]
+        data["models"]=[m for m in models if not isinstance(m,dict) or m.get("provider")!=core.PROVIDER_ID]+[{"id":m["id"],"provider":core.PROVIDER_ID} for m in rows]
+        return data
+    register("copilot-cli", "GitHub Copilot CLI", "openai",lambda h:{"config":os.environ.get("COPILOT_PROVIDERS_CONFIG") or path(h,".copilot","providers.json")},json_adapter(copilot),
+        "https://docs.github.com/copilot/how-tos/copilot-cli/customize-copilot/add-llm-models", "写入官方 providers.json BYOK 注册表，保留 GitHub 默认账号。",command="copilot",dirs=[".copilot"])
+    def openhands(data,ctx):
+        return core.deep_merge(data,{"llm":{"model":"openai/"+(ctx.get("model") or "auto"),"api_key":ctx["api_key"],"base_url":ctx["base_url_v1"]}})
+    register("openhands", "OpenHands CLI", "openai", (".openhands","agent_settings.json"),json_adapter(openhands),
+        "https://docs.openhands.dev/openhands/usage/cli/command-reference", "更新官方 agent_settings.json 的 llm 字段。",dirs=[".openhands"])
+    def kilo(paths,ctx):
+        data=core._load_json(paths["config"],"Kilo config");rows,selected=model_rows(ctx)
+        data=core.deep_merge(data,{"provider":{core.PROVIDER_ID:{"npm":"@ai-sdk/openai-compatible","name":core.PROVIDER_NAME,
+            "options":{"baseURL":ctx["base_url_v1"],"apiKey":ctx["api_key"]},
+            "models":{m["id"]:{"name":m["id"]} for m in rows}}},"model":core.PROVIDER_ID+"/"+selected})
+        return {paths["config"]:core._dump_json(data)}
+    def kilo_files(h):
+        d=path(config_root(h),"kilo")
+        existing=path(d,"kilo.jsonc")
+        # Use actual existing file; JSONC with comments refuses rather than destroying comments.
+        return {"config":existing if os.path.exists(existing) else path(d,"kilo.json")}
+    register("kilo-cli", "Kilo Code CLI", "openai",kilo_files,kilo,
+        "https://kilo.ai/docs/code-with-ai/platforms/cli", "注册自定义 OpenAI provider；复杂 JSONC 保守拒绝并给出手动方案。",command="kilo",dirs=[".config/kilo"])
+    def vibe(paths,ctx):
+        p=paths["config"];text=core._read_text(p)
+        # Only our tagged TOML array blocks; all other tables untouched.
+        block='[[providers]]\nname = "qoder-proxy"\napi_base = '+json.dumps(ctx["base_url_v1"])+ '\napi_key_env_var = "QODER_PROXY_API_KEY"\napi_style = "openai"\nbackend = "generic"\n\n[[models]]\nname = '+json.dumps(ctx.get("model") or "auto")+'\nprovider = "qoder-proxy"\nalias = "qoder-proxy"'
+        text=managed_block(text,"vibe-provider",block)
+        # Insert global active_model before any TOML table, including [[array]].
+        lines=text.splitlines();idx=next((i for i,l in enumerate(lines) if l.lstrip().startswith("[")),len(lines))
+        matches=[i for i in range(idx) if re.match(r"^\s*active_model\s*=",lines[i])]
+        if matches:lines[matches[0]]='active_model = "qoder-proxy"'
+        else:lines.insert(idx,'active_model = "qoder-proxy"')
+        env=core._read_text(paths["env"]);env=managed_block(env,"vibe-key","QODER_PROXY_API_KEY="+json.dumps(ctx["api_key"]))
+        return {p:"\n".join(lines)+"\n",paths["env"]:env}
+    register("mistral-vibe", "Mistral Vibe", "openai",lambda h:{"config":path(h,".vibe","config.toml"),"env":path(h,".vibe",".env")},vibe,
+        "https://docs.mistral.ai/vibe/code/cli/configuration", "添加命名 provider/model 和独立凭据变量；保留原 Mistral 设置。",command="vibe",dirs=[".vibe"])
+    manuals=[
+      ("goose","Goose","CLI / Harness","goose",[".config/goose"],[],"https://goose-docs.ai/docs/getting-started/providers/","goose configure → Custom Providers / OpenAI Compatible；Base URL={BASE_URL_V1}；Key=YOUR_API_KEY；模型={MODEL}。凭据由客户端 keychain 管理。"),
+      ("gemini-cli","Gemini CLI","CLI / Harness","gemini",[".gemini"],[],"https://geminicli.com/docs/","原生使用 Gemini 协议，不能直接接本项目 OpenAI/Anthropic 出口；请保留其原生配置。"),
+      ("qwen-code","Qwen Code","CLI / Harness","qwen",[".qwen"],[],"https://qwenlm.github.io/qwen-code-docs/en/users/configuration/","使用 OpenAI-compatible provider；OPENAI_BASE_URL={BASE_URL_V1}；OPENAI_API_KEY=YOUR_API_KEY；OPENAI_MODEL={MODEL}。"),
+      ("amp","Amp","CLI / Harness","amp",[".config/amp"],[],"https://ampcode.com/manual","使用其官方模型路由；当前不自动改写内部凭据或将普通 API Key 冒充 Amp 登录。"),
+      ("cline","Cline","IDE 扩展","cline",[],["saoudrizwan.claude-dev"],"https://docs.cline.bot/provider-config/openai-compatible","Cline 设置 → API Provider=OpenAI Compatible；Base URL={BASE_URL_V1}；API Key=YOUR_API_KEY；Model ID={MODEL}。"),
+      ("roo-code","Roo Code","IDE 扩展","",[],["rooveterinaryinc.roo-cline"],"https://docs.roocode.com/providers/openai-compatible","Roo Code 设置 → OpenAI Compatible；Base URL={BASE_URL_V1}；Key=YOUR_API_KEY；Model={MODEL}。"),
+      ("kilo-vscode","Kilo Code (VS Code)","IDE 扩展","",[],["kilocode.kilo-code"],"https://kilo.ai/docs/ai-providers/openai-compatible","Providers → Custom provider → OpenAI Compatible；Base URL={BASE_URL_V1}，Key=YOUR_API_KEY，模型={MODEL}。"),
+      ("cursor","Cursor","IDE / 桌面","cursor",[".cursor"],[],"https://docs.cursor.com/settings/api-keys","Settings → Models → OpenAI API Key / Override OpenAI Base URL；URL={BASE_URL_V1}，Key=YOUR_API_KEY，添加模型={MODEL}。部分Agent功能由客户端限制。"),
+      ("windsurf","Windsurf","IDE / 桌面","windsurf",[".codeium/windsurf",".windsurf"],[],"https://docs.windsurf.com/","使用客户端 BYOK 支持范围；不直接编辑私有状态数据库，网关不能替代 Windsurf 原生订阅能力。"),
+      ("trae","Trae","IDE / 桌面","trae",[".trae"],[],"https://docs.trae.ai/","设置 → 模型 → 自定义 OpenAI-compatible provider；URL={BASE_URL_V1}，Key=YOUR_API_KEY，模型={MODEL}。"),
+      ("zed","Zed","IDE / 桌面","zed",[".config/zed"],[],"https://zed.dev/docs/ai/llm-providers","Settings → AI → OpenAI Compatible；api_url={BASE_URL_V1}，模型={MODEL}；凭据在 Zed 自己的安全存储录入。"),
+      ("cline-cli","Cline CLI","CLI / Harness","cline",[".cline"],[],"https://docs.cline.bot/cline-cli/overview","运行 cline auth，选择 OpenAI Compatible，填 {BASE_URL_V1}、YOUR_API_KEY、{MODEL}。"),
+      ("junie","JetBrains Junie","IDE / 桌面","junie",[".junie"],[],"https://www.jetbrains.com/help/junie/","使用客户端官方 BYOK 设置；插件/订阅功能不由本网关自动接管。"),
+      ("augment","Augment Code","IDE 扩展","auggie",[".augment"],["augment.vscode-augment"],"https://docs.augmentcode.com/","使用 Augment 官方提供的模型/接入方式；不改写其私有登录数据库。"),
+      ("cherry-studio","Cherry Studio","IDE / 桌面","",[],[],"https://docs.cherry-ai.com/","设置 → 模型服务 → OpenAI；地址={BASE_URL_V1}，Key=YOUR_API_KEY，获取模型。"),
+      ("chatbox","Chatbox","IDE / 桌面","chatbox",[],[],"https://chatboxai.app/","Settings → Model Provider → Custom/OpenAI API；URL={BASE_URL_V1}，Key=YOUR_API_KEY，模型={MODEL}。"),
+      ("lobe-chat","LobeChat","Web / 自部署","",[],[],"https://lobehub.com/docs","Provider → OpenAI Compatible；Base URL={BASE_URL_V1}，Key=YOUR_API_KEY。部署在其他机器时不要使用网关127.0.0.1。"),
+      ("open-webui","Open WebUI","Web / 自部署","open-webui",[],[],"https://docs.openwebui.com/getting-started/quick-start/starting-with-openai-compatible/","Admin → Connections → OpenAI API，填 {BASE_URL_V1} 和 YOUR_API_KEY；容器须使用可达宿主地址。"),
+    ]
+    for cid,label,category,command,dirs,extensions,docs,guide in manuals:
+        clients[cid]={"id":cid,"label":label,"desc":"提供本机检测与明确接入指引，不直接改私有状态或凭据库。",
+            "protocol":"native" if cid in ("gemini-cli","amp","windsurf","junie","augment") else "openai",
+            "files":lambda h:{},"probe":lambda h:False,"apply":None,"mode":"manual",
+            "category":category,"commands":[command] if command else [],"probe_dirs":dirs,
+            "extensions":extensions,"docs_url":docs,"guide":guide}
+
+
+def managed_block(text, name, body):
+    begin="# qoder-proxy:"+name+":begin";end="# qoder-proxy:"+name+":end"
+    if text.count(begin)!=text.count(end) or text.count(begin)>1:
+        raise ValueError("invalid existing Qoder managed block")
+    block=begin+"\n"+body.rstrip()+"\n"+end+"\n"
+    if begin in text:
+        return re.sub(r"(?m)^"+re.escape(begin)+r"\n[\s\S]*?^"+re.escape(end)+r"\n?",lambda m:block,text)
+    return text.rstrip()+"\n"+block
+
+
+def detect_catalog(clients, home):
+    """One directory inventory per extension root; never reads config contents."""
+    extensions=[]
+    for relative in (".vscode/extensions",".vscode-insiders/extensions",".cursor/extensions",".windsurf/extensions"):
+        directory=os.path.join(home,relative)
+        try:
+            extensions.extend(name.lower() for name in os.listdir(directory))
+        except OSError:
+            pass
+    apps=[]
+    for directory in (os.environ.get("LOCALAPPDATA"),os.environ.get("APPDATA"),"/Applications",os.path.join(home,"Applications")):
+        if not directory:continue
+        try:apps.extend(name.lower() for name in os.listdir(directory))
+        except OSError:pass
+    result={}
+    for cid,client in clients.items():
+        evidence=[]
+        for cmd in client.get("commands",[]):
+            executable=shutil.which(cmd)
+            if executable:evidence.append("PATH: "+os.path.basename(executable))
+        for relative in client.get("probe_dirs",[]):
+            if os.path.isdir(os.path.join(home,relative)):evidence.append("目录: "+relative)
+        for prefix in client.get("extensions",[]):
+            if any(e==prefix or e.startswith(prefix+"-") for e in extensions):evidence.append("扩展: "+prefix)
+        app_names={"cherry-studio":["cherry studio","cherrystudio"],"chatbox":["chatbox"],"cursor":["cursor"],"windsurf":["windsurf"],"trae":["trae"]}.get(cid,[])
+        if any(any(n in app for n in app_names) for app in apps):evidence.append("应用目录")
+        result[cid]=evidence
+    return result
+
+
+extend_clients(sys.modules[__name__])
+CLIENTS["continue"]["extensions"] = ["continue.continue"]
+
+def template(client_id, base_url, model=None):
+    """Pure placeholder template: build in an empty temp dir; no local config/key reads."""
+    client = _client(client_id)
+    base = str(base_url or "").strip().rstrip("/")
+    if not re.match(r"^https?://", base):
+        raise AgentConfigError("base_url must start with http:// or https://")
+    base_v1 = base if base.endswith("/v1") else base+"/v1"
+    model = str(model or "auto")
+    guide = client.get("guide", "在客户端选择 Qoder Gateway provider / 模型；配置前保留原件。")
+    guide = guide.replace("{BASE_URL_V1}", base_v1).replace("{MODEL}", model)
+    if client.get("mode") == "manual":
+        return {"client": client_id, "mode": "manual", "guide": guide, "files": []}
+    with tempfile.TemporaryDirectory(prefix="qoder-agent-template-") as home:
+        # Only role names come from the registry. Never read any resolved local client path.
+        roles = client["files"](home)
+        paths = {role: os.path.join(home, role + ".template") for role in roles}
+        ctx = {"base_url": base, "base_url_v1": base_v1, "api_key": "YOUR_API_KEY",
+               "model": model, "models": [{"id": model}]}
+        contents = client["apply"](paths, ctx)
+        return {"client": client_id, "mode": "automatic", "guide": guide,
+                "files": [{"role": role, "content": contents[p]} for role,p in paths.items() if p in contents]}
+
+
 def _client(client_id):
     client = CLIENTS.get(client_id)
     if not client:
@@ -656,9 +918,13 @@ def overview(accounts_dir, home=None):
     home = _resolve_home(home)
     state = _load_state(accounts_dir)
     out = []
+    evidence_map = detect_catalog(CLIENTS, home)
     for client_id in sorted(CLIENTS):
         client = CLIENTS[client_id]
-        installed = bool(client["probe"](home))
+        evidence = evidence_map.get(client_id, [])
+        installed = bool(evidence or client["probe"](home))
+        if installed and not evidence:
+            evidence = ["配置目录 / 可执行文件"]
         record = state.get(client_id) if installed else None
         out.append({
             "id": client_id,
@@ -666,6 +932,12 @@ def overview(accounts_dir, home=None):
             "desc": client["desc"],
             "protocol": client["protocol"],
             "installed": installed,
+            "mode": client.get("mode", "automatic"),
+            "category": client.get("category", "CLI / Harness"),
+            "evidence": evidence,
+            "docs_url": client.get("docs_url", ""),
+            "guide": client.get("guide", "使用下方占位符示例或一键配置；写入前备份，可还原。"),
+            "config_paths": list(client["files"](home).values()),
             "configured": bool(isinstance(record, dict)
                                and record.get("files")),
             "applied_at": (record or {}).get("applied_at"),
@@ -690,6 +962,8 @@ def plan(client_id, base_url, api_key, model=None, models=None, home=None):
         "model": str(model or "").strip() or None,
         "models": list(models or []),
     }
+    if client.get("mode") == "manual":
+        raise AgentConfigError("该客户端仅支持检测与手动接入，请查看官方配置指引")
     paths = client["files"](home)
     try:
         new_contents = client["apply"](paths, ctx)
@@ -734,8 +1008,10 @@ def integrate(accounts_dir, client_id, base_url, api_key, model=None,
                       if isinstance(entry, dict)}
     # Phase 1：先备份，后动手。
     staged = []
+    rollback_bytes = {}
     for entry in built["files"]:
         path, content, existed = entry["path"], entry["content"], entry["existed"]
+        rollback_bytes[path] = _read_bytes(path) if os.path.exists(path) else None
         prior = previous_files.get(path)
         if prior is not None and not prior.get("existed") and existed:
             # 上次 apply 我们建的文件：仍是原样就还是「我们的」，restore 删它
@@ -768,11 +1044,11 @@ def integrate(accounts_dir, client_id, base_url, api_key, model=None,
                 "bytes": len(content.encode("utf-8")),
             })
     except Exception as exc:
-        for w_path, w_existed, w_backup in written:
+        for w_path, w_existed, w_backup in reversed(written):
             try:
-                if w_existed and w_backup:
-                    _atomic_write_bytes(w_path, _read_bytes(w_backup))
-                elif not w_existed and os.path.exists(w_path):
+                if rollback_bytes[w_path] is not None:
+                    _atomic_write_bytes(w_path, rollback_bytes[w_path])
+                elif os.path.exists(w_path):
                     os.unlink(w_path)
             except Exception:
                 pass

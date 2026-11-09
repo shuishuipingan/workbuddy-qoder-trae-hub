@@ -18,7 +18,9 @@ import argparse
 import base64
 import bisect
 import calendar
+import copy
 import errno
+import gzip
 import hashlib
 import heapq
 import http.client
@@ -70,10 +72,18 @@ import wb_accounts
 import wb_activity
 import wb_atrest
 import wb_catalog
+import wb_codearts
 import wb_egress
 import wb_ipintel
 import wb_logstore
+import wb_media
+import wb_media_client
+import wb_media_tasks
+import wb_pool_media
+import wb_pool_scope
+import wb_pool_text
 import wb_pricing
+import wb_usage_io
 import wb_settings
 import wb_webprompts
 import wb_tiers
@@ -190,20 +200,18 @@ def port_owner_hint(port):
     if IS_WINDOWS:
         return "netstat -ano | findstr :%d" % port
     return "lsof -nP -iTCP:%d -sTCP:LISTEN" % port
+def restart_hint():
+    """Launcher that stops every running copy first."""
+    return "restart-wb-proxy.bat" if IS_WINDOWS else "./restart-wb-proxy.sh"
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
-# 区域自动路由（对标 qd 的 #26）：默认开启。**显式指定永远优先** —— 本开关只
-# 作用于「用户没指定区域」时的兜底路径（?realm= / Key 绑定 / X-Realm 任一存在时
-# 都优先于本逻辑）。prefer 默认 cn：一个 key 同时打国内/国际时默认先走国内，
-# 国内无可用账号（额度/熔断/冷却/日限额全算）自动回退国际。
-AUTO_REALM_ENABLED = os.environ.get("WB_AUTO_REALM", "1").lower() not in (
-    "0", "false", "no", "off")
 def detect_model_realm(model_id):
     if not model_id:
         return CURRENT_REALM
     m = str(model_id).lower()
     intl_only = {
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
+        "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        "gemini-3.8-flash", "gemini-3.5-flash",
         "grok-4.7"
     }
     if m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-")):
@@ -227,8 +235,9 @@ def detect_model_realm(model_id):
 INTL_EXCLUSIVE_PREFIXES = ("gpt-", "gemini-")
 CN_EXCLUSIVE_PREFIXES = ("deepseek-v4-pro",)
 INTL_EXCLUSIVE = {
-    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-    "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
+    "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gemini-3.8-flash", "gemini-3.5-flash",
     "grok-4.7",
 }
 CN_EXCLUSIVE = {
@@ -236,44 +245,6 @@ CN_EXCLUSIVE = {
     "kimi-k3-1", "kimi-k2.7", "minimax-m3",
     "hy3-x", "hy4-preview-dev", "hy4-preview-x",
 }
-def realm_candidates(model, requested=None):
-    """本次请求应尝试的区域（按顺序）。智能路由规则：
-
-      1. 区域独占模型：只试它所在的区域（另一区上游根本没有这个模型）。
-      2. 显式指定（?realm= / Key 绑定 / X-Realm）：尊重显式，但允许在
-         「该区无可用账号」时回退另一区（前提是另一区有这个模型）。
-      3. 自动（未显式指定）：prefer（默认 cn）优先；若 prefer 区当前一个
-         可用账号都没有而另一区有，直接换序 —— 一次命中，不必先撞一次失败。
-    返回列表至少有一个元素；自动路由关闭时等价于旧行为（单元素）。
-    """
-    owner = exclusive_realm(model)
-    try:
-        cfg = wb_settings.realm_routing(ACCOUNTS_DIR)
-    except Exception:
-        cfg = {"enabled": True, "prefer": "cn"}
-    enabled = bool(cfg.get("enabled")) and AUTO_REALM_ENABLED
-    if requested:
-        realms = [requested]
-        if not enabled or requested not in ("cn", "intl")                 or owner not in ("", requested):
-            return realms
-        other = "intl" if requested == "cn" else "cn"
-        return [requested, other]
-    if owner:
-        return [owner]
-    if not enabled:
-        return [CURRENT_REALM]
-    prefer = cfg.get("prefer") or "cn"
-    other = "intl" if prefer == "cn" else "cn"
-    try:
-        if POOL is not None \
-                and POOL.count_ready(prefer, model=model or None) == 0 \
-                and POOL.count_ready(other, model=model or None) > 0:
-            return [other, prefer]
-    except Exception as exc:
-        log("auto realm readiness probe skipped: %s" % exc)
-    return [prefer, other]
-
-
 def exclusive_realm(model_id):
     """"intl"/"cn" when only that exit serves the model, else ""."""
     if not model_id:
@@ -334,8 +305,753 @@ def install_console_close_handler():
 # ---------------------------------------------------------------------------
 UPSTREAM = "https://www.workbuddy.ai"
 CHAT_PATH = "/v2/chat/completions"
+
+#: 媒体路由（生图 / 改图 / 生视频）。与 chat 并列的一层，鉴权走同一个 API Key 门，
+#: 但**不占** chat 的并发槽：一次生图要十几秒、一条视频要几十秒到几分钟。
+MEDIA_POST_PATHS = (
+    "/v1/images/generations", "/images/generations",
+    "/v1/images/edits", "/images/edits",
+    "/v1/videos", "/videos",
+)
+#: 媒体请求体上限。改图的输入图是 data URL：8 MB 原图编码后约 10.7 MB，再包一层
+#: JSON 就逼近通用上限（默认 16 MB，还可能被 max_payload_mb 调小），而那条上限是
+#: 给 chat 定的。媒体单独放宽，且**只放宽不收紧**：用户配得更大就随他。
+MEDIA_MAX_PAYLOAD_BYTES = 24 * 1024 * 1024
+#: 一次媒体调用最多换几个账号。与 chat 的重试量级一致；媒体贵，再多就是烧钱。
+MEDIA_ROTATE_MAX = 3
+#: 媒体并发槽。默认 4：生图单张十几秒，一条视频的**提交**只要几秒（轮询在后台 worker），
+#: 所以这里管的是「同时在跑的请求数」，不是「同时在排队的任务数」。
+MEDIA_SLOTS_DEFAULT = 4
+try:
+    MEDIA_SLOTS = max(1, int(os.environ.get("WB_MEDIA_SLOTS", MEDIA_SLOTS_DEFAULT)))
+except ValueError:
+    MEDIA_SLOTS = MEDIA_SLOTS_DEFAULT
+_MEDIA_SLOTS_SEM = threading.BoundedSemaphore(MEDIA_SLOTS)
+_MEDIA_INFLIGHT = 0
+_MEDIA_INFLIGHT_LOCK = threading.Lock()
+_MEDIA_RATE_LOCK = threading.Lock()
+#: (key_id, 分钟桶) → 本分钟内已发的生图次数。只在内存里：重启清零是可接受的，
+#: 它是一道防误循环的闸，不是账本（账本在 usage.jsonl）。
+_MEDIA_RATE = {}
+#: `/v3/config` 的**原始** payload（含 media tags），按区缓存。与 _models_cache 分开：
+#: 后者已被投影成聊天目录，媒体条目在投影里丢了（selectCliModels 不认它们）。
+_catalog_raw = {}
+
+#: 换号可能就过了的失败：都是「这个账号此刻不行」而不是「这个请求不对」。
+MEDIA_RETRYABLE = frozenset(("AUTH", "RATE_LIMIT", "NO_CREDIT", "UPSTREAM"))
+#: 可能已经扣过积分的失败，要进模型级冷却。
+#: REJECTED / INVALID_ARGS / NO_MEDIA_MODEL 不在其中——它们一分钱没花。
+MEDIA_BILLABLE = frozenset(("AUTH", "RATE_LIMIT", "NO_CREDIT", "UPSTREAM",
+                            "EMPTY_RESULT", "TASK_FAILED"))
+
+
+class MediaRateLimited(Exception):
+    """429 的鸭子类型载体：`_rate_limited()` 只读 wait / message / detail。"""
+
+    def __init__(self, wait):
+        Exception.__init__(self, "media rate limit")
+        self.wait = int(wait or 60)
+        self.message = ("媒体请求太频繁：每 Key 每分钟的生图上限已用尽，请 %d 秒后再试"
+                        % self.wait)
+        self.detail = ""
+
+
+def _as_text(value):
+    """非空字符串才算数（`None` / 空串 / 非字符串一律视为"没给"）。"""
+    return value if isinstance(value, str) and value.strip() != "" else ""
+
+
+def acquire_media_slot():
+    """拿一个媒体并发槽；满员返回 False（调用方回 503 + Retry-After）。"""
+    global _MEDIA_INFLIGHT
+    if not _MEDIA_SLOTS_SEM.acquire(blocking=False):
+        return False
+    with _MEDIA_INFLIGHT_LOCK:
+        _MEDIA_INFLIGHT += 1
+    return True
+
+
+def release_media_slot():
+    global _MEDIA_INFLIGHT
+    with _MEDIA_INFLIGHT_LOCK:
+        if _MEDIA_INFLIGHT > 0:
+            _MEDIA_INFLIGHT -= 1
+    try:
+        _MEDIA_SLOTS_SEM.release()
+    except ValueError:
+        pass
+
+
+def media_inflight():
+    with _MEDIA_INFLIGHT_LOCK:
+        return _MEDIA_INFLIGHT
+
+
+def media_rate_allow(key_id, per_minute, now=None):
+    """每 Key 每分钟的生图次数闸。返回 (是否放行, 建议等待秒数)。
+
+    这是一道「防客户端死循环把额度烧光」的闸，不是账本——账本在 usage.jsonl。
+    所以它只在内存里、重启清零是可接受的；也因此它不允许被环境变量调大。
+    """
+    if per_minute is None or per_minute <= 0:
+        return True, 0
+    now = time.time() if now is None else now
+    bucket = int(now // 60)
+    with _MEDIA_RATE_LOCK:
+        # 顺手清掉上一分钟的桶：进程长跑时这张表不会越滚越大。
+        for existing in list(_MEDIA_RATE):
+            if existing[1] != bucket:
+                del _MEDIA_RATE[existing]
+        slot = (key_id or "", bucket)
+        used = _MEDIA_RATE.get(slot, 0)
+        if used >= per_minute:
+            return False, max(1, int(60 - (now % 60)))
+        _MEDIA_RATE[slot] = used + 1
+    return True, 0
+
+
+#: (Key, 本地日期) → 当天已花的媒体积分。**只在内存里**：重启清零可接受，
+#: 与「每分钟次数」同一取舍——它是防失控的闸，账本在 usage.jsonl。
+_MEDIA_KEY_SPEND = {}
+_MEDIA_KEY_SPEND_LOCK = threading.Lock()
+
+
+def _media_day_key(key_id):
+    return (key_id or "", time.strftime("%Y-%m-%d"))
+
+
+def media_key_spend(key_id):
+    with _MEDIA_KEY_SPEND_LOCK:
+        return _MEDIA_KEY_SPEND.get(_media_day_key(key_id), 0.0)
+
+
+def media_key_spend_add(key_id, credit):
+    """记一笔媒体花费（实际扣费，不是预估）。"""
+    try:
+        amount = float(credit or 0)
+    except (TypeError, ValueError):
+        return
+    if amount <= 0:
+        return
+    with _MEDIA_KEY_SPEND_LOCK:
+        slot = _media_day_key(key_id)
+        _MEDIA_KEY_SPEND[slot] = _MEDIA_KEY_SPEND.get(slot, 0.0) + amount
+        today = slot[1]
+        for existing in list(_MEDIA_KEY_SPEND):
+            if existing[1] != today:
+                del _MEDIA_KEY_SPEND[existing]
+
+
+def media_key_spend_allow(key_id, cost, limit):
+    """当天这个 Key 还能不能花 `cost` 积分。`limit <= 0` 表示不限。
+
+    这是第二道闸门：**Key 级**防「一个客户端把整个池子烧光」，账号级的
+    `daily_credit_limit` 防「某个账号被烧穿」。两层都过才派发。
+    预检用**预估上界**（图片 6、视频 26/秒），累计用**实际扣费**——保守方向反了就
+    起不到护栏作用。
+    """
+    if not limit or limit <= 0:
+        return True, ""
+    spent = media_key_spend(key_id)
+    projected = spent + max(0.0, float(cost or 0))
+    if projected > float(limit):
+        return False, ("本 Key 今日媒体花费已达 %.2f / %g 积分上限（本次预估 %g）"
+                       % (spent, limit, cost))
+    return True, ""
+
+
+def media_budget_ok(account, cost):
+    """派发前的两道预算预检，返回 (是否够, 不够的原因)。
+
+    `ready()` 只回答「这个账号此刻能不能用」，不回答「付不付得起这一次」：
+    一条 5 秒 kling 视频约 128 积分，在 300 积分余额的账号上是 43%；而
+    `credit_limit_blocked()` 只在 `used >= limit` 时才为真，**不预判本次成本**。
+    所以两道都要看：
+
+      1. 缓存余额 `credits["remain"]` —— 余额未知时不拦（与 reserve_blocked 同一口径，
+         否则新装的账号会永远派不出去）
+      2. 日限额余量 `daily_credit_limit - daily_credits_today` —— 不预检的话，
+         媒体单次超额会把账号当日额度顶穿，然后 chat 也被 credit_limit_blocked 摘掉
+    """
+    credits = getattr(account, "credits", None)
+    if isinstance(credits, dict):
+        try:
+            remain = float(credits.get("remain"))
+        except (TypeError, ValueError):
+            remain = None
+        if remain is not None and remain < cost:
+            return False, "缓存余额 %g 积分 < 本次预估 %g" % (remain, cost)
+    try:
+        limit = int(getattr(account, "daily_credit_limit", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit > 0:
+        used = getattr(account, "daily_credits_today", None)
+        try:
+            used = float(used)
+        except (TypeError, ValueError):
+            used = None
+        if used is not None:
+            headroom = limit - used
+            if headroom < cost:
+                return False, ("今日额度剩 %g 积分 < 本次预估 %g"
+                               % (max(0.0, headroom), cost))
+    return True, ""
+
+
+# ---------------------------------------------------------------- 生视频的任务表与学区间
+#
+# 任务表是懒单例：模块导入时不建目录、不起线程——测试里 import wb_proxy 是常事，
+# 不该顺带在磁盘上留一个 media/ 目录。
+_MEDIA_TASKS = None
+_MEDIA_TASKS_LOCK = threading.Lock()
+#: 上游在拒绝文案里自报的时长区间，按 (区, 模型 id) 记。目录没给 videoGeneration 的
+#: 账号本地无从校验，只能让上游先拒一次；学到之后第二次同样的越界值就能在本地拦下
+#: （零请求、零冷却）。键带上区域名，因为模型 id 不跨区。
+_MEDIA_LEARNED_SECONDS = {}
+_MEDIA_LEARNED_LOCK = threading.Lock()
+
+
+def learn_video_seconds(realm, model_id, text):
+    """从上游的拒绝文案里学「这个模型支持几秒」，返回 (min, max) 或 None。
+
+    读不出区间就什么都不记——**绝不猜**。实测文案形如
+    `unsupported video duration: 1 seconds, supported range: 4-15 seconds`。
+    """
+    span = wb_media.parse_supported_seconds_range(text or "")
+    if span is None:
+        return None
+    with _MEDIA_LEARNED_LOCK:
+        _MEDIA_LEARNED_SECONDS[(realm, model_id)] = span
+    return span
+
+
+def learned_video_seconds(realm, model_id):
+    with _MEDIA_LEARNED_LOCK:
+        return _MEDIA_LEARNED_SECONDS.get((realm, model_id))
+
+
+#: 单价账本：`(模型, 分辨率) → 积分/秒`，来源是上游 `usage.credit` ÷ 秒数。
+#: 该数值与账号余额**核对得上**：实测一条 4 秒视频记账 57.14，服务账号
+#: `credits.remain` 随后正好减少 57.14（入账有约 2 分钟延迟，早查会看成没扣）。
+#: 核对工具见 scripts/reconcile_credits.py。
+#:
+#: 上游目录**没有价格字段**，价格只在结算时以 `credit` 返回，所以真实单价只能从
+#: "实扣 ÷ 秒数"反推。为什么要单独记：原来的估算用一个一刀切的 26 积分/秒，
+#: 对 minimax（实测 14.29/秒）高估 82%——余额紧时会把本来跑得起的调用挡掉；
+#: 对高分辨率档位又可能低估，而低估的后果是账号被一次调用打穿。
+_MEDIA_PRICES = {}
+_MEDIA_PRICES_LOCK = threading.Lock()
+_MEDIA_PRICES_PATH = None
+#: 生图实测单价（积分/张），键 = 模型 id。与视频分开记：一个是按秒、一个是按张，
+#: 混在一张表里迟早会把单位搞错。
+_MEDIA_IMAGE_PRICES = {}
+_MEDIA_IMAGE_PRICES_PATH = None
+
+
+def media_prices_path():
+    """账本落盘位置（与任务表同目录，重启后仍然有效）。"""
+    return os.path.join(wb_media_tasks.default_out_dir(), "video-prices.json")
+
+
+def media_image_prices_path():
+    return os.path.join(wb_media_tasks.default_out_dir(), "image-prices.json")
+
+
+def learn_image_price(model, credit):
+    """记下一次生图的实扣（积分/张）。没有 credit 就不记，绝不猜。"""
+    model = (model or "").strip()
+    if not model:
+        return None
+    try:
+        credit = float(credit)
+    except (TypeError, ValueError):
+        return None
+    if credit <= 0:
+        return None
+    price = round(credit, 4)
+    with _MEDIA_PRICES_LOCK:
+        _MEDIA_IMAGE_PRICES[model] = price
+        try:
+            with open(_MEDIA_IMAGE_PRICES_PATH, "w", encoding="utf-8") as handle:
+                json.dump(_MEDIA_IMAGE_PRICES, handle, ensure_ascii=False,
+                          indent=2, sort_keys=True)
+        except Exception:                                # noqa: BLE001
+            pass
+    return price
+
+
+def media_image_price(model):
+    """实测单张价格；没有观测值返回 None。"""
+    with _MEDIA_PRICES_LOCK:
+        return _MEDIA_IMAGE_PRICES.get((model or "").strip())
+
+
+def media_image_cost_hint(model):
+    """生图派发前的估计：有实测价按实测，否则用 6.0（保守上界）。"""
+    price = media_image_price(model)
+    return price if price else wb_media.COST_IMAGE_ESTIMATE
+
+
+def load_media_prices():
+    """读回账本；文件不存在或坏了都当空账本，不影响派发。"""
+    global _MEDIA_PRICES_PATH
+    path = media_prices_path()
+    _MEDIA_PRICES_PATH = path
+    global _MEDIA_IMAGE_PRICES_PATH
+    _MEDIA_IMAGE_PRICES_PATH = media_image_prices_path()
+    try:
+        with open(_MEDIA_IMAGE_PRICES_PATH, encoding="utf-8") as handle:
+            image_payload = json.load(handle)
+        if isinstance(image_payload, dict):
+            with _MEDIA_PRICES_LOCK:
+                for model, value in image_payload.items():
+                    try:
+                        _MEDIA_IMAGE_PRICES[model] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:                                    # noqa: BLE001
+        return
+    if not isinstance(payload, dict):
+        return
+    with _MEDIA_PRICES_LOCK:
+        for key, value in payload.items():
+            parts = (key or "").split("|")
+            model = parts[0]
+            resolution = parts[1] if len(parts) > 1 else ""
+            with_reference = len(parts) > 2 and parts[2] == "ref"
+            if len(parts) > 2 and parts[2] not in ("", "ref"):
+                continue
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if model and price > 0:
+                _MEDIA_PRICES[(model, resolution, with_reference)] = price
+
+
+def _save_media_prices_locked():
+    path = _MEDIA_PRICES_PATH
+    if not path:
+        return
+    payload = {("%s|%s" % (model, resolution)) + ("|ref" if ref else ""): price
+               for (model, resolution, ref), price in _MEDIA_PRICES.items()}
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:                                    # noqa: BLE001
+        pass                                             # 落盘失败不影响派发
+
+
+def learn_media_price(model, resolution, credit, seconds, with_reference=False):
+    """用一次已完成任务的实扣反推单价。
+
+    三个输入缺一不可：`credit` 为空说明上游没给结算值（failed / lost），
+    `seconds` 缺失就无法换算成单价。**绝不按猜测补一个数**——错的价格比没有价格
+    更坏，它会悄悄改变"付得起吗"的判断。
+
+    `with_reference` 单独一档：**带参考素材的任务按 2 倍计价**（2026-11-02 实测：
+    3 张参考图 + 1 段参考视频、5 秒 768P 实扣 142.86 = 28.572/秒，正好是普通
+    768P 14.2857/秒 的 2.00 倍）。两档共用同一个键会互相覆盖——那次实测就把
+    768P 的普通单价写成了 28.572，之后所有普通任务报价都会翻倍。
+    """
+    model = (model or "").strip()
+    if not model:
+        return None
+    try:
+        credit = float(credit)
+        span = float(seconds)
+    except (TypeError, ValueError):
+        return None
+    if credit <= 0 or span <= 0:
+        return None
+    price = round(credit / span, 4)
+    with _MEDIA_PRICES_LOCK:
+        _MEDIA_PRICES[_price_key(model, resolution, with_reference)] = price
+        _save_media_prices_locked()
+    return price
+
+
+def _price_key(model, resolution, with_reference=False):
+    """账本键：(模型, 分辨率, 是否带参考素材)。"""
+    return ((model or "").strip(), (resolution or "").strip(),
+            bool(with_reference))
+
+
+def media_price_per_second(model, resolution=None, exact_only=False,
+                          with_reference=False):
+    """实测单价（上游 credit ÷ 秒数）；没有观测值返回 None。
+
+    精确匹配 `(模型, 分辨率)` 优先；只有别的分辨率的观测值时取该模型**最大值**
+    ——估算宁可往高报：高估只是可能少派一次，低估会把账号打穿。
+
+    `exact_only=True` 关掉那个"取最大值"的兜底：**报价**必须诚实，把 4K 的价
+    填给没观测过的 1080P 就是错报（实测 minimax 2K 比 768P 贵 60%，两者价差
+    不是噪声）。所以对外报价走严格模式，内部预算判断才用宽松模式。
+    """
+    model = (model or "").strip()
+    if not model:
+        return None
+    tier = bool(with_reference)
+    with _MEDIA_PRICES_LOCK:
+        exact = _MEDIA_PRICES.get(_price_key(model, resolution, tier))
+        if exact:
+            return exact
+        if exact_only:
+            return None
+        # 兜底只在**同一档**里取最大值：拿"带参考素材"的 2 倍价去估普通任务，
+        # 会把预算算成两倍，害得本来付得起的单子被拦下。
+        same_model = [price for (name, _res, ref), price in _MEDIA_PRICES.items()
+                      if name == model and ref == tier]
+    return max(same_model) if same_model else None
+
+
+def backfill_media_prices():
+    """从任务历史里回填单价账本（**只用有过实扣的已完成任务**）。
+
+    为什么要回填：账本是我在功能上线后才加的，之前跑过的任务已经在 `tasks.json`
+    里留下了"实扣 + 秒数 + 分辨率"，这些是真实结算数据，比任何估算都可信。
+    不做这一步，网关会一直用 26/秒的上界，直到下一次真跑视频。
+    """
+    try:
+        with open(os.path.join(wb_media_tasks.default_out_dir(), "tasks.json"),
+                  encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:                                    # noqa: BLE001
+        return 0
+    tasks = payload.get("tasks") if isinstance(payload, dict) else None
+    if not isinstance(tasks, list):
+        return 0
+    learned = 0
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("status") != "completed":
+            continue
+        # 老任务没有 `has_reference_materials` 这个字段，**无从判断是哪一档**。
+        # 当成普通档学就会把"带参考素材"的 2 倍价写进普通档——实测发生过一次：
+        # 一条 5 秒 768P 的带素材任务（142.86）把 768P 的普通单价从 14.2857
+        # 改成了 28.572，之后每次重启回填都会再写坏一遍。宁可少学一条。
+        if "has_reference_materials" not in task:
+            continue
+        if learn_media_price(task.get("model"), task.get("resolution"),
+                             task.get("credit"), task.get("seconds"),
+                             with_reference=bool(task.get("has_reference_materials"))) is not None:
+            learned += 1
+    # 生图没有任务表（同步调用），实扣只落在 usage.jsonl 里，也从那儿回填。
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue                     # 半行/坏行跳过，不因此中断回填
+                if row.get("kind") == "image" and row.get("credit"):
+                    if learn_image_price(row.get("model"), row.get("credit")) is not None:
+                        learned += 1
+    except Exception:                                    # noqa: BLE001
+        pass
+    if learned:
+        log("media: 从历史记录回填 %d 条实测单价" % learned, tag="media")
+    return learned
+
+
+def media_cost_hint(model, seconds, resolution=None, with_reference=False):
+    """派发前的积分估计：有实测价按实测算，没有才退回 26/秒的上界。
+
+    `with_reference` 要如实传：带参考素材是另一档价（实测 2 倍），拿普通档估它
+    会低估一半，等于把"付不起"的单子放过去。
+    """
+    return wb_media.estimate_cost(
+        "video", seconds,
+        price_per_second=media_price_per_second(model, resolution,
+                                                with_reference=with_reference))
+
+
+def media_task_finished(task):
+    """任务到终态时补一笔 usage。
+
+    生图的 credit 在响应里就有，视频的只在轮询完成时才给——所以视频的记账挂在任务表
+    的完成回调上，而不是提交流程里（提交时还不知道花了多少）。
+
+    `failed` / `lost` 也可能已经扣过费，但上游没给数值。这里**不编一个 0** 进去：
+    那会让账面上看起来这些任务是免费的。
+    """
+    credit = (task or {}).get("credit")
+    if credit is None:
+        return
+    media_key_spend_add(task.get("key"), credit)
+    # 用实扣反推单价，下次估算就不必再用一刀切的 26/秒。
+    learned = learn_media_price(task.get("model"), task.get("resolution"),
+                                credit, task.get("seconds"),
+                                with_reference=bool(task.get("has_reference_materials")))
+    if learned is not None:
+        log("media: 学到 %s（%s%s）单价 %.4f 积分/秒（实扣 %.2f ÷ %s 秒）"
+            % (task.get("model"), task.get("resolution") or "默认",
+               "·带参考素材" if task.get("has_reference_materials") else "", learned,
+               float(credit), task.get("seconds")), tag="media")
+    record_usage(task.get("model") or "video", {"credit": credit}, stream=False,
+                 account=task.get("account"), outcome="completed",
+                 key=task.get("key"), realm=task.get("realm"), kind="video",
+                 # 参数必须落到账上：否则同一行只有 credit，事后无法解释
+                 # "为什么这次 57.14、那次 128.57"（模型/秒数/分辨率都丢了）。
+                 media={"seconds": task.get("seconds"),
+                        "resolution": task.get("resolution"),
+                        "aspect_ratio": task.get("aspect_ratio"),
+                        "image_to_video": task.get("image_to_video")})
+
+
+def media_account_by_uid(uid):
+    """任务表轮询时按 uid 找账号。
+
+    这个函数必须定义在 wb_proxy 里、并被**注入**给任务表：任务表不能自己
+    `import wb_proxy`——wb_proxy 以脚本方式运行时模块名是 `__main__`，
+    `import wb_proxy` 会把模块代码再跑一遍，拿到一个 `POOL is None` 的影子模块。
+    后果是提交成功却立刻 "账号已不可用"。这里读的是本模块自己的 POOL 全局量。
+    """
+    _, pool = _ensure_pools()
+    if pool is None:
+        return None
+    try:
+        # Task recovery may only resume on a media-pool account. Moving the
+        # account back to text makes the task fail clearly instead of silently
+        # using a text credential for image/video work.
+        return pool.get(uid)
+    except Exception:
+        return None
+
+
+#: 参考视频/音频里允许自动上传的素材上限（与图片同一档）
+def resolve_reference_uploads(body, realm, model_id, account=None):
+    """把 `body` 里参考视频/音频的 data URL 换成**上游抓得到**的 download_url。
+
+    为什么必须换：上游对 `video_url` 是**真去下载的**。data URL 与本地路径都抓不到，
+    实测报 `2013: content[4].video_url: media url unreachable`。官方客户端的做法是
+    「预签名 → PUT 到 COS → 把 download_url 填进 video_url」，这里照抄。
+
+    上传不花积分（只有提交任务才花），所以用一个临时挑出来的账号做也没关系。
+    签名 24 小时有效，因此队列里排队过夜的任务可能需要重传——上游那条路本来也躲不开。
+    """
+    kinds = (("reference_videos", "video_url", "参考视频"),
+             ("reference_audios", "audio_url", "参考音频"))
+    pending = [(kind, inner, label) for kind, inner, label in kinds
+               if any(wb_media.is_data_url((entry or {}).get(inner) or "")
+                      for entry in (body.get(kind) or ()))]
+    if not pending:
+        return body
+    if account is None:
+        account = _pick_media_account_for(realm, model_id, 0, set())
+    for kind, inner, label in pending:
+        resolved = []
+        for entry in body.get(kind) or ():
+            url = (entry or {}).get(inner) or ""
+            if not wb_media.is_data_url(url):
+                resolved.append(entry)
+                continue
+            data, filename = wb_media.split_data_url(url)
+            if len(data) > wb_media.MAX_INPUT_IMAGE_BYTES:
+                raise wb_media.MediaError(
+                    "INVALID_ARGS",
+                    "%s %d 字节，超过 %d 字节上限（先压缩再传）"
+                    % (label, len(data), wb_media.MAX_INPUT_IMAGE_BYTES))
+            download_url = wb_media_client.upload_reference_file(account, data, filename)
+            log("media: %s 已上传到上游 (%d 字节)" % (label, len(data)), tag="media")
+            resolved.append({inner: download_url})
+        body[kind] = resolved
+    return body
+
+
+def _pick_media_account_for(realm, model_id, cost_hint, excluded):
+    """选账号的**模块级**实现（后台提交线程也能用）。
+
+    `Handler._pick_media_account` 只是薄薄一层：它把 self 上的 Key 白名单/钉账号
+    变成参数再调这里。后台线程没有 self，直接调这个。
+    """
+    apply_daily_guards()
+    apply_reserve_credits()
+    hold = restriction_hold_remaining(realm)
+    if hold > 0:
+        raise wb_media.MediaError(
+            "RATE_LIMIT",
+            "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1))
+    pinned = pinned_account()
+    if pinned is not None:
+        _, medias = _ensure_pools()
+        if medias is not None:
+            try:
+                medias.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_media.MediaError("AUTH", str(exc))
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_media.MediaError("NO_ROUTE", str(exc))
+        if pinned.realm != realm:
+            raise wb_media.MediaError(
+                "INVALID_ARGS", "钉住的账号属于 %s 出口，媒体只走 %s" % (pinned.realm, realm))
+        if not pinned.ready(model=model_id):
+            raise wb_media.MediaError(
+                "UPSTREAM", "钉住的账号此刻不可用：%s" % pinned.unavailable_reason(model=model_id))
+        ok, reason = media_budget_ok(pinned, cost_hint)
+        if not ok:
+            raise wb_media.MediaError("NO_CREDIT", "钉住的账号付不起这次调用：%s" % reason)
+        return pinned
+    _, medias = _ensure_pools()
+    account = (medias.pick(realm=realm, exclude=excluded or set(),
+                           model=model_id)
+               if medias is not None else None)
+    if account is None:
+        return None
+    ok, reason = media_budget_ok(account, cost_hint)
+    if not ok:
+        raise wb_media.MediaError("NO_CREDIT", "%s 付不起这次调用：%s" % (account.uid[:8], reason))
+    return account
+
+
+def _media_realm_for_key(handler=None, requested=None):
+    """Choose the media exit without a persisted media-realm setting.
+
+    Priority:
+      1. the API key's bound realm,
+      2. an explicitly requested realm (only for the catalogue endpoint),
+      3. the only realm that currently has usable media accounts,
+      4. the panel's active realm when it has media accounts, otherwise any
+         realm with media accounts, and finally the active realm for a fresh
+         install.
+    """
+    # /health is also served without an API key and is exercised by lightweight
+    # request doubles that only implement the health-facing surface. Treat a
+    # missing key context as an unbound request instead of assuming every
+    # handler carries the full authentication helpers.
+    allowed = None
+    bound = ""
+    if handler is not None:
+        allowed_getter = getattr(handler, "_key_allowed_accounts", None)
+        realm_getter = getattr(handler, "_key_realm", None)
+        if callable(allowed_getter):
+            allowed = allowed_getter()
+        if callable(realm_getter):
+            bound = realm_getter() or ""
+    if bound:
+        return bound
+    if requested:
+        # Let the caller's validation turn an unknown explicit realm into 400.
+        return requested
+
+    _, medias = _ensure_pools()
+    realms = [realm for realm in wb_settings.MEDIA_REALMS
+              if medias is not None
+              and medias.count_ready(realm=realm, allowed=allowed, refresh=False) > 0]
+    if len(realms) == 1:
+        return realms[0]
+    if CURRENT_REALM in realms:
+        return CURRENT_REALM
+    if realms:
+        return realms[0]
+    # 没有可用账号时，仍要能从留档目录提供模型清单。否则一次冷启动会
+    # 把“暂时没有账号”误报成“媒体路由不存在”，客户端会以为功能未开启。
+    catalog_realms = [realm for realm in wb_settings.MEDIA_REALMS
+                      if read_catalog_dump(realm) is not None]
+    if CURRENT_REALM in catalog_realms:
+        return CURRENT_REALM
+    if catalog_realms:
+        return catalog_realms[0]
+    return CURRENT_REALM if CURRENT_REALM in wb_settings.MEDIA_REALMS else "cn"
+
+
+def media_tasks():
+    """生视频任务表的懒单例。
+
+    并发数在这里定：`media.video_concurrency`（默认 3）。轮询线程数跟着它走——一条
+    任务的轮询可能阻塞几十秒，单线程会把其它条一起拖住，看起来像"并发没生效"。
+    """
+    global _MEDIA_TASKS
+    if _MEDIA_TASKS is None:
+        with _MEDIA_TASKS_LOCK:
+            if _MEDIA_TASKS is None:
+                concurrency = 3
+                try:
+                    config = wb_settings.media_config(ACCOUNTS_DIR)
+                    concurrency = int(config.get("video_concurrency") or 3)
+                except Exception:
+                    pass
+                concurrency = max(1, concurrency)
+                _MEDIA_TASKS = wb_media_tasks.MediaTaskStore(
+                    out_dir=wb_media_tasks.default_out_dir(),
+                    workers=concurrency,
+                    concurrency=concurrency,
+                    on_finish=media_task_finished,
+                    resolve_account=media_account_by_uid,
+                    logger=lambda message: log(message, tag="media"),
+                )
+                # 排队中的任务由任务表回调本函数提交（它自己不知道怎么选账号）。
+                _MEDIA_TASKS.set_submitter(submit_queued_video_task)
+    return _MEDIA_TASKS
+
+
+def submit_queued_video_task(task):
+    """把排队中的任务真正提交到上游。返回 `{upstream_id, account}`。
+
+    **只用 task 里带回来的字段**（body/model/realm/key 都在内存队列里），所以这里
+    不依赖请求上下文——后台线程没有 self。失败抛 `wb_media.MediaError`，任务表会把
+    它标成 `rejected`（一分没花、客户端可立刻重试）。
+    """
+    body = task.get("body") or {}
+    model_id = task.get("model")
+    realm = task.get("realm") or "cn"
+    store = media_tasks()
+    # 先把正在跑任务的账号排掉：并行任务摊到不同账号上，别在同一个账号上叠风控。
+    excluded = set(store.busy_accounts() or ())
+
+    def pick(avoid):
+        try:
+            cost_hint = media_cost_hint(task.get("model"),
+                                        task.get("seconds") or 5,
+                                        task.get("resolution"))
+        except Exception:
+            cost_hint = 0
+        return _pick_media_account_for(realm, model_id, cost_hint, avoid)
+
+    account = pick(excluded)
+    if account is None:
+        # 所有账号都在跑任务：退一步用任意可用账号（排队总比报错好）。
+        account = pick(set())
+    if account is None:
+        raise wb_media.MediaError("UPSTREAM", "没有可用账号跑这次生视频")
+    submission = wb_media_client.submit_video(account, body)
+    account.note_success(model=model_id)
+    return {"upstream_id": submission["taskId"], "account": account.uid}
+
+
+def read_catalog_dump(realm):
+    """冷启动时从留档副本读 `/v3/config` 原文；读不到返回 None。
+
+    `catalog/README.txt` 原先写着「Nothing reads it back」。媒体目录是第一个真的
+    会读它的消费者（该文件的说明已同步更新）：内存缓存 `_catalog_raw` 只在成功拉取
+    后才有，重启后的第一分钟要靠这份副本，否则一次生图会先白白多打一次上游。
+    """
+    try:
+        path = catalog_cache_path(realm)
+        if not os.path.isfile(path):
+            return None
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
 MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+# Routes whose request head is traced on arrival (see do_POST): the ones a
+# conversation actually uses, so the trace stays quiet on panel polling.
+_CHAT_PATHS = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/responses", "/responses",
+    "/v1/messages", "/messages",
+)
 
 # ---------------------------------------------------------------------------
 # Background-model redirection (desktop clients).
@@ -361,6 +1077,60 @@ BACKGROUND_MODEL_NAMES = tuple(
     ).split(",")
     if m.strip()
 )
+
+
+INTL_MODEL_ALIASES = {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
+}
+
+
+def intl_model_alias_enabled():
+    """The intl id remap is on unless WB_INTL_MODEL_ALIAS disables it."""
+    raw = os.environ.get("WB_INTL_MODEL_ALIAS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def intl_model_alias(name, realm=None):
+    """The intl upstream id for `name`, or `name` unchanged.
+
+    The intl exit renamed deepseek-v4.1-flash to the "-sg" build in 2026-11:
+    the desktop client's own catalogue (and the product config fetched from
+    www.workbuddy.ai) lists only deepseek-v4.1-flash-sg, while a request for
+    the old base id answers code 6004 "usage exceeds frequency limit" on
+    accounts whose base bucket is empty.
+
+    This is an outbound alias only. Clients and /v1/models keep the logical
+    id, and API-key model checks run before the alias is applied.
+    """
+    text = str(name or "")
+    if (realm or CURRENT_REALM) != "intl" or not intl_model_alias_enabled():
+        return text
+    return INTL_MODEL_ALIASES.get(text.strip().lower(), text)
+
+
+def apply_intl_model_alias(payload, realm=None):
+    """Rewrite one request body to the intl upstream id; returns the new id.
+
+    Kept for callers that are constructing an outbound body themselves (the
+    panel probe and the window probe). The request handlers must not call it:
+    rewriting the client payload at ingress would make /v1/models and API-key
+    permissions see the upstream id instead of the logical one.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    name = str(payload.get("model") or "")
+    target = intl_model_alias(name, realm)
+    if target == name:
+        return name
+    payload["model"] = target
+    log("alias: intl model %s -> %s" % (name, target))
+    return target
+
+
+def _apply_deepseek_flash_target(payload, realm=None):
+    # Historical hook kept as a no-op: the intl alias is applied when the
+    # upstream body is built, after all client-facing model checks.
+    return
 
 
 def _apply_background_model_alias(payload):
@@ -426,7 +1196,8 @@ CORS_PATH_PREFIXES = ("/v1", "/chat", "/completions", "/models", "/responses")
 # Management paths that happen to live under /v1 must not be treated as API:
 # /v1/usage reports account-level spend and is gated by the panel session.
 MANAGEMENT_PATH_PREFIXES = ("/v1/usage", "/usage", "/accounts", "/settings",
-                            "/tasks", "/scheduler", "/panel", "/logs")
+                            "/tasks", "/scheduler", "/panel", "/logs",
+                            "/codearts")
 def cors_origin_allowed(path):
     """True when the OpenAI-style API path should advertise CORS."""
     path = (path or "").split("?")[0]
@@ -885,7 +1656,8 @@ def _best_cached_tokens(usage):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
                 account=None, outcome="completed", key=None, effort=None,
-                realm_reason=None, requested_model=None):
+                requested_model=None, realm=None, proxy_slot=None, proxy_exit=None,
+                kind="chat", media=None):
     """Record one finished request as exactly one JSONL row.
 
     A request without a usage block still gets a row (flagged usage_missing):
@@ -915,6 +1687,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         "model": model,
         "stream": bool(stream),
         "outcome": outcome,
+        # 请求类型：chat / image / video。默认 chat，旧调用点一个字不用改；
+        # 旧行没有这个字段，读的一侧按 chat 处理（row.get("kind", "chat")）。
+        "kind": kind,
         "elapsed_ms": elapsed_ms,
         "ttft_ms": ttft_ms,
         "gen_ms": gen_ms,
@@ -928,8 +1703,12 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row.update(fp)
     if account:
         row["account"] = account
+    if proxy_slot:
+        row["proxy_slot"] = proxy_slot
+    if proxy_exit:
+        row["proxy_exit"] = proxy_exit
     acc = POOL.get(account) if (account and POOL) else None
-    row["realm"] = acc.realm if acc else CURRENT_REALM
+    row["realm"] = realm or (acc.realm if acc else CURRENT_REALM)
     # The refresher visits one account per tick, so on a large pool the cached
     # balance can be hours old; subtract this request's real cost at once so
     # reserve_credits keeps working between refreshes (#442).
@@ -940,17 +1719,26 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     # existed; the dashboard reports those as two different buckets, and a
     # missing field is the only evidence of the cutover that survives.
     row["key"] = key or ""
-    if realm_reason is not None:
-        # 区域自动路由：本次是否换区及原因（""=没换区；键不存在=旧行）
-        row["realm_reason"] = str(realm_reason)
     # The price policy this request is measured against, stored as a reference
     # so the table can be de-duplicated and swept. A row written before the
     # table existed has no reference and falls back to the timeline.
-    row["cost_policy"] = wb_pricing.current_policy_id(model)
+    if kind != "chat":
+        # 媒体模型不在 chat 价目表里，current_policy_id() 会给一个 chat 的默认策略，
+        # 那会让「按价目表统计」把媒体请求算进某个 chat 策略的样本里。
+        row["cost_policy"] = "media"
+    else:
+        row["cost_policy"] = ("codearts:unpriced" if realm == "codearts"
+                              else wb_pricing.current_policy_id(model))
     # Only when the request had one: the panel shows a chip for rows that carry
     # the field, and a model without reasoning controls has nothing to report.
     if effort:
         row["reasoning_effort"] = effort
+    # 媒体调用的计费参数：**只记有值的**，不给 chat 行塞一堆 null。
+    # 没有这一块，一行 usage 只剩一个 credit 数值，事后无法解释它怎么算出来的。
+    if isinstance(media, dict):
+        for field in ("seconds", "resolution", "aspect_ratio", "image_to_video"):
+            if media.get(field) is not None:
+                row[field] = media[field]
     # Derived per-request rates (None-safe).
     if gen_ms and gen_ms > 0:
         row["tokens_per_sec"] = round(fields.get("completion_tokens", 0) / (gen_ms / 1000.0), 2)
@@ -964,10 +1752,18 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         t_tokens = fields.get("total_tokens", 0)
         dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
         acc_tag = f" acct={account[:8]}" if account else ""
+        egress_tag = (f" slot={proxy_slot} egress={proxy_exit}"
+                      if proxy_slot or proxy_exit else "")
         key_tag = f" key={key_label(key)}" if key else ""
         speed_tag = f" {row.get('tokens_per_sec', 0)}t/s" if row.get("tokens_per_sec") else ""
         miss_tag = " usage=missing" if usage_missing else ""
-        log(f"chat done: model={model}{acc_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}", tag="chat")
+        if kind == "chat":
+            log(f"chat done: model={model}{acc_tag}{egress_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}", tag="chat")
+        else:
+            # 媒体请求没有 token 概念，日志行只说"谁的哪个模型、花了多少、用多久"，
+            # 并用 kind 当 tag，这样「运行日志」页能单独筛出媒体。
+            credit_tag = (" %.2f 积分" % fields["credit"]) if fields.get("credit") else ""
+            log(f"{kind} done: model={model}{acc_tag}{egress_tag}{key_tag}{dur}{credit_tag}", tag=kind)
     except Exception:
         pass
     return row
@@ -976,6 +1772,11 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
 def record_upstream_usage(upstream, requested_model, usage, **kwargs):
     """Record the model actually billed upstream, preserving the client alias."""
     billed_model = getattr(upstream, "_wb_billed_model", requested_model)
+    # 出口归因（#743）：每条完成行都带上响应对象的账号槽位与实际出口。
+    account = POOL.get(getattr(upstream, "_wb_account_uid", "")) if POOL else None
+    if account is not None:
+        kwargs.setdefault("proxy_slot", account.proxy_slot)
+        kwargs.setdefault("proxy_exit", egress_exit(account.proxy))
     record_usage(billed_model, usage, requested_model=requested_model, **kwargs)
 
 
@@ -995,9 +1796,33 @@ def _persist_usage(row, fail_label):
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
+def upstream_failure_response(handler, model, exc, t_start, key_id=None):
+    """一次上游失败的统一出口：先定状态码，再落盘，最后回客户端。
+
+    池空（no usable account）是 **503**——等上游配额恢复，或者去面板加号；
+    其余是 **502**——查上游链路。顺序不能反：先记 502 再把响应改成 503，会
+    让日志与 `usage/usage.jsonl` 把"该等"记成"该查"，按状态码统计 5xx 时
+    两者混在一起（issue #666）。
+
+    两条链路（`/v1/responses`、`/v1/chat/completions`）原本各写一遍同样的
+    判断；收到这里后，状态码只有一个决定点，用量行与客户端看到的是同一个。
+    """
+    message = str(exc)
+    status = 503 if message.startswith("no usable account") else 502
+    record_error(model, status, message,
+                 elapsed_ms=int((time.time() - t_start) * 1000),
+                 account=getattr(exc, "account_uid", None),
+                 key=key_id)
+    if status == 503:
+        return handler._error(503, message +
+                              " - add or enable one at the dashboard (/)")
+    return handler._error(502, "upstream unreachable: %s" % exc)
+
+
 def record_error(model, status, message, elapsed_ms=None, account=None,
                  usage=None, stream=None, ttft_ms=None, gen_ms=None, fp=None,
-                 outcome="failed", key=None):
+                 outcome="failed", key=None, realm=None, proxy_slot=None,
+                 proxy_exit=None):
     """Record one failed request as exactly one JSONL row.
 
     Passing the account uid records which account the request was bound to, so
@@ -1037,10 +1862,17 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     row.update(fields)
     if fp:
         row.update(fp)
+    if realm:
+        row["realm"] = realm
     if account:
         row["account"] = account
         acc = POOL.get(account) if POOL else None
-        row["realm"] = acc.realm if acc else CURRENT_REALM
+        if not realm:
+            row["realm"] = acc.realm if acc else CURRENT_REALM
+    if proxy_slot:
+        row["proxy_slot"] = proxy_slot
+    if proxy_exit:
+        row["proxy_exit"] = proxy_exit
     row["key"] = key or ""
     _persist_usage(row, "error persist failed")
     dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
@@ -1048,7 +1880,9 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     # 行一直没打出来——出错时最想知道的「哪个账号、什么终态」反而要回去翻
     # usage.jsonl，而 chat done 那条早就有 acct= 了，两侧不对称。
     acc_tag = f" acct={account[:8]}" if account else ""
-    log(f"request error: model={model}{dur}{acc_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
+    egress_tag = (f" slot={proxy_slot} egress={proxy_exit}"
+                  if proxy_slot or proxy_exit else "")
+    log(f"request error: model={model}{dur}{acc_tag}{egress_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
         level="ERROR", tag="chat")
     return row
 def _pct(values, q):
@@ -1889,7 +2723,12 @@ _STATS_TTL = float(os.environ.get("WB_STATS_TTL", 15))
 # reads rows that arrived since the last scan.
 # ---------------------------------------------------------------------------
 _daily_usage = {"day": "", "totals": None, "credits": None, "models": None,
-                "offset": 0, "at": 0.0}
+                "offset": 0, "at": 0.0,
+                # See _scan_daily_usage's caller: (size, dev, inode) of the log
+                # the cached offset was taken against, plus the 64 bytes just
+                # before it. Without these a rewritten-then-regrown log (log
+                # rotation with copytruncate) looked like a plain append.
+                "key": None, "tail": None}
 _daily_usage_lock = threading.Lock()
 
 
@@ -1975,11 +2814,23 @@ def daily_usage_stats(ttl=None):
         else:
             state = {"tokens": {}, "credits": {}, "models": {}}
         offset = int(c["offset"] or 0)
-        try:
-            size = os.path.getsize(USAGE_LOG)
-        except OSError:
-            size = 0
-        if offset > size:
+        log_key = _usage_log_key(USAGE_LOG)
+        # Resume the cached fold only when the bytes it counted are provably
+        # still there. `offset > size` alone misses the case that actually
+        # bites: log rotation with `copytruncate` empties the file in place
+        # (same inode) and it then grows past the old offset, so the size test
+        # passes while the bytes underneath were replaced. The daily counters
+        # would then keep yesterday's numbers *and* silently skip every row in
+        # the first `offset` bytes of today's file - which parks accounts on
+        # the daily guard while the panel shows a total that never happened.
+        # `_log_offset_holds` covers size/device/inode and
+        # `_log_tail_signature` re-reads the seam, which is what tells an
+        # append apart from a rewrite. Same rule, same two helpers, as the
+        # perf/aggregate/recent folds above.
+        if offset and not (c.get("key") is not None
+                           and c.get("tail") is not None
+                           and _log_offset_holds(c["key"], log_key, offset)
+                           and _log_tail_signature(offset, USAGE_LOG) == c["tail"]):
             state = {"tokens": {}, "credits": {}, "models": {}}
             offset = 0
         try:
@@ -1987,11 +2838,15 @@ def daily_usage_stats(ttl=None):
         except Exception as exc:
             log("daily token scan failed: %s" % exc)
             _daily_usage.update({"day": day, "totals": None, "offset": 0,
-                                 "at": time.time()})
+                                 "key": None, "tail": None, "at": time.time()})
             return None
+        # Record the position we consumed *and* the seam behind it, so the next
+        # call can prove this prefix still holds the same bytes.
         _daily_usage.update({"day": day, "totals": state["tokens"],
                              "credits": state["credits"],
                              "models": state["models"], "offset": offset,
+                             "key": _usage_log_key(USAGE_LOG),
+                             "tail": _log_tail_signature(offset, USAGE_LOG),
                              "at": time.time()})
         return _daily_state_copy(_daily_usage)
 
@@ -2044,6 +2899,23 @@ def apply_daily_credit_limit(refresh=False):
         credits = stats["credits"] if stats is not None else None
         free_models = free_models_by_realm()
     return POOL.apply_daily_credit_limit(limits, credits, free_models)
+
+
+def apply_reserve_credits(refresh=False):
+    """Publish the reserve and, only when it is on, the realm free ids.
+
+    This reuses the existing 60-second local catalogue cache; it never folds
+    usage logs or adds network work. The settings-save path passes refresh=True
+    so switching the guard off also clears the in-memory threshold.
+    """
+    if POOL is None:
+        return 0
+    values = wb_settings.limit_values(ACCOUNTS_DIR, "reserve_credits")
+    on = any(value > 0 for value in values.values())
+    if not on and not refresh:
+        return values
+    return POOL.apply_reserve_credits(
+        values, free_models_by_realm() if on else None)
 
 
 def apply_model_daily_token_limit(refresh=False):
@@ -2619,6 +3491,14 @@ def _remaining_refresh(state):
         log_key = _usage_log_key(path)
         if not _log_resume_ok(slot, log_key, path):
             # 文件被换掉/截短：这个来源的贡献全部作废，从零重折。
+            # 只有「续读失败」才是线索（copytruncate 式轮转、或有人在服务
+            # 运行时改/换过日志）；冷启动时 slot["key"] 本来就是 None，那不是
+            # 事故，报了只会把真正的信号淹掉。
+            folded_before = (slot.get("key") not in (None, (0, 0, 0))
+                             and (slot.get("offset") or 0) > 0)
+            if folded_before:
+                log("remaining usage fold reset (%s, %s): log replaced or truncated, "
+                    "folding from zero" % (source, path), level="WARN", tag="usage")
             state[source] = {"offset": 0, "key": log_key, "tail": b""}
             if source == "log":
                 state["usage"].clear()
@@ -2959,7 +3839,8 @@ def _remaining_payload(now=None, accounts=None):
     """
     now = time.time() if now is None else now
     if accounts is None:
-        accounts = list(POOL.accounts) if POOL else []
+        texts, _ = _ensure_pools()
+        accounts = texts.accounts() if texts else []
     accounts = [a for a in accounts
                 if getattr(a, "enabled", True) and getattr(a, "uid", "")]
     with _remaining_state_lock:
@@ -5947,6 +6828,49 @@ def recent_usage(limit=100, realm=None, page=1):
         "rows": page_rows
     }
 POOL = None
+# Dispatch views over the one shared AccountPool. The pool owns credentials,
+# refresh, proxies and guards; these two views only enforce which kind of
+# traffic each account may serve.
+TEXTS = None
+MEDIAS = None
+
+
+def _pool_views_ready():
+    """Whether both dispatch views are bound to the current POOL."""
+    return (TEXTS is not None and MEDIAS is not None
+            and getattr(TEXTS, "pool", None) is POOL
+            and getattr(MEDIAS, "pool", None) is POOL)
+
+
+def _ensure_pools():
+    """Return the dispatch views, rebinding them if POOL was replaced.
+
+    Production binds once after loading. Tests and embedders assign the
+    module-level POOL directly; without this check they would keep using a
+    stale pool from an earlier test.
+    """
+    if POOL is None:
+        return None, None
+    if not _pool_views_ready():
+        return _bind_pools()
+    return TEXTS, MEDIAS
+
+
+def _bind_pools():
+    """Bind text/media dispatch views to the loaded account pool."""
+    global TEXTS, MEDIAS
+    if POOL is None:
+        TEXTS = None
+        MEDIAS = None
+    else:
+        TEXTS = wb_pool_text.TextPool(POOL, log=log)
+        MEDIAS = wb_pool_media.MediaPool(POOL, log=log)
+    return TEXTS, MEDIAS
+
+
+def _pool_representative(realm=None, scope=None):
+    """``representative_account`` for code that already owns a pool view."""
+    return representative_account(realm=realm, scope=scope)
 
 # Pinned-account routes (/u/<ref>/v1/...): the handler strips the prefix and
 # resolves the ref before dispatching. One thread serves one connection at a
@@ -6068,6 +6992,42 @@ def realm_state_file():
     return os.path.join(ACCOUNTS_DIR, "active_realm.json")
 
 
+def _realm_selectable(realm):
+    """这个出口现在能不能被选中。
+
+    intl/cn 永远可用；codearts 只有配置完整时才可用，避免持久化了一个已经
+    被删掉/关闭的出口，进程起来后所有未绑定 Key 都打到 503。
+    """
+    if realm in ("intl", "cn"):
+        return True
+    if realm == "codearts":
+        try:
+            return wb_settings.codearts_configured(ACCOUNTS_DIR)
+        except Exception:
+            return False
+    return False
+
+
+def realm_options():
+    """看板/`/realm` 的出口选项。CodeArts 未配置时不出现在列表里。"""
+    options = ["intl", "cn"]
+    if _realm_selectable("codearts"):
+        options.append("codearts")
+    return options
+
+
+def reconcile_codearts_realm():
+    """CodeArts 被关闭/删配置后，把默认出口从 codearts 收敛回 intl。
+
+    返回 True 表示真的发生了收敛；调用方（设置保存）据此给看板带一条 warning。
+    """
+    if CURRENT_REALM == "codearts" and not _realm_selectable("codearts"):
+        save_persisted_realm("intl")
+        log("codearts realm disabled; default exit reset to intl")
+        return True
+    return False
+
+
 def load_persisted_realm():
     global CURRENT_REALM
     path = realm_state_file()
@@ -6076,7 +7036,11 @@ def load_persisted_realm():
             with open(path, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
                 r = d.get("realm")
-                if r in ("intl", "cn"):
+                if r in ("intl", "cn", "codearts"):
+                    if r == "codearts" and not _realm_selectable(r):
+                        log("persisted realm 'codearts' is not configured; "
+                            "falling back to intl")
+                        return CURRENT_REALM
                     CURRENT_REALM = r
                     return CURRENT_REALM
         except Exception as e:
@@ -6084,7 +7048,9 @@ def load_persisted_realm():
     return CURRENT_REALM
 def save_persisted_realm(realm):
     global CURRENT_REALM
-    if realm in ("intl", "cn"):
+    if realm in ("intl", "cn", "codearts"):
+        if realm == "codearts" and not _realm_selectable(realm):
+            return CURRENT_REALM
         CURRENT_REALM = realm
         try:
             os.makedirs(ACCOUNTS_DIR, exist_ok=True)
@@ -6115,7 +7081,11 @@ def account_views(realm=None):
     """List view of every account, including a live readiness flag."""
     if not POOL:
         return []
-    return POOL.list_public(realm=realm)
+    rows = POOL.list_public(realm=realm)
+    for row in rows:
+        row["poolScope"] = wb_pool_scope.normalize_scope(
+            row.get("poolScope"))
+    return rows
 
 
 def _finite_number(value):
@@ -6388,6 +7358,21 @@ def probe_proxy_exit(proxy_url, timeout=12):
         return "", str(exc)[:160]
 
 
+def egress_exit(proxy_url):
+    """代理串的出口标识（host:port），日志与用量行共用；不打用户名密码。"""
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return "direct"
+    try:
+        info = wb_upstream_pool._split_proxy(raw)
+        if info and info.get("host"):
+            return "%s:%s" % (info["host"], info.get("port") or "")
+        parts = urllib.parse.urlsplit(raw if "://" in raw else "http://" + raw)
+        return parts.netloc.rpartition("@")[2] or raw
+    except Exception:
+        return raw.rpartition("@")[2]
+
+
 def probe_proxy_intel(proxy_url, timeout=12):
     """Probe one proxy: its exit IP, and where and what that exit is.
 
@@ -6448,6 +7433,15 @@ def proxy_slots_view():
             slot_id = account.proxy_slot
             if slot_id and account.enabled:
                 counts[slot_id] = counts.get(slot_id, 0) + 1
+    try:
+        for account in wb_codearts.pool_for(ACCOUNTS_DIR).accounts:
+            slot_id = account.proxy_slot
+            if slot_id and not account.disabled:
+                counts[slot_id] = counts.get(slot_id, 0) + 1
+    except Exception:
+        # CodeArts is optional; a broken account file must not take down the
+        # WorkBuddy proxy-slot panel.
+        pass
     out = []
     for entry in wb_settings.proxy_slots(ACCOUNTS_DIR):
         item = dict(entry)
@@ -6455,6 +7449,115 @@ def proxy_slots_view():
         item["label"] = slot_label(entry)
         out.append(item)
     return out
+
+
+SUBBRIDGE_HOST = os.environ.get("WB_SUBBRIDGE_HOST") or os.environ.get(
+    "WB_SUBBRIDGE_LISTEN") or "172.17.0.1"
+_SUBBRIDGE_SLOT_PORT_RE = re.compile(
+    r"^http://(?:%s|127\.0\.0\.1):(\d+)(?:/)?$"
+    % re.escape(SUBBRIDGE_HOST))
+SUBBRIDGE_PORT_START = int(os.environ.get("WB_SUBBRIDGE_PORT_START") or "17901")
+SUBBRIDGE_PORT_COUNT = int(os.environ.get("WB_SUBBRIDGE_PORT_COUNT") or "64")
+SUBBRIDGE_PORT_RANGE = range(SUBBRIDGE_PORT_START,
+                             SUBBRIDGE_PORT_START + SUBBRIDGE_PORT_COUNT)
+
+
+def _is_subbridge_slot(entry):
+    """Whether a slot is managed by the subscription bridge port pool."""
+    match = _SUBBRIDGE_SLOT_PORT_RE.match(str((entry or {}).get("url") or ""))
+    if not match:
+        return False
+    try:
+        return int(match.group(1)) in SUBBRIDGE_PORT_RANGE
+    except ValueError:
+        return False
+
+
+def reconcile_subbridge_slots(current, probes, probed_at=None):
+    """Replace bridge-managed slots while preserving manual slots and slot ids."""
+    now = int(probed_at if probed_at is not None else time.time())
+    existing = {}
+    manual = []
+    for raw in current or []:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        if _is_subbridge_slot(entry):
+            url = str(entry.get("url") or "")
+            if url:
+                existing[url] = entry
+        else:
+            manual.append(entry)
+
+    managed = []
+    seen = set()
+    for probe in probes or []:
+        if not isinstance(probe, dict):
+            continue
+        url = str(probe.get("url") or "").strip()
+        if not url or url in seen or not _is_subbridge_slot({"url": url}):
+            continue
+        seen.add(url)
+        entry = dict(existing.get(url) or {"id": "", "url": url})
+        name = str(probe.get("name") or "").strip()
+        if name:
+            entry["name"] = name
+        entry["enabled"] = bool(probe.get("ok"))
+        entry["ip"] = str(probe.get("exit_ip") or "").strip()
+        entry["probed_at"] = now
+        for field in ("country", "country_code", "ip_type", "isp", "asn"):
+            value = str(probe.get(field) or "").strip()
+            if value:
+                entry[field] = value
+        managed.append(wb_settings._clean_slot_entry(entry) or entry)
+    return manual + managed
+
+
+def probe_subbridge_listeners(listeners, rounds=3, workers=8):
+    """Probe newly rendered listener ports concurrently, retaining failures."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    targets = []
+    for item in listeners or []:
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError):
+            continue
+        targets.append({
+            "port": port,
+            "url": "http://%s:%d" % (SUBBRIDGE_HOST, port),
+            "name": str(item.get("proxy") or item.get("name") or "").strip(),
+            "ok": False,
+            "exit_ip": "",
+            "error": "not probed",
+        })
+
+    def probe(target):
+        exit_ip, error = probe_proxy_exit(target["url"], timeout=7)
+        return {
+            "port": target["port"],
+            "url": target["url"],
+            "name": target["name"],
+            "ok": bool(exit_ip),
+            "exit_ip": exit_ip,
+            "error": error,
+        }
+
+    for attempt in range(max(1, int(rounds))):
+        pending = [index for index, target in enumerate(targets)
+                   if not target.get("ok")]
+        if not pending:
+            break
+        with ThreadPoolExecutor(max_workers=min(max(1, int(workers)),
+                                                len(pending))) as pool:
+            results = list(pool.map(lambda index: (index, probe(targets[index])),
+                                    pending))
+        for index, result in results:
+            targets[index] = result
+        if attempt + 1 < max(1, int(rounds)) and any(
+                not target.get("ok") for target in targets):
+            time.sleep(3)
+    return targets
 
 
 _byacct_cache = {"at": 0.0, "data": None}
@@ -8867,6 +9970,185 @@ _usage_cache_progress = {}
 _usage_cache_checkpointed = {}
 _usage_cache_last_attempt = time.time()
 
+# 补写（retry）状态：某一类这次被跳过（状态锁被占 / 状态不可序列化）时不能
+# 就这么算了 —— 实践中见过一类连续几天没落盘：现场只有 CPU 高，没有任何日志，
+# 重启后又从旧 offset 全量重折。登记一个延迟重试，成功就取消。
+# 退避：30s 起步、指数翻倍、封顶 15 分钟，成功立刻归零。
+_USAGE_CACHE_RETRY_MIN_SECONDS = 30.0
+_USAGE_CACHE_RETRY_MAX_SECONDS = 900.0
+_USAGE_CACHE_SKIP_LOG_SECONDS = 300.0
+# 加载到的 checkpoint 落后当前日志超过这么多字节就告警：它就是「重启后第一批
+# 请求又慢了几分钟」的那个数。
+_USAGE_CACHE_LAG_WARN_BYTES = 64 * 1024 * 1024
+_usage_cache_retry_lock = threading.Lock()
+_usage_cache_retry_due = {}
+_usage_cache_retry_attempts = {}
+_usage_cache_skip_logged = {}
+_usage_cache_skip_counts = {}
+_usage_cache_retry_thread = None
+_usage_cache_retry_starting = False
+
+
+def _usage_cache_retry_min_seconds():
+    """补写最低退避秒数；测试用环境变量压到毫秒级。"""
+    try:
+        value = float(os.environ.get("WB_USAGE_CACHE_RETRY_MIN_SECONDS",
+                                     _USAGE_CACHE_RETRY_MIN_SECONDS))
+    except (TypeError, ValueError):
+        return _USAGE_CACHE_RETRY_MIN_SECONDS
+    # 兜住 0（「立刻重试」的直觉写法）：0 乘任何 2**n 都是 0，退化成补写循环
+    # 的 0.5s 粒度，等于每 0.5 秒试写一次盘。
+    return max(1.0, value)
+
+
+def _usage_cache_schedule_retry(kind):
+    """登记一次延迟补写：跳过的类必须有人接着写，否则永远停在旧 offset 上。
+
+    只提前不延后：同一个类被反复跳过时取更早的那个 deadline，退避由
+    attempts 计数决定（每次登记 +1，封顶 15 分钟）。
+    """
+    global _usage_cache_retry_thread, _usage_cache_retry_starting
+    with _usage_cache_retry_lock:
+        attempts = _usage_cache_retry_attempts.get(kind, 0)
+        delay = min(_usage_cache_retry_min_seconds() * (2 ** min(attempts, 5)),
+                    _USAGE_CACHE_RETRY_MAX_SECONDS)
+        _usage_cache_retry_attempts[kind] = attempts + 1
+        due = time.time() + delay
+        current = _usage_cache_retry_due.get(kind)
+        _usage_cache_retry_due[kind] = due if current is None else min(current, due)
+        need_thread = (_usage_cache_retry_thread is None
+                       and not _usage_cache_retry_starting)
+        if need_thread:
+            _usage_cache_retry_starting = True
+    if need_thread:
+        thread = threading.Thread(target=_usage_cache_retry_loop,
+                                  name="usage-cache-retry", daemon=True)
+        # 先启动、成功才占位：反过来（先赋值再 start）在线程数打满 / 内存紧张
+        # 时 start() 会抛，标志位留成「非 None 的死线程」，补写线程这辈子不会
+        # 再启动，且一条日志都没有——正好复刻这次要消灭的「静默不落盘」。
+        # start() 也必须在锁外：新线程的第一件事就是抢这把锁。
+        try:
+            thread.start()
+        except Exception as exc:
+            with _usage_cache_retry_lock:
+                _usage_cache_retry_starting = False
+            log("usage-cache retry thread failed to start: %s: %s"
+                % (type(exc).__name__, exc), level="WARN", tag="usage")
+            return
+        with _usage_cache_retry_lock:
+            _usage_cache_retry_thread = thread
+            _usage_cache_retry_starting = False
+
+
+# 每一类上一次「收集不到」的真实原因，由 _usage_cache_collect_kind 自己写下：
+# 事后复探锁状态不准（它失败时本来就没拿到锁，等调用方来问时持有者可能已经
+# 放手），会把瞬时的锁竞争误判成「状态不可序列化」。
+_USAGE_CACHE_BUSY = "state lock busy"
+_USAGE_CACHE_UNSERIALISABLE = "state not serialisable (kind state has no checkpointable shape)"
+# 定价总开关关着时，折叠不会读取任何价格，state["pricing"] 必然为 None。
+# 这是操作者的显式选择，不是状态损坏；单独标记，避免 WARN 和无效补写。
+_USAGE_CACHE_PRICING_OFF = "pricing disabled (cost estimation off)"
+_usage_cache_collect_reason = {}
+
+
+def _usage_cache_mark_reason(kind, reason):
+    _usage_cache_collect_reason[kind] = reason
+    return None
+
+
+def _usage_cache_clear_retry(kind):
+    """该类已写成功：取消补写并清掉跳过计数/日志节流。"""
+    with _usage_cache_retry_lock:
+        _usage_cache_retry_due.pop(kind, None)
+        _usage_cache_retry_attempts.pop(kind, None)
+        _usage_cache_skip_logged.pop(kind, None)
+        _usage_cache_skip_counts.pop(kind, None)
+
+
+def _usage_cache_note_skip(kind, why=None):
+    """记一次跳过的写盘：留痕（节流）+ 登记补写。
+
+    跳过本身是设计（不能在请求线程里阻塞等状态锁），但静默跳过会让一类
+    连续几天不落盘而现场毫无线索，所以这里必须打日志。
+    """
+    now = time.time()
+    with _usage_cache_retry_lock:
+        _usage_cache_skip_counts[kind] = _usage_cache_skip_counts.get(kind, 0) + 1
+        # count 必须在节流判断外取：下面的「不可序列化到 3 次就停手」分支
+        # 在 should_log 为 False 时同样要读它。
+        count = _usage_cache_skip_counts[kind]
+        # 定价关闭时本来就没有可写的价记录：不占日志节流窗口，也不登记
+        # 永远无法成功的补写。跳过计数仍然保留，便于现场确认确实发生过。
+        if why and why.startswith(_USAGE_CACHE_PRICING_OFF[:30]):
+            return
+        last = _usage_cache_skip_logged.get(kind)
+        should_log = last is None or (now - last) >= _USAGE_CACHE_SKIP_LOG_SECONDS
+        if should_log:
+            _usage_cache_skip_logged[kind] = now
+    if should_log:
+        # WARN 而不是默认的 INFO：这是「某类即将不落盘」的唯一信号，面板按
+        # WARN 筛问题时要能看到它。
+        log("usage aggregate cache write skipped (%s, %d time(s)): %s"
+            % (kind, count, why or "reason unknown"), level="WARN", tag="usage")
+    if why and why.startswith(_USAGE_CACHE_UNSERIALISABLE[:30]) and count >= 3:
+        # 形状不可序列化不是补写能治的（状态要等下一次折叠成功才有可写的
+        # 形状）：再无限重试只是每 15 分钟白试一次 + 每 300s 一条 WARN。
+        # 留痕到此为止，下一次真正折叠成功时会走 clear_retry 复位。
+        return
+    _usage_cache_schedule_retry(kind)
+
+
+def _usage_cache_requeue_if_needed(kind, wrote):
+    """补写没写成时把名额还回去（写成了就什么都不做）。
+
+    写盘节流闸门挡回去的那次没人在别处登记 → 必须归还，否则「跳过必补写」在
+    推进量小的场景下不成立（最后一段日志永远不落盘）。跳过路径（note_skip）
+    已经登记过，再登记一次会让退避和计数按 2 倍增长，所以先看有没有待办。
+    """
+    if wrote:
+        return
+    with _usage_cache_retry_lock:
+        already = kind in _usage_cache_retry_due
+    if not already:
+        _usage_cache_schedule_retry(kind)
+
+
+def _usage_cache_retry_loop():
+    """后台补写：到点就把跳过的类重新走一遍 _usage_cache_maybe_save。
+
+    永远不抛异常：这是个加速件的看守，它自己挂掉不能影响服务。
+    """
+    while True:
+        try:
+            now = time.time()
+            with _usage_cache_retry_lock:
+                due = [k for k, ts in _usage_cache_retry_due.items() if ts <= now]
+                wait = 60.0
+                if _usage_cache_retry_due:
+                    wait = max(0.5, min(60.0,
+                                       min(_usage_cache_retry_due.values()) - now))
+            if not due:
+                time.sleep(wait)
+                continue
+            for kind in due:
+                with _usage_cache_retry_lock:
+                    _usage_cache_retry_due.pop(kind, None)
+                try:
+                    wrote = _usage_cache_maybe_save(
+                        kind, _usage_cache_progress.get(kind, 0))
+                except Exception as exc:
+                    wrote = False
+                    log("usage aggregate cache retry failed (%s): %s: %s"
+                        % (kind, type(exc).__name__, exc),
+                        level="WARN", tag="usage")
+                _usage_cache_requeue_if_needed(kind, wrote)
+        except Exception as exc:
+            # 这里是最后一道兜底：不留痕就等于把「补写名额」悄悄吃掉，和内层
+            # 静默跳过是同一种事故形态（本次修复要消灭的正是它）。
+            log("usage-cache retry loop hiccup: %s: %s"
+                % (type(exc).__name__, exc), level="WARN", tag="usage")
+            time.sleep(5)
+
 
 def _usage_cache_forget():
     """忘掉本进程读过的 checkpoint（模拟一次重启；测试与探针用）。
@@ -8878,6 +10160,13 @@ def _usage_cache_forget():
     with _usage_cache_lock:
         _usage_cache_kind_cache.clear()
         _usage_cache_legacy_data = _USAGE_CACHE_LEGACY_UNREAD
+    # 补写计划属于「本进程读过的状态」的一部分：不清掉会补写一份进程已经
+    # 忘了的 checkpoint（测试/探针里表现为莫名其妙的迟到写入）。
+    with _usage_cache_retry_lock:
+        _usage_cache_retry_due.clear()
+        _usage_cache_retry_attempts.clear()
+        _usage_cache_skip_logged.clear()
+        _usage_cache_skip_counts.clear()
 
 
 def _usage_cache_kind_entries(kind):
@@ -8894,13 +10183,22 @@ def _usage_cache_kind_entries(kind):
     """
     if not _usage_cache_enabled():
         return None
+    lag_message = None
+    log_size = _usage_log_key()[0]      # 锁外 stat，供 lag 告警使用
     with _usage_cache_lock:
         if kind not in _usage_cache_kind_cache:
             entries = _usage_cache_read_kind(kind)
             if entries is None:
                 entries = _usage_cache_read_legacy_kind(kind)
             _usage_cache_kind_cache[kind] = entries
-        return _usage_cache_kind_cache[kind]
+            lag_message = (_usage_cache_report_lag(kind, entries, log_size=log_size)
+                           if entries else None)
+        result = _usage_cache_kind_cache[kind]
+    # 日志（可能落 SQLite）放到锁外：本函数可能在状态锁内被调用，不能把
+    # _usage_cache_lock 的临界区从内存操作拉长到 I/O。
+    if lag_message:
+        log(lag_message, level="WARN", tag="usage")
+    return result
 
 
 def _usage_cache_read_kind(kind):
@@ -8933,6 +10231,41 @@ def _usage_cache_read_kind(kind):
     if not isinstance(entries, list):
         return None
     return entries
+
+
+def _usage_cache_report_lag(kind, entries, log_size=None):
+    """加载到的 checkpoint 落后当前日志很多时，留一条日志。
+
+    offset 落后多少，重启后第一批请求就要重折多少字节——「早上/发版后面板
+    特别卡、CPU 跑满」的那个数就是它。落后本身不报错（append-only 日志下
+    永远合法），只是要看得见。每类每次进程只报一次（读取结果按类记忆）。
+    """
+    try:
+        # 调用点可以在锁外先 stat 好再传进来：本函数可能被 _usage_cache_lock
+        # 保护着调用，不该在临界区里再发一次 syscall。
+        size = log_size if log_size is not None else _usage_log_key()[0]
+        farthest = 0
+        found = False
+        for entry in entries:
+            # _usage_cache_int() 是形状判断（返回 bool，且把 True/False 排除在外），
+            # 不是取值函数：拿它当 offset 用会把 True 当成 1，谎报落后整份日志。
+            raw = entry.get("offset") if isinstance(entry, dict) else None
+            if _usage_cache_int(raw) and raw > farthest:
+                farthest = raw
+                found = True
+        if not found:
+            # 这类条目里根本没有 offset（形状不认识）：报一个「落后整个日志」
+            # 只会误导人，宁可不说。
+            return
+        lag = size - farthest
+        if lag < _USAGE_CACHE_LAG_WARN_BYTES:
+            return
+        return "usage aggregate cache lag (%s): checkpoint %d, log %d -> %.1f MB " \
+               "to fold on the next refresh" % (kind, farthest, size,
+                                                lag / 1048576.0)
+    except (OSError, TypeError, ValueError, KeyError):
+        # 告警自身不成立（形状不认识/stat 失败）就算了，绝不能影响读取。
+        return None
 
 
 def _usage_cache_read_legacy_kind(kind):
@@ -9985,6 +11318,23 @@ def _usage_cache_series_entry(realm, state):
             "hits_overflow": bool(state["hits_overflow"])}
 
 
+class _lock_if_free(object):
+    """Hold `lock` if it is free right now; `as` gives whether it was taken."""
+
+    def __init__(self, lock):
+        self.lock = lock
+        self.held = False
+
+    def __enter__(self):
+        self.held = self.lock.acquire(blocking=False)
+        return self.held
+
+    def __exit__(self, *exc):
+        if self.held:
+            self.lock.release()
+        return False
+
+
 def _usage_cache_collect_kind(kind):
     """逐把取一类状态，做锁外可序列化的深拷贝；返回 (entries, offset) 或 None。
 
@@ -9995,48 +11345,85 @@ def _usage_cache_collect_kind(kind):
 
     entries 为空（状态都归零/不可复现）时返回 None：没得写就不写，等下一次
     折叠成功再落盘。offset 是该类各 realm 状态里的最远位置。
+
+    状态锁只做非阻塞尝试：拿不到（别的线程正在这把锁里全量重折）同样返回
+    None，这一类留到下次再写。全量重折会在锁里扫完整个日志（GB 级日志要几十
+    分钟），而调用方持着 _usage_cache_write_lock、往往还持着自己视图的缓存锁
+    （如 _byacct_lock）——阻塞等待会把别的视图一起拖死（面板 by-account 524）。
     """
     if kind == "snapshot":
         entries = []
         done = 0
-        with _usage_snap_state_lock:
+        pricing_off = False
+        pricing_disabled = not wb_pricing.pricing_enabled()
+        with _lock_if_free(_usage_snap_state_lock) as held:
+            if not held:
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _usage_snap_state.items():
+                # 总开关关着时这份折叠没有价记录，写出去也不会被采纳端采用。
+                # 只跳过确实因开关关闭而缺少 pricing 的状态；价表读取失败等
+                # 其他原因仍按不可序列化上报。
+                if pricing_disabled and state.get("pricing") is None:
+                    pricing_off = True
+                    continue
                 entry = _usage_cache_snapshot_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        if entries:
+            return entries, done
+        return _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_PRICING_OFF if pricing_off
+            else _USAGE_CACHE_UNSERIALISABLE)
     if kind == "by_account":
-        with _byacct_state_lock:
+        with _lock_if_free(_byacct_state_lock) as held:
+            if not held:
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             entry = _usage_cache_by_account_entry(_byacct_state)
             if entry is None:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_UNSERIALISABLE)
             return [entry], _byacct_state["offset"]
     if kind == "analytics":
         entries = []
         done = 0
-        with _analytics_state_lock:
+        pricing_off = False
+        pricing_disabled = not wb_pricing.pricing_enabled()
+        with _lock_if_free(_analytics_state_lock) as held:
+            if not held:
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _analytics_state.items():
+                if pricing_disabled and state.get("pricing") is None:
+                    pricing_off = True
+                    continue
                 entry = _usage_cache_analytics_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        if entries:
+            return entries, done
+        return _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_PRICING_OFF if pricing_off
+            else _USAGE_CACHE_UNSERIALISABLE)
     if kind == "series":
         entries = []
         done = 0
-        with _series_state_lock:
+        with _lock_if_free(_series_state_lock) as held:
+            if not held:
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _series_state.items():
                 entry = _usage_cache_series_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "remaining":
-        with _remaining_state_lock:
+        with _lock_if_free(_remaining_state_lock) as held:
+            if not held:
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             entry = _usage_cache_remaining_entry(_remaining_state)
             if entry is None:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_UNSERIALISABLE)
             return [entry], entry["offset"]
     return None
 
@@ -10070,7 +11457,9 @@ def _usage_cache_write_kind(kind, entries):
     payload = {"schema": _USAGE_CACHE_SCHEMA, "kind": kind,
                "written_at": time.time(), "entries": entries}
     path = _usage_cache_kind_path(kind)
-    tmp = path + ".tmp"
+    # 临时文件名带 pid：蓝绿切换时新旧槽位共享同一个 usage 目录、且会同时
+    # 存活约 300 秒，固定名（path + ".tmp"）会让两个进程互相截断临时文件。
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -10102,11 +11491,12 @@ def _usage_cache_maybe_save(kind, offset):
     """
     global _usage_cache_last_attempt
     if not _usage_cache_enabled():
-        return
+        return False
+    wrote = False
     try:
-        # 串行化整段写盘：两个请求线程可能同时判定「该写」，而临时文件名是
-        # 固定的（path + ".tmp"，和 save_runtime_override 一致），两个写者
-        # 同时打开同一个临时文件会互相截断。等锁的一方在锁里会重新判定一遍，
+        # 串行化整段写盘：两个请求线程可能同时判定「该写」。临时文件名虽然已
+        # 按 pid 区分（见 _usage_cache_write_kind），但同进程的两个写者仍会撞
+        # 同一个临时文件，所以写盘整体串行。等锁的一方在锁里会重新判定一遍，
         # 第一个写者已经把 checkpointed 推上去，于是它多半直接返回。
         with _usage_cache_write_lock:
             now = time.time()
@@ -10128,7 +11518,7 @@ def _usage_cache_maybe_save(kind, offset):
                 if not due_kinds and (not advanced
                                       or (now - _usage_cache_last_attempt)
                                       < min_seconds):
-                    return
+                    return False
                 # 记「尝试」而不是「成功」：只读文件系统上失败会一直成立，
                 # 不退避的话每次刷新都去试写一遍。
                 _usage_cache_last_attempt = now
@@ -10140,22 +11530,61 @@ def _usage_cache_maybe_save(kind, offset):
                 try:
                     collected = _usage_cache_collect_kind(advanced_kind)
                     if collected is None:
+                        # 收集不到就跳过（锁被占 / 状态不可序列化）是设计，但
+                        # 必须留痕并登记补写：静默跳过会让某一类连续几天不落盘
+                        # ———现场只有 CPU 高，重启后又从旧 offset 全量重折。
+                        # 两种原因要能分开：锁被占补写能自愈，「状态不可序列化」
+                        # 补写永远治不好，排障方向完全不同。
+                        _usage_cache_note_skip(
+                            advanced_kind,
+                            _usage_cache_collect_reason.get(advanced_kind)
+                            or _USAGE_CACHE_BUSY)
                         continue
                     entries, done = collected
                     _usage_cache_write_kind(advanced_kind, entries)
                 except Exception as exc:
-                    log("usage aggregate cache write failed (%s): %s"
-                        % (advanced_kind, exc))
+                    log("usage aggregate cache write failed (%s): %s: %s"
+                        % (advanced_kind, type(exc).__name__, exc),
+                        level="WARN", tag="usage")
+                    _usage_cache_note_skip(
+                        advanced_kind, why=type(exc).__name__ + ": " + str(exc))
                     continue
+                _usage_cache_clear_retry(advanced_kind)
+                wrote = True
                 with _usage_cache_lock:
                     if done > _usage_cache_checkpointed.get(advanced_kind, 0):
                         _usage_cache_checkpointed[advanced_kind] = done
     except Exception as exc:
-        log("usage aggregate cache write failed: %s" % exc)
+        log("usage aggregate cache write failed: %s: %s"
+            % (type(exc).__name__, exc), level="WARN", tag="usage")
+    return wrote
+
+
+def _panel_upstream_config(accounts_dir):
+    """Upstream settings safe for the panel; the token value never leaves here."""
+    config = wb_settings.upstream_config(accounts_dir)
+    config.pop("device_token", None)
+    return config
+
+
+def _panel_device_token_status(accounts_dir):
+    """Redacted device-token status; a broken file must not break settings."""
+    try:
+        return wb_accounts.device_token_status(accounts_dir)
+    except Exception as exc:
+        log("could not read device token status: %s" % type(exc).__name__,
+            level="WARN", tag="settings")
+        return {
+            "source": "none",
+            "configured_file": "",
+            "loaded": False,
+            "length": 0,
+            "cached_at": 0,
+        }
 
 
 def runtime_settings_view():
-    """Current panel-visible settings (never returns the password or the key)."""
+    """Current panel-visible settings (never returns passwords or secrets)."""
     key = API_KEY or ""
     if len(key) > 8:
         masked = key[:4] + "*" * 6 + key[-4:]
@@ -10215,17 +11644,14 @@ def runtime_settings_view():
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "auto_switch_products": wb_settings.auto_switch_products(ACCOUNTS_DIR),
-        # 区域智能换区（本地补丁）：面板要能读到状态才能渲染开关与首选区。
-        "realm_routing": (lambda cfg: dict(cfg, effective=bool(cfg.get("enabled")) and AUTO_REALM_ENABLED,
-                                           auto_env="WB_AUTO_REALM"))(
-            wb_settings.realm_routing(ACCOUNTS_DIR)),
-        "free_model_credit_fallback": wb_settings.free_model_credit_fallback(ACCOUNTS_DIR),
         "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
         "filter_models_by_key": wb_settings.filter_models_by_key(ACCOUNTS_DIR),
         "reasoning_effort_map": wb_settings.reasoning_effort_map(ACCOUNTS_DIR),
         "models_only_available": wb_settings.models_only_available(ACCOUNTS_DIR),
         "identity": wb_settings.identity_config(ACCOUNTS_DIR),
         "identity_version_defaults": wb_identity.default_versions(),
+        "codearts": wb_codearts.masked_config(ACCOUNTS_DIR),
+        "daily_activity": wb_settings.daily_activity_enabled(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "daily_chat_web_timeout":
             wb_settings.daily_chat_web_timeout(ACCOUNTS_DIR,
@@ -10261,6 +11687,10 @@ def runtime_settings_view():
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
         "egress_backoff_enabled":
             wb_settings.egress_backoff_enabled(ACCOUNTS_DIR),
+        "restriction_hold_seconds":
+            int(wb_settings.restriction_hold_seconds(ACCOUNTS_DIR)),
+        "restriction_holds":
+            all_restriction_holds(),
         "realm_fallback_enabled":
             wb_settings.realm_fallback_enabled(ACCOUNTS_DIR),
         "account_max_concurrent":
@@ -10270,6 +11700,11 @@ def runtime_settings_view():
         "account_inflight": account_inflight_snapshot(),
         "affinity_stable_key_enabled":
             wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR),
+        # 媒体能力（生图 / 生视频）限额。路由始终开启，面板只画这四项。
+        "media": wb_settings.media_config(ACCOUNTS_DIR),
+        "media_limits": dict(wb_settings.MEDIA_LIMITS),
+        "media_minimums": dict(wb_settings.MEDIA_MINIMUMS),
+        "media_realms": list(wb_settings.MEDIA_REALMS),
         "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
         "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
@@ -10279,9 +11714,24 @@ def runtime_settings_view():
         "key_before_hidden": wb_settings.key_before_hidden(ACCOUNTS_DIR),
         "hidden_pages": wb_settings.hidden_pages(ACCOUNTS_DIR),
         "update_check_enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
+        "update_check_proxy_slot": wb_settings.update_check_proxy_slot(ACCOUNTS_DIR),
+        "update_check_proxy_slots": [
+            {
+                "id": slot.get("id") or "",
+                "label": slot.get("label") or slot.get("name") or slot.get("id") or "",
+                "enabled": slot.get("enabled", True) is not False,
+            }
+            for slot in proxy_slots_view()
+        ],
         "keep_backups": wb_settings.keep_backups(ACCOUNTS_DIR),
         "keep_backups_max": wb_settings.MAX_KEEP_BACKUPS,
-        "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "upstream": _panel_upstream_config(ACCOUNTS_DIR),
+        "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
+        "desktop_chat_compat": wb_settings.desktop_chat_compat(ACCOUNTS_DIR),
+        "max_payload_mb": wb_settings.max_payload_mb(ACCOUNTS_DIR),
+        "max_payload_bytes_effective": (wb_settings.max_payload_mb(ACCOUNTS_DIR) * 1024 * 1024
+                                        if wb_settings.max_payload_mb(ACCOUNTS_DIR) is not None
+                                        else MAX_PAYLOAD_BYTES),
         "usage": wb_settings.usage_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "window_probe": wb_settings.window_probe(ACCOUNTS_DIR),
@@ -10291,11 +11741,30 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.8.0",
+        "version": "2.0.4",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
-    return POOL.representative() if POOL else None
+    return representative_account(scope=wb_pool_scope.SCOPE_TEXT)
+
+
+def representative_account(realm=None, scope=None):
+    """Pool representative with a legacy-pool compatibility fallback.
+
+    AccountPool accepts ``scope``; test and embedding pools written before
+    pool separation only accept ``realm``. Catalog refresh, health summaries
+    and media catalog reads all need the same seam, so the fallback lives
+    here instead of being repeated at every call site.
+    """
+    if POOL is None:
+        return None
+    if scope is not None:
+        try:
+            return POOL.representative(realm=realm, scope=scope)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+    return POOL.representative(realm=realm)
 
 def quota_scan_interval_hours():
     """The polling period the quota scanner runs on, for the panel caption."""
@@ -10559,7 +12028,7 @@ _LOG_WARN_HINTS = (
 # 想按模块看某一类问题时筛不出来。原有类别（chat/scheduler/tasks/accounts/
 # catalog/auth/settings）的相对顺序保持不变，避免改变既有日志的归类。
 _LOG_TAG_HINTS = (
-    ("chat", ("chat:", "chat done", "request error", "/v1/chat",
+    ("chat", ("chat:", "chat head:", "chat done", "request error", "/v1/chat",
               "/chat/completions", "responses")),
     ("scheduler", ("scheduler", "调度器")),
     ("tasks", ("task", "任务", "打卡", "签到", "猫猫", "travel", "growth")),
@@ -10844,11 +12313,14 @@ VIRTUAL_ALIAS_MODELS = {
 }
 NON_CHAT_MODELS = {"lite"} | VIRTUAL_ALIAS_MODELS
 NON_CHAT_PREFIXES = ("codewise-", "completion-")
+# 纯媒体生成模型：上游目录里它们不带 credits、没有对话规格，只有生成参数
+# （如 kling-video-v3 的 videoGeneration）。名字上无法用前后缀区分，只能列名。
 NON_CHAT_SUFFIXES = ("-image-alpha", "-image-alpha-edit", "-taco-completion")
+NON_CHAT_IDS = {"hy-image-3.5", "kling-video-v3"}
 def is_chat_model(mid):
     if not mid:
         return False
-    if mid in NON_CHAT_MODELS:
+    if mid in NON_CHAT_MODELS or mid in NON_CHAT_IDS:
         return False
     if mid.startswith(NON_CHAT_PREFIXES):
         return False
@@ -10872,23 +12344,25 @@ CN_UI_ORDER = [
     "deepseek-v4-pro",
 ]
 INTL_UI_ORDER = [
-    "hy4-preview-f",
-    "hy3",
     "deepseek-v4.1-flash",
+    "deepseek-v4.1-flash-sg",
+    "hy4-preview",
+    "hy3",
     "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
-    "gpt-5.5",
-    "gpt-5.4",
     "grok-4.7",
-    "gemini-3.5-flash",
-    "glm-5.3-flash",
+    "gemini-3.8-flash",
     "glm-5.3",
-    "glm-5.2",
+    "glm-5.3-flash",
+    "kimi-k3.1-pro",
+    "kimi-k3.1-pro-highspeed",
     "kimi-k3",
-    "kimi-k2.6",
-    "kimi-k2.8-preview",
+    "minimax-m3.1-flash",
 ]
 def merge_reasoning(base, live):
     """Field-level merge of one model's reasoning block.
@@ -10932,7 +12406,15 @@ def merge_catalog(primary, realm=None, extras=False):
         if meta:
             base = merged.get(mid) or {}
             base_reasoning = base.get("reasoning")
-            base.update(meta)
+            live = dict(meta)
+            # A live/cache catalogue can report x0.00 while the bundled table
+            # knows the model is paid (issue #774). Do not let that placeholder
+            # downgrade a known-paid model to "free"; all other fields update.
+            if (credits_is_free(live.get("credits"))
+                    and base.get("credits")
+                    and not credits_is_free(base.get("credits"))):
+                live.pop("credits", None)
+            base.update(live)
             if isinstance(meta.get("reasoning"), dict):
                 base["reasoning"] = merge_reasoning(base_reasoning, meta["reasoning"])
             merged[mid] = base
@@ -11023,7 +12505,8 @@ def models_available_for(model, realm):
     """
     if POOL is None:
         return True
-    usable = [a for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    usable = [a for a in (texts.accounts() if texts else POOL.accounts)
               if a.realm == realm and a.enabled and a.access_token]
     if not usable:
         return False
@@ -11074,14 +12557,18 @@ def fetch_models(realm=None):
             _catalog_meta[r] = {"source": source, "fetched_at": time.time(),
                                 "file_mtime": file_mtime}
         return entries
-def model_entry(mid, meta):
+def model_entry(mid, meta, realm=None):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
     convention-driven. Several shapes are emitted at once so that different
     clients (OpenRouter-style, LobeChat-style, plain-flag readers) all find
     what they look for.
+
+    `realm` decides whether the international free-channel rules apply; the
+    same model id is metered in the domestic catalog.
     """
     meta = meta or {}
+    realm = realm or CURRENT_REALM
     item = {
         "id": mid,
         "object": "model",
@@ -11371,8 +12858,11 @@ def curate_remote_catalog(realm, ids, meta=None):
     """Trim a remote catalogue to the models the picker should offer.
 
       - virtual aliases (default-model ... auto) are not models;
-      - "-sg" / "-x" builds are the paid variant of a name the list already
-        carries;
+      - a "-sg" / "-x" build is dropped only when the same list also carries
+        the plain name: it is then just the paid variant of a model the picker
+        already shows. When the plain name is gone (upstream renamed
+        deepseek-v4.1-flash to -sg in 2026-11 and no longer lists the base),
+        the suffixed build *is* the model, so it must stay;
       - when a free ("x0.00") sibling exists, the free one is the one the
         picker shows, so the paid sibling is dropped;
       - everything else keeps its upstream order. Names the upstream does not
@@ -11385,15 +12875,24 @@ def curate_remote_catalog(realm, ids, meta=None):
             credits[mid] = str(item.get("credits") or "").strip().lower()
     order = CN_UI_ORDER if realm == "cn" else INTL_UI_ORDER
     known = set(ids) | set(credits) | set(order)
+    listed = set(ids)
 
     def free(mid):
         return credits.get(mid) in ("x0.00", "x0", "0", "0.00")
+
+    def variant_base(mid):
+        for suffix in VARIANT_SUFFIXES:
+            if mid.endswith(suffix) and mid != suffix:
+                return mid[:-len(suffix)]
+        return ""
 
     out = []
     for mid in ids:
         if not is_chat_model(mid):
             continue
-        if mid.endswith(VARIANT_SUFFIXES):
+        base = variant_base(mid)
+        if base and base in listed:
+            # 同名基名也在本次目录里 → 它是付费变体，交给下面的免费档规则
             continue
         if mid.endswith("-f"):
             base = mid[:-2]
@@ -11415,7 +12914,8 @@ def fetch_remote_product_config(realm):
     """
     if realm not in ("intl", "cn") or POOL is None:
         return None
-    account = POOL.representative(realm=realm)
+    account = representative_account(
+        realm=realm, scope=wb_pool_scope.SCOPE_TEXT)
     if account is None or not account.access_token:
         log("remote catalog: no usable %s account, skipping" % realm)
         return None
@@ -11444,6 +12944,10 @@ def fetch_remote_product_config(realm):
             wb_tiers.ingest(realm, payload)
             # 成功副本落盘留档（catalog/，纯存档；见 persist_remote_catalog）。
             persist_remote_catalog(realm, payload)
+            # 顺手留一份原始 payload：媒体目录要从 data.models[].tags 里投影，
+            # 而聊天目录那一步会把媒体条目丢掉。留内存（5 分钟 TTL 与目录缓存一致）
+            # 比 dsh 插件再发一次 /v3/config 省一次往返。
+            _catalog_raw[realm] = payload
             return parsed
         last = "empty catalogue"
     log("remote catalog: %s fetch failed (%s)" % (realm, last))
@@ -11545,7 +13049,8 @@ def catalog_daily_pass(now=None):
     """
     done = []
     for realm in catalog_daily_due(now):
-        if POOL is None or POOL.representative(realm=realm) is None:
+        if POOL is None or representative_account(
+                realm=realm, scope=wb_pool_scope.SCOPE_TEXT) is None:
             continue
         out = refresh_catalog(realm)
         log("catalog daily: %s -> %s" % (realm, out.get("msg")))
@@ -11656,7 +13161,8 @@ def curated_live_sources(realm):
 
 
 def fetch_endpoint_models():
-    account = POOL.pick(realm="intl") if POOL else None
+    texts, _ = _ensure_pools()
+    account = texts.pick(realm="intl") if texts else None
     if account is None:
         log("model discovery skipped: no usable account")
         cached = _models_cache.get("intl", {}).get("data")
@@ -11805,16 +13311,27 @@ SANITIZE_FEATURES = (
     "11128",
 )
 SANITIZE_REWRITES = (
-    ("You are Claude Code, Anthropic's official CLI for Claude",
-     "You are Claude Code, Anthropic's official CLI tool for Claude"),
     ("Main branch (you will usually use this for PRs)",
      "Default branch (you will usually use this for PRs)"),
-    ("You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
-     "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant."),
     ("To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
      "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"),
     ("11128", "11-128"),
 )
+# Codex CLI 的自述首段（#743）：上游按「身份句 + Codex CLI」判 11-128。
+# 旧规则把中性句改写成这段自述，反过来把指纹注入出站 body；这里整句中性化，
+# 改写后不再命中 has_fingerprint()。
+SANITIZE_CODEX_INTRO_RE = re.compile(
+    r"(?i)You are a coding agent running in the Codex CLI(?: tool)?"
+    r"[^.\n]*\.")
+SANITIZE_CODEX_INTRO_REPLACEMENT = "You are a helpful AI assistant."
+# Claude Code 的自述首段（#733）：报告者把提示词模式改成「替换」后 400 消失，
+# 说明指纹在 system 文本里。这里按 #743 处理 Codex 自述句的同一套办法整句
+# 中性化；只锚定这一句，其余 Claude Code 提示词原样保留。
+SANITIZE_CLAUDE_CODE_INTRO_RE = re.compile(
+    r"(?i)You are Claude Code,\s*Anthropic['’]s official CLI"
+    r"(?: tool)? for Claude(?: Code)?\.?")
+SANITIZE_CLAUDE_CODE_INTRO_REPLACEMENT = "You are a helpful AI assistant."
+SANITIZE_CLAUDE_CODE_LOWER = "you are claude code,"
 SANITIZE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\r\n]*;?\s*")
 SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header")
 SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
@@ -11872,6 +13389,18 @@ SANITIZE_DSH_GUI_RE = re.compile(
     r" whose URL the runtime context names\.")
 SANITIZE_DSH_GUI_REPLACEMENT = r"\1 whose URL is named in the runtime context."
 SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
+# 文件引用段（#683）：官方插件 @deepseek-ai/dsh-file-reference 注入的
+# FILE_REFERENCE_PROMPT 整段命中同一套「A 句 + B 句连续出现」判据，
+# 回 400 / code 11-128。实测（2026-10-28，CN 号池）：整段 5 句连排稳定 400，
+# 只发前两句 200 —— 匹配的是整段，不是单词。
+#
+# 修法只动 A 句一个词：`paths the user` -> `paths that the user`，语义不变，
+# 整段不再连续；负向前瞻 (?!that ) 保证幂等。作用域与 GUI 段一致：
+# system / developer / assistant，user / tool 里的同句属用户数据不改写（#537）。
+SANITIZE_DSH_FILEREF_RE = re.compile(
+    r"(?i)(Tokens prefixed with @ are paths )(?!that )(the user explicitly referenced\.)")
+SANITIZE_DSH_FILEREF_REPLACEMENT = r"\1that \2"
+SANITIZE_DSH_FILEREF_LOWER = "are paths the user explicitly referenced"
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -11921,6 +13450,10 @@ def has_fingerprint(text, identity=True):
         return True
     if not identity:
         return False
+    # SANITIZE_FEATURES 只登记了首字母大写的 "You are Claude Code"；这里用
+    # 小写字面量补齐大小写混排的 system 文本，命中后才走 sanitize_text 的正则。
+    if SANITIZE_CLAUDE_CODE_LOWER in low:
+        return True
     # 品牌词缩减：`harness` 是廉价前置筛，真命中交给正则。
     if (SANITIZE_BRAND_LOWER in low
             and SANITIZE_BRAND_RE.search(text) is not None):
@@ -11928,6 +13461,10 @@ def has_fingerprint(text, identity=True):
     # GUI 描述段：先做一次字面量探测，命中才走正则。
     if (SANITIZE_DSH_GUI_LOWER in low
             and SANITIZE_DSH_GUI_RE.search(text) is not None):
+        return True
+    # 文件引用段：同一条廉价前置探测，命中才走正则。
+    if (SANITIZE_DSH_FILEREF_LOWER in low
+            and SANITIZE_DSH_FILEREF_RE.search(text) is not None):
         return True
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
@@ -11946,9 +13483,16 @@ def sanitize_text(text, identity=True):
     # neutralized.
     text = SANITIZE_OMO_JUNIOR_RE.sub("Sisyphus-Junior - Focused executor", text)
     if identity:
+        # Claude Code 自述首段先整句换掉：它本身就是 SANITIZE_FEATURES 里的指纹。
+        text = SANITIZE_CLAUDE_CODE_INTRO_RE.sub(
+            SANITIZE_CLAUDE_CODE_INTRO_REPLACEMENT, text)
+        # Codex 自述首段先整句换掉：它本身就是 SANITIZE_FEATURES 里的指纹。
+        text = SANITIZE_CODEX_INTRO_RE.sub(SANITIZE_CODEX_INTRO_REPLACEMENT, text)
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
+        # 文件引用段：只补一个词，打断整段连续匹配。
+        text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
@@ -11981,6 +13525,27 @@ def preserve_request_contract_enabled():
     """Opt-in field/data preservation; does not enforce upstream constraints."""
     return os.environ.get("WB_PRESERVE_REQUEST_CONTRACT", "0").strip().lower() in (
         "1", "true", "yes", "on")
+
+
+def sanitize_tools(tools):
+    """Remove channel fingerprints from function descriptions."""
+    if not isinstance(tools, list):
+        return tools
+    out = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        item = dict(tool)
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            desc = fn.get("description")
+            if isinstance(desc, str):
+                fn["description"] = sanitize_text(desc, identity=True)
+            item["function"] = fn
+        out.append(item)
+    return out
 
 
 def sanitize_tool_calls(tool_calls):
@@ -12034,6 +13599,9 @@ def sanitize_messages(messages):
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(
                     item["reasoning_content"], identity=False)
+            if not preserve_request_contract_enabled() and isinstance(item.get("reasoning"), str):
+                item["reasoning"] = sanitize_text(
+                    item["reasoning"], identity=False)
             if "tool_calls" in item:
                 item["tool_calls"] = sanitize_tool_calls(item["tool_calls"])
             out.append(item)
@@ -12353,6 +13921,95 @@ def backfill_reasoning_content(messages, model, thinking_enabled=None):
         else:
             out.append(m)
     return out
+
+
+def mirror_upstream_reasoning(messages, model):
+    """Mirror reasoning_content for models whose upstream reads reasoning."""
+    model_prefixes = (
+        "kimi", "glm", "minimax", "mimo", "step", "space-bunny",
+    )
+    model_name = str(model or "").lower()
+    if not any(model_name == prefix or model_name.startswith(prefix + "-")
+               for prefix in model_prefixes):
+        return messages
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            out.append(message)
+            continue
+        item = dict(message)
+        reasoning_content = item.get("reasoning_content")
+        reasoning = item.get("reasoning")
+        if (isinstance(reasoning_content, str) and reasoning_content.strip()
+                and not (isinstance(reasoning, str) and reasoning.strip())):
+            item["reasoning"] = reasoning_content
+        out.append(item)
+    return out
+# ---------------------------------------------------------------------------
+# Empty text parts (code 11151)
+# ---------------------------------------------------------------------------
+# 上游对每个 text 段做长度校验：`text` 为 "" 或缺失直接 400 / 11151
+# 「a message has empty content」，整段会话就此退役——每次重试都重放同一历史，
+# 换账号也救不回来。触发点不只是客户端真的发了 parts 数组：上游会把**字符串**
+# content 里以 `[` 开头的 JSON 数组当作 parts 解析，于是工具结果里常见的表单 /
+# 按钮抓取（`[{"type":"text","text":""}, ...]`）被当成一个空文本段。
+# 实测（kimi-k3.1-pro，cn 号池）：
+#   [{"type":"text","text":""}]            -> 400 / 11151
+#   [{"type":"text","text":null}]           -> 400 / 11151
+#   [{"type":"text"}]                       -> 400 / 11151
+#   [{"type":"text","text":"   "}]          -> 200（只看长度是否为零）
+#   [{"type":"textarea","text":""}]         -> 200（未识别的 type 被忽略）
+#   {"type":"text","text":""}（非数组）      -> 200（不嗅探对象）
+# 所以只补值、不删段：空 text 段填一个空格，语义不变（模型本来也看不到内容）。
+# 注意前缀空格挡不住嗅探——上游会先跳过空白再解析，别用那种写法。
+EMPTY_TEXT_PART_FILL = " "
+def _fill_empty_text_parts(parts):
+    """Give every empty text part a placeholder; True when one was filled."""
+    changed = False
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if text is None or text == "":
+            part["text"] = EMPTY_TEXT_PART_FILL
+            changed = True
+    return changed
+def _sniffed_parts(content):
+    """Return the parsed parts when a string body would be read as part list."""
+    if not isinstance(content, str):
+        return None
+    stripped = content.lstrip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        parts = json.loads(stripped)
+    except Exception:
+        return None
+    if not parts or not isinstance(parts, list):
+        return None
+    if not all(isinstance(part, dict) for part in parts):
+        return None
+    return parts
+def guard_empty_text_parts(messages):
+    """Fill empty text parts, in real part lists and in sniffer-parsed strings."""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            # 只复制要改的 text 段；图片等其余段保持原引用，不改写调用方载荷。
+            parts = [dict(part) if isinstance(part, dict)
+                     and part.get("type") == "text" else part
+                     for part in content]
+            if _fill_empty_text_parts(parts):
+                m["content"] = parts
+        else:
+            parts = _sniffed_parts(content)
+            if parts is not None and _fill_empty_text_parts(parts):
+                m["content"] = json.dumps(parts, ensure_ascii=False)
+    return messages
 # ---------------------------------------------------------------------------
 # Tool & Tool Choice Normalization (avoids code 11101 on object tool_choice)
 # ---------------------------------------------------------------------------
@@ -12520,7 +14177,7 @@ def _normalize_tool_parameters(fn):
     if params is None or not isinstance(params, dict):
         fn["parameters"] = {"type": "object", "properties": {}}
         return
-    p = dict(params)
+    p = copy.deepcopy(params)
     if p.get("type") != "object":
         p["type"] = "object"
     if "properties" not in p or not isinstance(p.get("properties"), dict):
@@ -12565,10 +14222,173 @@ def normalize_tools(obj):
                 _normalize_tool_parameters(fn)
                 item["function"] = fn
             norm.append(item)
+    # The upstream Go validator only accepts function names matching
+    # ^[A-Za-z0-9_-]{1,64}$. Entries that cannot satisfy that must be dropped
+    # rather than forwarded: a bare server-side declaration such as
+    # {"type": "web_search"} normalizes to {"type": "function"} with no
+    # "function" object at all, and the upstream then rejects the whole
+    # request by path tools[N].function.name (code 11133).
+    #
+    # Names are dropped, never rewritten: renaming would desynchronize the
+    # tool_calls names the model emits from the ones the client knows.
     if norm:
-        obj["tools"] = norm
+        valid = []
+        seen = set()
+        dropped = []
+        for item in norm:
+            fn = item.get("function")
+            if not isinstance(fn, dict):
+                dropped.append("<no function>")
+                continue
+            name = str(fn.get("name") or "").strip()
+            if not re.match(r"^[A-Za-z0-9_-]{1,64}$", name):
+                dropped.append(name or "<empty>")
+                continue
+            if name in seen:
+                dropped.append(name + " <dup>")
+                continue
+            seen.add(name)
+            valid.append(item)
+        if dropped:
+            log("normalize_tools: dropped %d unusable tool(s): %s"
+                % (len(dropped), ", ".join(dropped[:6])))
+        if valid:
+            obj["tools"] = valid
+        else:
+            obj.pop("tools", None)
     else:
         obj.pop("tools", None)
+    if obj.get("tools") and not preserve_request_contract_enabled():
+        obj["tools"] = sanitize_tools(obj["tools"])
+
+
+def _schema_contains_ref(node):
+    if isinstance(node, dict):
+        if "$ref" in node:
+            return True
+        return any(_schema_contains_ref(value) for key, value in node.items()
+                   if key not in ("default", "examples", "example", "enum", "const"))
+    if isinstance(node, list):
+        return any(_schema_contains_ref(value) for value in node)
+    return False
+
+
+def _inline_kimi_schema_node(node, defs, seen=None, depth=0, budget=None):
+    """Inline local JSON Schema references for Kimi tool declarations."""
+    if budget is None:
+        budget = [10000]
+    if depth > 64:
+        return {}
+    if budget[0] <= 0:
+        budget[0] = -1
+        return {}
+    budget[0] -= 1
+
+    if isinstance(node, list):
+        out = []
+        for value in node:
+            expanded = _inline_kimi_schema_node(
+                value, defs, seen=seen, depth=depth + 1, budget=budget)
+            if budget[0] < 0:
+                return {}
+            out.append(expanded)
+        return out
+    if not isinstance(node, dict):
+        return node
+
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = None
+        for prefix in ("#/$defs/", "#/definitions/"):
+            if ref.startswith(prefix):
+                name = ref[len(prefix):].replace("~1", "/").replace("~0", "~")
+                break
+        if name is None:
+            return dict(node)
+        active = set(seen or ())
+        if not name or name not in defs:
+            return {"type": "object"}
+        if name in active:
+            return {}
+        active.add(name)
+        expanded = _inline_kimi_schema_node(
+            defs[name], defs, seen=active, depth=depth + 1, budget=budget)
+        if budget[0] < 0:
+            return {}
+        siblings = {}
+        root = depth == 0
+        for key, value in node.items():
+            if key == "$ref" or (
+                    root and key in ("$defs", "definitions", "$schema")):
+                continue
+            child = _inline_kimi_schema_node(
+                value, defs, seen=active, depth=depth + 1, budget=budget)
+            if budget[0] < 0:
+                return {}
+            siblings[key] = child
+        if siblings and isinstance(expanded, dict):
+            expanded = dict(expanded)
+            expanded.update(siblings)
+        return expanded
+
+    out = {}
+    root = depth == 0
+    for key, value in node.items():
+        if root and key in ("$defs", "definitions", "$schema"):
+            continue
+        if key in ("default", "examples", "example", "enum", "const"):
+            out[key] = value
+            continue
+        child = _inline_kimi_schema_node(
+            value, defs, seen=seen, depth=depth + 1, budget=budget)
+        if budget[0] < 0:
+            return {}
+        out[key] = child
+    return out
+
+
+def inline_kimi_tool_schemas(body):
+    """Inline $ref/$defs in Kimi tool schemas before the request leaves."""
+    if not isinstance(body, dict):
+        return body
+    model = str(body.get("model") or "").strip().lower()
+    if model.startswith("cn:"):
+        model = model[3:].strip()
+    if not model.startswith("kimi") or not isinstance(body.get("tools"), list):
+        return body
+
+    for tool in body["tools"]:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            continue
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        if not ("$defs" in params or "definitions" in params
+                or _schema_contains_ref(params)):
+            continue
+
+        defs = {}
+        for key in ("definitions", "$defs"):
+            values = params.get(key)
+            if isinstance(values, dict):
+                defs.update(values)
+        budget = [10000]
+        expanded = _inline_kimi_schema_node(
+            params, defs, seen=set(), depth=0, budget=budget)
+        if budget[0] < 0:
+            continue
+        if not isinstance(expanded, dict):
+            expanded = {"type": "object"}
+        fn = dict(fn)
+        fn["parameters"] = expanded
+        _normalize_tool_parameters(fn)
+        tool["function"] = fn
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Stop Sequence Normalization (avoids code 11101 on a string stop)
 # ---------------------------------------------------------------------------
@@ -13316,6 +15136,94 @@ def apply_prompt_mode(messages):
     return messages
 
 
+MIN_BUDGET_BY_EFFORT = {
+    "minimal": 4096,
+    "low": 4096,
+    "medium": 6144,
+    "high": 8192,
+    "xhigh": 12288,
+    "max": 16384,
+}
+MIN_OUTPUT_BUDGET_PROBE = 16
+
+
+def min_output_budget_enabled():
+    return os.environ.get("WB_MIN_OUTPUT_BUDGET", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def ensure_min_output_budget(body, model=None):
+    """Raise explicit output budgets to the floor for the active effort."""
+    if not isinstance(body, dict) or "max_tokens" not in body:
+        return body
+    try:
+        current = int(body.get("max_tokens"))
+    except (TypeError, ValueError):
+        return body
+    if current < MIN_OUTPUT_BUDGET_PROBE:
+        return body
+
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and \
+            str(thinking.get("type") or "").strip().lower() == "disabled":
+        return body
+    effort = str(body.get("reasoning_effort")
+                 or body.get("reasoningEffort") or "").strip().lower()
+    if effort == "none":
+        return body
+    floor = MIN_BUDGET_BY_EFFORT.get(effort)
+    if floor is None:
+        return body
+    cap = model_default_max_output_tokens(model) if model else None
+    if cap and cap < floor:
+        floor = cap
+    if current < floor:
+        body["max_tokens"] = floor
+    return body
+
+
+def is_starved_completion(content_text, tool_calls, finish_reason):
+    """A length stop with no visible output and no tool call needs a retry."""
+    return (str(finish_reason or "").strip().lower() == "length"
+            and not str(content_text or "").strip()
+            and not tool_calls)
+
+
+def build_starved_retry_body(body, floor=0):
+    """Build the no-thinking retry body for a starved completion."""
+    if not isinstance(body, dict):
+        return None, False
+    current = None
+    if "max_tokens" in body:
+        try:
+            current = int(body.get("max_tokens"))
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and current < MIN_OUTPUT_BUDGET_PROBE:
+            return None, False
+
+    thinking = body.get("thinking")
+    effort = str(body.get("reasoning_effort")
+                 or body.get("reasoningEffort") or "").strip().lower()
+    if (isinstance(thinking, dict)
+            and str(thinking.get("type") or "").strip().lower() == "disabled") \
+            or effort in ("none", "off", "disabled", "disable"):
+        return None, False
+
+    out = dict(body)
+    out["thinking"] = {"type": "disabled"}
+    out.pop("reasoning_effort", None)
+    out.pop("reasoningEffort", None)
+    try:
+        floor = int(floor or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    if floor > 0 and current is not None \
+            and current >= MIN_OUTPUT_BUDGET_PROBE and current < floor:
+        out["max_tokens"] = floor
+    return out, True
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Map an unsupported level before anything below reads the effort, so the
@@ -13363,7 +15271,11 @@ def build_upstream_body(payload):
     repaired, _merged = merge_adjacent_tool_calls(body["messages"])
     repaired, _repacked = repack_tool_result_blocks(repaired)
     repaired, _cleaned = cleanup_orphan_tool_calls(repaired)
-    body["messages"] = repaired
+    # Last shape check: an empty text part is a hard 400 (11151) whichever side
+    # produced it, and it has to run after the merges above because they can
+    # move a string content into a different message.
+    body["messages"] = guard_empty_text_parts(repaired)
+    body["messages"] = mirror_upstream_reasoning(body["messages"], model)
     translate_max_completion_tokens(body)
     # Upstream GPT-family models enforce a minimum max_output_tokens >= 16;
     # smaller values (e.g. max_tokens=1 from probes) fail with 400 integer_below_min_value (#364, #252).
@@ -13407,6 +15319,10 @@ def build_upstream_body(payload):
                         chosen = "high"
                     if chosen:
                         body["reasoning_effort"] = chosen
+    # 显式档位模型（glm-5.1）：不带档位上游直接 400 / 11150，补上目录档位。
+    ensure_explicit_effort(body, model)
+    if min_output_budget_enabled():
+        ensure_min_output_budget(body, model)
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
@@ -13600,6 +15516,43 @@ def model_fixed_effort(model):
     return effort.strip() if isinstance(effort, str) and effort.strip() else None
 
 
+# 上游要求显式推理档位的模型。实测（2026-11-01，CN 号池）：glm-5.1 出站 body
+# 不带 reasoning_effort、带 "none"、或 thinking.type=disabled，一律回 400 /
+# code 11150「the reasoning effort value is not supported by the current
+# model」；low / minimal / medium / high / xhigh / max 任一档都 200。同一轮把
+# 目录里其余模型都不带档位打了一遍，全部照常 200 —— 所以只对名单内的模型补档，
+# 名单外的出站字节不变。
+EXPLICIT_EFFORT_MODELS = frozenset({"glm-5.1"})
+
+
+def ensure_explicit_effort(body, model):
+    """Fill in an effort level for models the upstream refuses to run without one.
+
+    The client's own level always wins. A missing value, an "off"-style value or
+    thinking.type=disabled is replaced with the catalog's pinned / default level
+    (else "medium"): these models only run with reasoning, so the opt-out cannot
+    be honoured and passing it through only turns the request into a 400.
+    """
+    if not isinstance(body, dict) or not model:
+        return body
+    if str(model).strip().lower() not in EXPLICIT_EFFORT_MODELS:
+        return body
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and \
+            str(thinking.get("type") or "").strip().lower() == "disabled":
+        body.pop("thinking", None)
+    key = "reasoning_effort"
+    if "reasoning_effort" not in body and "reasoningEffort" in body:
+        key = "reasoningEffort"
+    current = body.get(key)
+    if isinstance(current, str) and current.strip() \
+            and not _thinking_off_value(current):
+        return body
+    body[key] = (model_fixed_effort(model) or model_default_effort(model)
+                 or "medium")
+    return body
+
+
 def prompt_cache_key_enabled():
     """Whether to inject prompt_cache_key into outbound requests.
 
@@ -13680,10 +15633,19 @@ class RateLimited(Exception):
     """Upstream throttled this model (429 / code 6004). Distinct from a dead
     pool: the credential is fine, only the model is cooling down for a while."""
 
-    def __init__(self, http_error=None, detail="", wait=60, message=""):
+    def __init__(self, http_error=None, detail="", wait=60, message="",
+                 reset_at=None):
         self.http_error = http_error
         self.detail = detail or ""
         self.wait = max(1, int(wait or 60))
+        # 绝对重置时刻（epoch 秒）。wait 是「现在起还要等多久」，reset_at 是
+        # 「什么时候恢复」——同一个窗口的两种说法，但只有后者在客户端排队、
+        # 重试、或者把任务转给别的进程之后仍然成立。上游只在 6004 里给这个
+        # 时刻；其余 429 由网关按自己算出的冷却窗口补上。
+        try:
+            self.reset_at = float(reset_at) if reset_at else None
+        except (TypeError, ValueError):
+            self.reset_at = None
         # 429s answered without an upstream call (the pool is parked by the
         # daily token guard) carry their own text instead of the upstream
         # wording.
@@ -13708,8 +15670,8 @@ def gateway_hint(status, message):
     text = str(message or "")
     lower = text.lower()
     if status == 413 and "payload too large" in lower:
-        return ("single request body exceeds the gateway cap "
-                "(WB_MAX_PAYLOAD_BYTES, default 16MB); raise it and restart wb-proxy")
+        return ("single request body exceeds the gateway cap; reduce the request or "
+                "increase the limit in panel settings (or WB_MAX_PAYLOAD_BYTES before startup)")
     if status == 503 and "concurrent chat limit" in lower:
         return "gateway is busy at its concurrency limit; retry shortly"
     if ("11133" in lower or "model_param_invalid" in lower
@@ -13945,7 +15907,9 @@ def retry_after_seconds(model, realm):
     """Shortest wait until any account of this realm can serve `model` again."""
     if not POOL:
         return 60
-    waits = [a.throttle_wait(model=model) for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    accounts = texts.accounts() if texts else list(POOL.accounts)
+    waits = [a.throttle_wait(model=model) for a in accounts
              if a.realm == realm and a.enabled and a.access_token]
     active = [w for w in waits if w > 0]
     return int(min(active)) if active else 60
@@ -14065,9 +16029,374 @@ def read_http_error(exc, limit=600):
     if raw is not None:
         return raw[:limit]
     try:
-        return exc.read(limit)
+        raw = exc.read(limit)
+        if os.environ.get("WB_CACHE_HTTP_ERROR_BODY", "").strip().lower() in ("1", "true", "yes", "on"):
+            exc.wb_body = raw
+        return raw
     except Exception:
         return b""
+
+
+# ---------------------------------------------------------------- 11-128 取证
+# 上游回 400 / code 11-128 时，日志里只有 600 字节错误体，无法判断是出站
+# body 的哪一段触发了渠道校验。这里提供一个**默认关闭**的本地取证开关：
+#
+#   WB_DUMP_11_128=1      只写摘要：消息结构、长度、哈希、已知指纹命中、头
+#   WB_DUMP_11_128=full   摘要 + 实际发往上游的 body（含对话明文，仅本机）
+#
+# 摘要不含任何提示词文本；full 会写明文，用来和另一台机器 / 另一个客户端做
+# 逐字节对比。两种模式都不写 Authorization、API Key、Cookie 或设备 token。
+DUMP_11_128_DIR = "11-128-dumps"
+_DUMP_11_128_SEEN = deque()
+_DUMP_11_128_SEEN_MAX = 64
+_DUMP_11_128_LOCK = threading.Lock()
+_DUMP_11_128_SECRET_PARTS = (
+    "authorization", "api-key", "apikey", "token", "cookie", "secret",
+    "signature", "password",
+)
+_DUMP_11_128_KEEP_HEADERS = frozenset((
+    "user-agent", "content-type", "content-encoding", "accept",
+    "accept-encoding", "anthropic-version", "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access", "x-model-id",
+))
+
+
+def dump_11_128_mode():
+    """Return "", "summary" or "full" for the current process environment."""
+    raw = str(os.environ.get("WB_DUMP_11_128", "")).strip().lower()
+    if raw in ("full", "body", "2"):
+        return "full"
+    if raw in ("1", "true", "yes", "on", "summary"):
+        return "summary"
+    return ""
+
+
+def is_channel_rejection(status, detail):
+    """True for the upstream channel check that returns 400 / 11-128."""
+    if status is not None:
+        try:
+            if int(status) not in (400, 403):
+                return False
+        except (TypeError, ValueError):
+            return False
+    text = detail if isinstance(detail, str) else ""
+    low = text.lower()
+    return "11-128" in low or "unapproved channel" in low
+
+
+def _dump_sha12(value):
+    if isinstance(value, bytes):
+        blob = value
+    else:
+        blob = str(value).encode("utf-8", "replace")
+    return hashlib.sha256(blob).hexdigest()[:12]
+
+
+def _dump_url(url):
+    """Drop the query / fragment: it can carry a token even on a fixed URL."""
+    return str(url or "").split("?", 1)[0].split("#", 1)[0]
+
+
+def _dump_text_meta(value):
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            text = str(value)
+    return {"chars": len(text), "sha12": _dump_sha12(text)}
+
+
+def _dump_message_shape(messages):
+    """Per-message role / content shape without storing the text itself."""
+    out = []
+    for index, message in enumerate(messages or []):
+        if not isinstance(message, dict):
+            out.append({"i": index, "type": type(message).__name__})
+            continue
+        item = {"i": index, "role": message.get("role", "")}
+        content = message.get("content")
+        if isinstance(content, str):
+            item["content"] = {"type": "text", "chars": len(content),
+                               "sha12": _dump_sha12(content)}
+        elif isinstance(content, list):
+            parts = []
+            for part in content[:20]:
+                if not isinstance(part, dict):
+                    parts.append({"type": type(part).__name__})
+                    continue
+                shape = {"type": part.get("type", "")}
+                if isinstance(part.get("text"), str):
+                    shape.update(_dump_text_meta(part["text"]))
+                elif part.get("image_url") is not None:
+                    shape.update(_dump_text_meta(part.get("image_url")))
+                parts.append(shape)
+            item["content"] = {"type": "parts", "n_parts": len(content),
+                               "parts": parts}
+        elif content is None:
+            item["content"] = {"type": "none"}
+        else:
+            item["content"] = {"type": type(content).__name__}
+        if message.get("tool_calls"):
+            names = []
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and function.get("name"):
+                    names.append(str(function["name"])[:80])
+            item["tool_calls"] = names[:20]
+        if message.get("name"):
+            item["name"] = str(message["name"])[:80]
+        out.append(item)
+    return out
+
+
+def _dump_tool_names(tools):
+    names = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        source = function if isinstance(function, dict) else tool
+        name = source.get("name")
+        if name:
+            names.append(str(name)[:80])
+    return names[:100]
+
+
+def _dump_fingerprint_hits(messages):
+    """Which known channel fingerprints still occur in identity messages."""
+    hits = set()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") not in ("system", "developer", "assistant"):
+            continue
+        content = message.get("content")
+        texts = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+        for text in texts:
+            for feature in SANITIZE_FEATURES:
+                if feature in text:
+                    hits.add(feature)
+    return sorted(hits)
+
+
+def _dump_safe_headers(headers):
+    """Keep identity headers, redact credentials, hash the rest."""
+    if not headers:
+        return {}
+    pairs = headers.items() if hasattr(headers, "items") else headers
+    out = {}
+    for name, value in pairs:
+        name = str(name)
+        low = name.lower()
+        text = "" if value is None else str(value)
+        if any(part in low for part in _DUMP_11_128_SECRET_PARTS):
+            out[name] = "<redacted>"
+        elif low in _DUMP_11_128_KEEP_HEADERS or low.startswith("x-stainless-"):
+            out[name] = text[:300]
+        else:
+            out[name] = "<%d chars, sha256:%s>" % (len(text), _dump_sha12(text))
+    return out
+
+
+def _dump_request_id(detail):
+    try:
+        payload = json.loads(detail or "")
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("requestId", "request_id", "request-id", "reqId"):
+            if payload.get(key):
+                return str(payload[key])[:120]
+        for key in ("data", "error", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                for inner in ("requestId", "request_id", "request-id", "reqId"):
+                    if nested.get(inner):
+                        return str(nested[inner])[:120]
+    match = re.search(
+        r'"?request[_-]?id"?\s*[:=]\s*"?([A-Za-z0-9._:-]{6,120})',
+        detail or "", re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _dump_response_request_id(exc):
+    headers = getattr(exc, "headers", None)
+    if not headers:
+        return ""
+    for key in ("x-request-id", "x-requestid", "request-id", "x-trace-id"):
+        try:
+            value = headers.get(key)
+        except Exception:
+            value = None
+        if value:
+            return str(value)[:120]
+    return ""
+
+
+def _dump_outbound_body(exc):
+    raw = getattr(exc, "wb_outbound_body", None)
+    if raw is None:
+        return b""
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = str(raw).encode("utf-8", "replace")
+    raw = bytes(raw)
+    if str(getattr(exc, "wb_outbound_encoding", "")).lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    return raw
+
+
+def _dump_filename_part(value):
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or ""))
+    return text[:64].strip("._-") or "unknown"
+
+
+def _dump_write_bytes(path, data):
+    """Atomic write with owner-only permissions where the OS supports it."""
+    tmp = "%s.%d.%s.tmp" % (path, os.getpid(), uuid.uuid4().hex[:8])
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _dump_write_json(path, payload):
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    _dump_write_bytes(path, (text + "\n").encode("utf-8"))
+
+
+def maybe_dump_11_128(exc, detail, endpoint, model, fp=None, stream=None,
+                      client_headers=None):
+    """Write one local evidence bundle when an upstream 11-128 is seen.
+
+    The outbound body is attached by open_upstream() only while the switch is
+    on, so the disabled path pays nothing and never holds a second copy of a
+    large request. All exceptions are swallowed: a diagnostic must never turn
+    an upstream 400 into a gateway 500.
+    """
+    try:
+        mode = dump_11_128_mode()
+        if not mode:
+            return ""
+        status = getattr(exc, "code", None)
+        if not is_channel_rejection(status, detail):
+            return ""
+        body = _dump_outbound_body(exc)
+        body_key = "%s|%s|%s|%s" % (
+            hashlib.sha256(body).hexdigest() if body else _dump_sha12(detail),
+            endpoint, getattr(exc, "wb_outbound_product", ""),
+            getattr(exc, "wb_outbound_realm", ""))
+        with _DUMP_11_128_LOCK:
+            if body_key in _DUMP_11_128_SEEN:
+                return ""
+            if len(_DUMP_11_128_SEEN) >= _DUMP_11_128_SEEN_MAX:
+                _DUMP_11_128_SEEN.popleft()
+
+        parsed = None
+        if body:
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+            except Exception:
+                parsed = None
+        messages = parsed.get("messages") if isinstance(parsed, dict) else None
+        if not isinstance(messages, list):
+            messages = []
+        tools = parsed.get("tools") if isinstance(parsed, dict) else None
+        if not isinstance(tools, list):
+            tools = []
+        request_id = _dump_request_id(detail)
+        if not request_id:
+            request_id = _dump_response_request_id(exc)
+
+        outbound_fp = (prompt_fingerprint(messages)
+                       if isinstance(parsed, dict) else (fp or {}))
+        summary = {
+            "schema": 1,
+            "at": time.time(),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "endpoint": endpoint,
+            "status": status,
+            "model": model,
+            "stream": bool(stream) if stream is not None else None,
+            "request_id": request_id,
+            "account": {
+                "uid8": str(getattr(exc, "account_uid", "") or "")[:8],
+                "product": str(getattr(exc, "wb_outbound_product", "") or ""),
+                "realm": str(getattr(exc, "wb_outbound_realm", "") or ""),
+                "proxy_slot": str(getattr(exc, "proxy_slot", "") or ""),
+                "proxy_exit": str(getattr(exc, "proxy_exit", "") or ""),
+            },
+            "upstream_url": _dump_url(getattr(exc, "wb_outbound_url", "")),
+            "body": {
+                "available": bool(body),
+                "encoding": str(getattr(exc, "wb_outbound_encoding", "") or ""),
+                "bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest() if body else "",
+                "json": bool(isinstance(parsed, dict)),
+                "n_messages": len(messages),
+                "n_tools": len(tools),
+                "tool_names": _dump_tool_names(tools),
+                "fingerprint_hits": _dump_fingerprint_hits(messages),
+            },
+            "prompt_fingerprint": outbound_fp,
+            "handler_fingerprint": fp or {},
+            "messages": _dump_message_shape(messages),
+            "headers": _dump_safe_headers(
+                getattr(exc, "wb_outbound_headers", None)),
+            "client_headers": _dump_safe_headers(client_headers),
+            "upstream_error": (detail or "")[:2000],
+        }
+
+        outdir = os.path.join(USAGE_DIR, DUMP_11_128_DIR)
+        os.makedirs(outdir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = "%s-%s-%s" % (stamp, _dump_filename_part(endpoint),
+                             _dump_filename_part(request_id or body_key[:12]))
+        path = os.path.join(outdir, base + ".json")
+        suffix = 2
+        while os.path.exists(path):
+            path = os.path.join(outdir, "%s-%d.json" % (base, suffix))
+            suffix += 1
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if mode == "full" and body:
+            body_name = stem + (".body.json" if isinstance(parsed, dict)
+                                else ".body.bin")
+            _dump_write_bytes(os.path.join(outdir, body_name), body)
+            summary["body"]["file"] = body_name
+        _dump_write_json(path, summary)
+        with _DUMP_11_128_LOCK:
+            _DUMP_11_128_SEEN.append(body_key)
+        log("11-128 dump: %s (mode=%s, body=%d bytes)"
+            % (os.path.basename(path), mode, len(body)), level="WARNING",
+            tag="upstream")
+        return path
+    except Exception as exc2:
+        try:
+            log("11-128 dump failed: %s" % exc2, level="WARNING",
+                tag="upstream")
+        except Exception:
+            pass
+        return ""
 
 
 def model_scoped_errors_penalize_account():
@@ -14265,53 +16594,78 @@ def _env_number(name, default, cast=float):
 RESTRICTED_403_ROTATE_MAX = int(_env_number("WB_RESTRICTED_403_ROTATE_MAX", 0, int))
 RESTRICTION_WAVE_MIN = max(1, int(_env_number("WB_RESTRICTION_WAVE_MIN", 2, int)))
 RESTRICTION_WAVE_WINDOW = _env_number("WB_RESTRICTION_WAVE_WINDOW", 900.0)
-RESTRICTION_HOLD_SECONDS = _env_number("WB_RESTRICTION_HOLD_SECONDS", 1800.0)
-
 _RESTRICTION_LOCK = threading.Lock()
 _RESTRICTION_EVENTS = {}   # realm -> {uid: epoch}（窗口内被限制的账号）
 _RESTRICTION_HOLD = {}     # realm -> 暂停到哪个 epoch
 
 
-def reset_restriction_state():
-    """清空连坐保护状态（测试，以及人工确认「已申诉、可以恢复派发」时用）。"""
+def reset_restriction_state(realm=None):
+    """重置风控连坐状态。若指定 realm 则清空该区域，否则全部清空。"""
     with _RESTRICTION_LOCK:
-        _RESTRICTION_EVENTS.clear()
-        _RESTRICTION_HOLD.clear()
+        if realm:
+            _RESTRICTION_EVENTS.pop(realm, None)
+            _RESTRICTION_HOLD.pop(realm, None)
+        else:
+            _RESTRICTION_EVENTS.clear()
+            _RESTRICTION_HOLD.clear()
 
 
 def restriction_hold_remaining(realm, now=None):
-    """该区域整池暂停还剩多少秒（0 = 没有暂停）。"""
+    """查询指定区域连坐暂停的剩余秒数（0 = 没有暂停）。"""
     now = time.time() if now is None else now
     with _RESTRICTION_LOCK:
         return max(0.0, _RESTRICTION_HOLD.get(realm, 0.0) - now)
 
 
-def note_account_restriction(realm, uid="", now=None):
-    """记一次账号级风控限制；返回整池暂停的到期 epoch（0 = 尚未触发）。
+def all_restriction_holds(now=None):
+    """返回所有处于连坐暂停中的 realm 及剩余秒数（整数）。"""
+    now = time.time() if now is None else now
+    with _RESTRICTION_LOCK:
+        return {
+            realm: max(0, int(until - now))
+            for realm, until in _RESTRICTION_HOLD.items()
+            if until > now
+        }
 
-    同一窗口内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，就认为上游在
-    按设备 / 出口做连坐清扫：把整个区域暂停 RESTRICTION_HOLD_SECONDS，期间
-    不再向上游发任何请求（open_upstream 直接快速失败），等人工确认或时间到
-    再恢复。按 uid 去重，所以同一个号被反复探测 / 测试不会把暂停骗出来。
+
+def clamp_restriction_holds(max_seconds, now=None):
+    """当用户调整了暂停时长，实时截断当前现存的暂停倒计时。"""
+    now = time.time() if now is None else now
+    with _RESTRICTION_LOCK:
+        if max_seconds <= 0:
+            _RESTRICTION_HOLD.clear()
+            return
+        for realm, until in list(_RESTRICTION_HOLD.items()):
+            if until > now + max_seconds:
+                _RESTRICTION_HOLD[realm] = now + max_seconds
+
+
+def note_account_restriction(realm, uid="", now=None):
+    """记一次账号级风控限制；若触发连坐暂停则返回暂停到的 epoch（0 = 尚未触发）。
+
+    同一个区域内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，判定为该区域
+    遭到了设备 / 出口级别的风控连坐扫荡，全区域紧急暂停配置的 hold_seconds 秒；期间
+    所有发往该区域的任何请求（open_upstream）直接快速失败，直到人工确认或时间到
+    才恢复。按 uid 去重，避免同一个账号被重复探测 / 重试反复把暂停骗长。
     """
     now = time.time() if now is None else now
     uid = str(uid or "").strip() or "-"
+    hold_sec = wb_settings.restriction_hold_seconds(ACCOUNTS_DIR)
     with _RESTRICTION_LOCK:
         events = {key: at for key, at in _RESTRICTION_EVENTS.get(realm, {}).items()
                   if now - at <= RESTRICTION_WAVE_WINDOW}
         events[uid] = now
         _RESTRICTION_EVENTS[realm] = events
-        if len(events) < RESTRICTION_WAVE_MIN or RESTRICTION_HOLD_SECONDS <= 0:
+        if len(events) < RESTRICTION_WAVE_MIN or hold_sec <= 0:
             return 0.0
         until = max(_RESTRICTION_HOLD.get(realm, 0.0),
-                    now + RESTRICTION_HOLD_SECONDS)
+                    now + hold_sec)
         _RESTRICTION_HOLD[realm] = until
     log("upstream restriction wave on %s: %d account(s) restricted within %.0fs; "
         "pausing dispatch for %.0fs to avoid cross-account bans (uid %s)"
         % (realm, len(events), RESTRICTION_WAVE_WINDOW,
-           RESTRICTION_HOLD_SECONDS, uid[:8]))
+           hold_sec, uid[:8]))
     return until
-
 
 def restriction_hold_message(realm, remaining):
     """整池暂停期间交给客户端的说明。"""
@@ -14414,6 +16768,111 @@ def parse_rate_limit_reset(detail):
         return None
 
 
+def rate_limit_reset_at(exc):
+    """这次 429 的绝对恢复时刻（epoch 秒），拿不到就回 None。
+
+    优先用上游正文里写的墙钟（只有 6004 会写），否则由调用方按本地冷却窗口
+    算出并塞进 `reset_at`。两者都拿不到时不编造——客户端退回只看 Retry-After。
+    """
+    # 两个来源都过同一道筛子（见 _usable_reset_epoch）：过去的值、越界的值、
+    # 非数字一律丢掉。裸 int() 会把 now+0.4 截成当前这一秒，客户端拿到一个
+    # 「已经过去」的时刻照着重试，等于没等。
+    epoch = _usable_reset_epoch(getattr(exc, "reset_at", None))
+    if epoch is not None:
+        return epoch
+    return _usable_reset_epoch(
+        parse_rate_limit_reset(getattr(exc, "detail", "") or ""))
+
+
+#: 愿意对外宣称的最远恢复时刻（2100-01-01）。超过它的 epoch 不是「还有很久」，
+#: 而是正文里的时间戳本身可疑（年份写错、时区串了、陈旧响应被重放），对外发出去
+#: 只会让客户端睡到天荒地老。
+RATE_LIMIT_RESET_MAX = 4102444800
+
+
+def _usable_reset_epoch(reset_at, now=None):
+    """把一个候选恢复时刻收敛成可以对外宣称的 epoch，不可用就回 None。
+
+    三道筛子，缺一条都会让客户端拿到一个照做就错的时刻：
+
+      * 不是数字（`"abc"`、`None`）—— 丢掉；
+      * 已经过去 —— 丢掉。上游时钟慢、或者一条陈旧响应被重放时，正文里的墙钟
+        会落在过去；此时「再等 60 秒」和「304 天前就恢复了」同时出现在一个响应
+        里，客户端只会选一个信，而两个都不对；
+      * 远得离谱（超过 2100 年）—— 丢掉。这个范围也正好挡掉 `time.gmtime()`
+        的越界：Windows 上越界抛的是 `OSError`（errno 22），而 `strftime` 的
+        调用点如果漏捕，整条 429 响应会连一个字节都发不出去——这与
+        `parse_rate_limit_reset` 自己「坏正文不许打断请求路径」的契约冲突。
+    """
+    if not reset_at:
+        return None
+    try:
+        value = float(reset_at)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # 写成一条完整的谓词，而不是 `value <= 0 or value > MAX`：NaN 与任何数
+    # 比较都是 False，两条各写各的时候 NaN 会溜过去，落到 int(nan) 抛
+    # ValueError，把一条本来正常的 429 变成没有响应。
+    if not (0 < value <= RATE_LIMIT_RESET_MAX):
+        return None
+    if now is None:
+        now = time.time()
+    # 向上取整：`int()` 会把 `now + 60` 截掉小数部分，对外宣称的时刻因此可能
+    # 落在 now 之前最多一秒。
+    epoch = int(value)
+    if epoch < value:
+        epoch += 1
+    if epoch <= int(now):
+        # 已经过去（或就是这一秒）——丢掉，交给调用方回落到它自己的冷却窗口。
+        # 不在这里「补到下一秒」：那等于凭空造一个恢复时刻，而本模块的立场是
+        # 宁可不说也不说错的。
+        return None
+    return epoch
+
+
+def _iso_utc(epoch):
+    """epoch → ISO-8601 UTC。调用方保证 epoch 已经被 _usable_reset_epoch 收过。
+
+    429 天然是突发的（限流本身就是突发），同一次响应里正文和响应头各要一份
+    同一个时间戳，所以格式化只做一次（仓库里 build_usage 对 strftime 也有
+    同样的缓存处理）。
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def rate_limit_headers(reset_at):
+    """429 上除了 Retry-After 之外还要带的头。
+
+    `Retry-After` 只回答「等多久」，而下游真正需要的是「等到什么时候」：
+    多 worker / 多进程的客户端各自记一份相对时间，各自漂移；任务被转交给
+    别的进程后相对时间直接失效。所以再给两个绝对量：
+
+      * `X-RateLimit-Reset`    —— epoch 秒（GitHub 等 API 的通行口径；OpenAI
+        自家那两个头是 "1s" 形式的时长字符串，别与它混用）
+      * `X-RateLimit-Reset-At` —— ISO-8601 UTC，人眼和日志都能直接读
+
+    拿不到可用时刻时一个都不发，绝不用「现在 + 猜测」凑一个出来：一个错的
+    恢复时刻比没有更糟，客户端会照着它睡过头或提前撞墙。
+    """
+    epoch = _usable_reset_epoch(reset_at)
+    if epoch is None:
+        return []
+    return [("X-RateLimit-Reset", str(epoch)),
+            ("X-RateLimit-Reset-At", _iso_utc(epoch))]
+
+
+def rate_limit_reset_note(reset_at):
+    """给 429 正文补一句「什么时候恢复」，没有可用时刻时回空串。
+
+    有些客户端只把 message 打给人看、完全不解析响应头（curl、日志、各类
+    脚本）。头里有的信息，正文里也写一遍，读日志的人就不必再去翻响应头。
+    """
+    epoch = _usable_reset_epoch(reset_at)
+    if epoch is None:
+        return ""
+    return " (resets at %s)" % _iso_utc(epoch)
+
+
 def upstream_timeouts():
     """(header, idle) seconds for the chat upstream socket.
 
@@ -14468,12 +16927,16 @@ def _apply_stream_idle_timeout(response, seconds):
         return False
 
 
-def schedule_window_probe(account, model, reset_at):
+def schedule_window_probe(account, model, reset_at, cap=False, cap_at=0.0):
     """把上游给出的重置时刻登记给窗口探针（wb_window_probe）。
 
     上游的额度窗口按首次请求起算，到点无人请求就不会开始新一轮，所以这个
     时刻要在后台被主动用掉，而不是只当作一段冷却。登记本身不能影响请求
     路径：任何异常都只写日志，本次 429 照常换号重试。
+
+    `cap` 说明这条窗口是上游 6004 判定额度用满；连同撞线时刻一起落盘，
+    于是**任何模型**（不只免费模型）重启后仍然知道"这是配额用尽、撞线于
+    何时"，面板不会把它误写成一次临时限流（issue #668）。
     """
     if not reset_at or account is None or not model:
         return False
@@ -14483,26 +16946,15 @@ def schedule_window_probe(account, model, reset_at):
     accounts_dir = getattr(POOL, "dir", "") or ACCOUNTS_DIR
     try:
         import wb_window_probe
-        return wb_window_probe.schedule(accounts_dir, account.uid, model, reset_at)
+        return wb_window_probe.schedule(accounts_dir, account.uid, model, reset_at,
+                                         cap=cap, cap_at=cap_at)
     except Exception as exc:
         log("window probe schedule failed: %s" % exc)
         return False
 
 
-_FREE_MODEL_CREDIT_FALLBACKS = {
-    ("intl", "deepseek-v4.1-flash"): "deepseek-v4.1-flash-sg",
-}
-
-
-def _free_model_credit_fallback_enabled():
-    if wb_settings.free_model_credit_fallback(ACCOUNTS_DIR):
-        return True
-    return os.environ.get("WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
-                  allow_credit_fallback=True, allow_product_switch=True,
+                  allow_product_switch=True,
                   pin_account=None, defer_egress_success=False,
                   allowed_accounts=None):
     # Refresh the daily guards before picking. The scan underneath is
@@ -14512,6 +16964,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # share the same fold, and calling them separately paid for it three
     # times on every request.
     apply_daily_guards()
+    apply_reserve_credits()
     # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
     # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
     # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
@@ -14520,9 +16973,18 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         POOL.apply_remaining_weights(
             remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
-    model = str(payload.get("model") or "")
+    requested_model = str(payload.get("model") or "")
+    model = intl_model_alias(requested_model, realm)
+    texts, _ = _ensure_pools()
     pinned = pin_account if pin_account is not None else pinned_account()
     if pinned is not None:
+        if texts is not None:
+            try:
+                texts.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise PinnedAccountError(403, str(exc), pinned.uid)
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise PinnedAccountError(503, str(exc), pinned.uid)
         if allowed_accounts is not None and pinned.uid not in allowed_accounts:
             raise PinnedAccountError(
                 403, "pinned account '%s' is not allowed by this API key"
@@ -14541,13 +17003,20 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     if hold > 0:
         raise RateLimited(None, "upstream account restriction in effect",
                           wait=int(hold) + 1,
-                          message=restriction_hold_message(realm, hold))
+                          message=restriction_hold_message(realm, hold),
+                          reset_at=time.time() + int(hold) + 1)
     # 复用调用方已建好的 body：/v1/chat/completions 在进这里之前已经 build 过
     # 一次（那次的产物只用于一行日志和 prompt_fingerprint），此前这里会为同一
     # 个 payload 再建一遍，大请求实测白付 ~13.6ms/请求。403 降级重试时仍按
     # payload 重建（degrade 会切换 prompt 模式，必须拿到新 body）。
     upstream_body = (prebuilt_body if prebuilt_body is not None
                      else build_upstream_body(payload))
+    if upstream_body.get("model") != model:
+        # prebuilt_body is built from the client payload before open_upstream
+        # is called. Copy before changing it so callers can safely reuse their
+        # object across retries, and so the client-visible model never changes.
+        upstream_body = dict(upstream_body)
+        upstream_body["model"] = model
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
     # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
@@ -14566,13 +17035,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # Only pass `allowed` when the request actually carries a restriction: a
     # stub pool in tests (and any external pool implementation) keeps its old
     # count_ready signature for the unrestricted path.
-    if POOL is None:
+    if texts is None:
         ready_total = 1
     elif allowed_accounts is not None:
-        ready_total = POOL.count_ready(realm, model=model,
-                                       allowed=allowed_accounts)
+        ready_total = texts.count_ready(realm, model=model,
+                                        allowed=allowed_accounts)
     else:
-        ready_total = POOL.count_ready(realm, model=model)
+        ready_total = texts.count_ready(realm, model=model)
     total = 1 if pinned is not None else max(1, ready_total)
     tried = set()
     # 这一轮请求已经记过账的账号：重试轮（transient_hits 后 tried.clear() 整池
@@ -14672,7 +17141,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                           exclude=exclude, model=model, page=affinity_page)
             if allowed_accounts is not None:
                 kwargs["allowed"] = allowed_accounts
-            candidate = POOL.pick_for_session(**kwargs) if POOL else None
+            candidate = texts.pick_for_session(**kwargs) if texts else None
             if candidate is None:
                 return None
             if account_slot_acquire(candidate):
@@ -14749,6 +17218,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
         else:
             attempt_body = upstream_body
+        if account.realm == "cn" and isinstance(attempt_body.get("tools"), list):
+            attempt_body = dict(attempt_body)
+            attempt_body["tools"] = [dict(tool, function=dict(tool["function"]))
+                                     if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+                                     else tool for tool in attempt_body["tools"]]
+            inline_kimi_tool_schemas(attempt_body)
         # 官方 CLI 的 chat 请求体（见 wb_identity）：gzip（RequestBodyGzip=true，
         # 带 Content-Encoding: gzip）+ 注入 cache_retention=long；Responses API
         # 的字段 / 客户端 metadata 不带。VSCode 官方主 chat 也默认 gzip
@@ -14759,12 +17234,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             attempt_body = {k: v for k, v in attempt_body.items()
                             if k not in wb_identity.CLI_BODY_DROP_FIELDS}
             attempt_body["cache_retention"] = wb_identity.CLI_CACHE_RETENTION
-        # 紧凑 JSON：官方客户端（Node JSON.stringify）不带分隔符后的空格，默认的
-        # json.dumps(separators=(", ", ": ")) 会让 body 字节与 Content-Length 都成
-        # 一处机器特征。上游解析等价，只影响线上字节。
-        attempt_data = encode_upstream_body(attempt_body)
-        if cli_identity or vscode_identity:
-            attempt_data = wb_identity.gzip_body(attempt_data)
         # 会话头族（X-Conversation-ID / -Request-ID）的语义见 wb_identity：桌面端
         # 官方客户端同一会话复用同一个 id：桌面端 / CLI 按 (账号, 会话键) 稳定
         # 派生（#448），客户端没给会话键时保持每请求新生成；VSCode 按官方
@@ -14782,6 +17251,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             purpose="chat", session_key=session_key,
             turn_request_id=turn_request_id, model=model,
             conversation_id=conv_id)
+        if (account.product == wb_identity.PRODUCT_DESKTOP
+                and wb_identity.desktop_chat_compat_enabled(getattr(account, "accounts_dir", None))):
+            attempt_body = wb_identity.inject_conversation_fields(
+                attempt_body, req_headers.get("X-Conversation-Request-ID"))
+        attempt_data = encode_upstream_body(attempt_body)
+        if cli_identity or vscode_identity:
+            attempt_data = wb_identity.gzip_body(attempt_data)
         if cli_identity or vscode_identity:
             req_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
         req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
@@ -14804,12 +17280,37 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             # 头之后还要读几十秒，那段时间上游仍算这个账号在跑）。绑定后本地
             # 标记置空，循环开头就不会再重复归还。
             bind_account_slot_to_response(resp, account)
+            try:
+                resp._wb_account_uid = account.uid
+            except Exception:
+                pass
+            if model != requested_model:
+                try:
+                    resp._wb_billed_model = model
+                except Exception:
+                    pass
             slot_held = None
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
             # model and the request, and the callers record it on the usage row.
             return resp, account, upstream_effort_of(upstream_body, model)
         except urllib.error.HTTPError as exc:
+            # 归因（#743）：所有 HTTPError 分支共用，exit 的 raise 路径也能
+            # 带回实际账号与出口；400 分支因此不再需要单独补一次。
+            try:
+                exc.account_uid = account.uid
+                exc.proxy_slot = account.proxy_slot
+                exc.proxy_exit = egress_exit(account.proxy)
+                if dump_11_128_mode():
+                    exc.wb_outbound_body = attempt_data
+                    exc.wb_outbound_encoding = (
+                        "gzip" if (cli_identity or vscode_identity) else "identity")
+                    exc.wb_outbound_headers = dict(req_headers)
+                    exc.wb_outbound_url = chat_url
+                    exc.wb_outbound_product = getattr(account, "product", "")
+                    exc.wb_outbound_realm = getattr(account, "realm", "")
+            except Exception:
+                pass
             if exc.code == 429:
                 try:
                     detail = read_http_error(exc, 600).decode("utf-8", "replace")
@@ -14845,7 +17346,19 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                    cooldown=wait, detail=detail)
                 # 除了记冷却，还要把重置时刻交给后台探针：到点主动发一个最小
                 # 请求，把新一轮窗口的计时起点钉在那一刻（窗口按首次请求起算）。
-                schedule_window_probe(account, model, reset_at)
+                #
+                # 「达到限额」的唯一标志是上游返回 6004（用户口径）：别的 429
+                # 即使带重置墙钟也不构成额度判定。这个事实跟窗口一起落盘，
+                # 于是**任何模型**（含国内版按积分计费的 deepseek-v4.1-flash）
+                # 都能保住"配额用尽 + 撞线时刻"，面板不会把它误写成一次临时
+                # 限流（issue #668）。凭证档的 model_caps 仍只覆盖免费模型：
+                # 那是限额联动的范围，与"这是不是配额用尽"是两件事。
+                is_cap = rate_limit_is_cap(detail)
+                cap_at = time.time() if is_cap else 0.0
+                if is_cap:
+                    account.model_cap_marks[model] = cap_at
+                schedule_window_probe(account, model, reset_at, cap=is_cap,
+                                      cap_at=cap_at)
                 if reset_at:
                     # A cap with a reset clock is the one observable moment the
                     # window budget can be measured from; the usage rows alone
@@ -14856,7 +17369,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     # 429 即使带重置墙钟也不构成额度判定，不记 cap、不写盘。
                     # 记录范围（免费模型）由 note_model_cap 把守——范围外的
                     # 模型返回 False，重启后自动放开，不参与持久化禁用。
-                    if rate_limit_is_cap(detail):
+                    if is_cap:
                         try:
                             if account.note_model_cap(model, reset_at):
                                 _save_account_caps(account, model, reset_at)
@@ -14975,6 +17488,14 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # catalogue label; the tier map from `/v3/config` now drives
                 # both the scheduler and that label, so the request never gets
                 # this far for a gated model.
+                #
+                # `raise` skips the slot release after the loop, so hand the
+                # concurrency seat back first: without this the account stays
+                # "serving 1 request" forever and every later pick skips it
+                # (`account_max_concurrent=1` makes one leaked seat fatal).
+                if slot_held is not None:
+                    account_slot_release(slot_held)
+                    slot_held = None
                 raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
@@ -15015,6 +17536,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
+            # Same leak as the 400 branch above: an unhandled status (e.g. 404
+            # from a wrong chat path) escapes the loop, so release the seat
+            # before unwinding.
+            if slot_held is not None:
+                account_slot_release(slot_held)
+                slot_held = None
             raise
         except Exception as exc:
             if wb_accounts.is_tls_verify_error(exc):
@@ -15076,30 +17603,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     if slot_held is not None:
         account_slot_release(slot_held)
         slot_held = None
-    # Only spend credits after every enabled, credential-bearing account in
-    # this realm has a persisted upstream 6004 cap for this free model. The
-    # switch is opt-in because the retry can incur real charges.
-    paid_model = _FREE_MODEL_CREDIT_FALLBACKS.get((realm, model))
-    eligible = ([a for a in POOL.accounts
-                 if a.realm == realm and a.enabled and a.access_token
-                 and (allowed_accounts is None or a.uid in allowed_accounts)]
-                if POOL else [])
-    if (allow_credit_fallback and paid_model and _free_model_credit_fallback_enabled()
-            and eligible and all(a.cap_until(model) > time.time() for a in eligible)):
-        paid_payload = dict(payload)
-        paid_payload["model"] = paid_model
-        log("free model '%s' exhausted on all %d %s account(s); retrying paid model '%s'"
-            % (model, len(eligible), realm, paid_model))
-        response, account, effort = open_upstream(
-            paid_payload, session_key=session_key, target_realm=realm,
-            allow_credit_fallback=False, allow_product_switch=False,
-            **({"allowed_accounts": allowed_accounts}
-               if allowed_accounts is not None else {}))
-        try:
-            response._wb_billed_model = paid_model
-        except Exception:
-            pass
-        return response, account, effort
     if last_error is not None:
         # Carry the account that produced the failure out to the caller, so
         # the error row can name it even though the local variable that would
@@ -15120,8 +17623,14 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             exc.account_uid = last_uid
             raise exc
         if last_429 is not None:
-            exc = RateLimited(last_429, last_429_detail,
-                              wait=retry_after_seconds(model, realm))
+            # `retry_after_seconds` 是全池**最短**的冷却窗口——客户端真正能再次
+            # 得到服务的时刻；`last_429_detail` 却只是**最后一个**失败账号的
+            # 正文。两者来自不同的窗口：别的账号 60 秒后就绪、最后一个撞墙的
+            # 账号回了个 1 小时后的墙钟，照抄墙钟就会让客户端对着「其实马上
+            # 能用」的池子睡上一小时。这里只以池窗口为准。
+            wait = retry_after_seconds(model, realm)
+            exc = RateLimited(last_429, last_429_detail, wait=wait,
+                              reset_at=time.time() + wait)
             exc.account_uid = last_uid
             raise exc
         if last_403_detail:
@@ -15131,28 +17640,38 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
-        raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
-    enabled = [a for a in POOL.accounts
+        # 说清在等什么、等多久：客户端看到 "usage exceeds frequency limit"
+        # 时不知道是哪个模型、还有多久能好，于是照旧立刻重试（issue #665）。
+        reason = ("every usable account in realm '%s' is cooling the upstream %s "
+                  "window; the pool resumes in %ds" % (realm, model, wait))
+        raise RateLimited(None, "usage exceeds frequency limit", wait=wait,
+                          message=reason, reset_at=time.time() + wait)
+    texts, _ = _ensure_pools()
+    text_accounts = texts.accounts() if texts else (POOL.accounts if POOL else [])
+    enabled = [a for a in text_accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
     if enabled and all(a.daily_limit_blocked() for a in enabled):
         reason = ("every usable account reached today's token limit (%s per "
                   "account); the pool resumes after local midnight"
                   % wb_settings.daily_token_limit(ACCOUNTS_DIR, realm))
-        raise RateLimited(None, reason,
-                          wait=seconds_until_local_midnight(), message=reason)
+        midnight = seconds_until_local_midnight()
+        raise RateLimited(None, reason, wait=midnight, message=reason,
+                          reset_at=time.time() + midnight)
     if enabled and model and all(a.credit_limit_blocked(model) for a in enabled):
         reason = ("every usable account reached today's credit limit (%s per "
                   "account); paid models resume after local midnight, free "
                   "models keep working"
                   % wb_settings.daily_credit_limit(ACCOUNTS_DIR, realm))
-        raise RateLimited(None, reason,
-                          wait=seconds_until_local_midnight(), message=reason)
+        midnight = seconds_until_local_midnight()
+        raise RateLimited(None, reason, wait=midnight, message=reason,
+                          reset_at=time.time() + midnight)
     if enabled and model and all(a.model_token_limit_blocked(model) for a in enabled):
         reason = ("every usable account reached today's token limit for %s "
                   "(%s per account); the model resumes after local midnight"
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
-        raise RateLimited(None, reason,
-                          wait=seconds_until_local_midnight(), message=reason)
+        midnight = seconds_until_local_midnight()
+        raise RateLimited(None, reason, wait=midnight, message=reason,
+                          reset_at=time.time() + midnight)
     if busy and last_error is None:
         # 名额全满：账号本身完全健康，只是每个都在跑别的请求。必须报得比
         # 「全部停用/冷却/过期」清楚——否则排查的人会去看账号状态，而真正
@@ -15161,10 +17680,32 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         reason = ("every usable account is already serving %d concurrent "
                   "request(s) (account_max_concurrent=%d); retry shortly or "
                   "raise the cap" % (limit, limit))
-        raise RateLimited(None, reason, wait=1, message=reason)
-    raise RuntimeError("no usable account for realm '%s': all are disabled, cooling down, "
-                       "expired or parked by the daily token limit%s"
-                       % (realm, pool_unavailable_detail(realm, model)))
+        raise RateLimited(None, reason, wait=1, message=reason,
+                          reset_at=time.time() + 1)
+    candidates = [a for a in enabled
+                  if allowed_accounts is None or a.uid in allowed_accounts]
+    if (model and candidates
+            and all(a.blocked_by_model_cooldown(model) for a in candidates)):
+        # 全部候选都只差"这个模型的上游窗口恢复"：这是**等待**，不是故障。
+        # 503 + "去面板加号" 解决不了上游配额，只会让客户端立刻重试（真机
+        # 实测 24ms 一轮、3 分钟 12 次）；429 + Retry-After 才会让客户端等到
+        # 恢复时刻（issue #665）。
+        until = min(a.model_cooldown_until(model) for a in candidates)
+        wait = max(1, int(until - time.time()))
+        reason = ("every candidate account is waiting for the upstream %s window "
+                  "to reset (%d account(s), earliest reset in %ds); the pool is "
+                  "idle, not broken - retry after the reset"
+                  % (model, len(candidates), wait))
+        raise RateLimited(None, detail=reason, wait=wait, message=reason,
+                          reset_at=time.time() + wait)
+    scope = ""
+    if allowed_accounts:
+        scope = ("; this API key may use %d account(s)" % len(allowed_accounts))
+    raise RuntimeError("no usable account for realm '%s': every candidate is "
+                       "disabled, cooling down, expired, out of upstream quota "
+                       "or parked by a local limit%s%s"
+                       % (realm, scope,
+                          pool_unavailable_detail(realm, model, allowed_accounts)))
 
 
 # ---- 跨出口回退：国际版 → 国内版（开关默认关）--------------------------------
@@ -15197,10 +17738,11 @@ def realm_fallback_target(realm, model):
         return ""
     if exclusive_realm(model):
         return ""
-    if POOL is None:
+    texts, _ = _ensure_pools()
+    if texts is None:
         return ""
     try:
-        if POOL.count_ready(realm="cn", model=model) <= 0:
+        if texts.count_ready(realm="cn", model=model) <= 0:
             return ""
     except Exception:
         return ""
@@ -15253,7 +17795,7 @@ def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
     return open_upstream(payload, session_key=session_key,
                          target_realm=backup, **kwargs)
 
-def pool_unavailable_detail(realm, model=None):
+def pool_unavailable_detail(realm, model=None, allowed_accounts=None):
     """把该区域每个账号不可用的原因拼成一句，附在「没有可用账号」后面。
 
     这句话以前只列了四种可能（停用 / 冷却 / 过期 / 日限额），而 v1.6.16 之后
@@ -15263,11 +17805,21 @@ def pool_unavailable_detail(realm, model=None):
     排查的人只能对着「明明有 9 个账号」的池子猜。
 
     这里不改变判定，只把判定结果说出来：每个不可用账号「八位 UID + 原因」。
+
+    `allowed_accounts` 给定时只列**真正参与本次派发**的账号：API Key 可以
+    绑定账号，绑定之外的号再健康也轮不到。把它们列进来只会把排查的人引去
+    看整个区域——真机上就是这样：Key 绑的 2 个号在冷却，报错却列了全区 4 个
+    在冷却的号，而 2 个健康的号（没绑这个 Key）一个字都没提（issue #665）。
     """
-    if POOL is None:
+    texts, _ = _ensure_pools()
+    if texts is None:
         return ""
-    accounts = [a for a in POOL.accounts if a.realm == realm]
+    accounts = [a for a in texts.accounts() if a.realm == realm]
+    if allowed_accounts is not None:
+        accounts = [a for a in accounts if a.uid in allowed_accounts]
     if not accounts:
+        if allowed_accounts is not None:
+            return "；本 Key 绑定的账号都不在 %s 区" % realm
         return "；该区域没有任何账号"
     reasons = []
     for account in accounts:
@@ -15281,17 +17833,93 @@ def pool_unavailable_detail(realm, model=None):
         return ""
     return "；各账号：%s" % "，".join(reasons)
 
+
+def pool_readiness(pool=None, realm=None):
+    """账号池的可用口径：总数、按区域、按模型。
+
+    `/health` 以前只报两个数：全池的账号数与全池的"可用"数。它们既不按区域
+    分，也不看模型级冷却——被上游按 (账号, 模型) 限额挡住的号仍算"可用"。
+    于是池子对某个模型已经空了，探针与面板还是一片绿（issue #667）。
+
+    旧的 `accounts` / `accounts_ready` 保持原义（老脚本不受影响），这里补上
+    三种口径：按区域、按模型、当前出口的可用数。模型清单取自账号自己知道的
+    那些（免费模型名单、已撞线的模型、正在冷却的模型），不额外去打上游。
+    """
+    pool = POOL if pool is None else pool
+    out = {"accounts": 0, "accounts_ready": 0, "accounts_by_realm": {},
+           "accounts_ready_by_realm": {}, "accounts_ready_current_realm": 0,
+           "models_ready": {}}
+    if pool is None:
+        return out
+    accounts = list(pool.accounts)
+    realms = []
+    for a in accounts:
+        r = getattr(a, "realm", "") or ""
+        if r not in realms:
+            realms.append(r)
+    out["accounts"] = len(accounts)
+    out["accounts_ready"] = pool.count_ready()
+    for r in realms:
+        out["accounts_by_realm"][r] = len(
+            [a for a in accounts if (getattr(a, "realm", "") or "") == r])
+        out["accounts_ready_by_realm"][r] = pool.count_ready(realm=r)
+    out["accounts_ready_current_realm"] = pool.count_ready(
+        realm=realm or CURRENT_REALM)
+    models = set()
+    for a in accounts:
+        models.update(getattr(a, "free_models", ()) or ())
+        models.update(list((getattr(a, "model_caps", {}) or {}).keys()))
+        models.update(list((getattr(a, "model_cooldowns", {}) or {}).keys()))
+    for m in sorted(models)[:50]:
+        out["models_ready"][m] = {
+            r: pool.count_ready(realm=r, model=m, refresh=False) for r in realms}
+    return out
+
+
+def key_readiness(entry, pool=None):
+    """这个 API Key 真正能用到几个号（绑定 × 区域 × 当前状态）。
+
+    `/health` 报的是全池的数：池子里有号、服务在跑，但这个 Key 绑定的号可能
+    全在冷却里——"服务正常但我的 Key 用不了"就是这么发生的（issue #667）。
+    """
+    pool = POOL if pool is None else pool
+    out = {"key_accounts_ready": 0, "key_accounts_bound": 0}
+    if pool is None or not entry:
+        return out
+    allowed = wb_settings.key_allowed_accounts(entry)
+    realm = (entry or {}).get("realm") or CURRENT_REALM
+    out["key_accounts_ready"] = pool.count_ready(
+        realm=realm, allowed=allowed, refresh=False)
+    if allowed is not None:
+        out["key_accounts_bound"] = len(allowed)
+    else:
+        out["key_accounts_bound"] = len(
+            [a for a in pool.accounts if (getattr(a, "realm", "") or "") == realm])
+    return out
+
 #: 「测试」默认用哪条模型：最便宜、任何区域都有的那条。
 TEST_MODEL_DEFAULT = "deepseek-v4.1-flash"
 #: 一键测试的并发度：每个探针都是一次真实的上游请求，别把池子打成压测。
 PROBE_CONCURRENCY = 4
 
+#: Clash / sing-box / Surge 等本地 DNS 代理的 fake-IP 段（IANA benchmarking）。
+#: 开启 fake-IP 后，域名会先解析到这里，再由本机 TUN / 透明代理按 SNI 转发到真实
+#: 目标——198.18.0.11 本身不是要连的目的地，而是代理的占位地址。Python 的
+#: ipaddress 把 198.18.0.0/15 算作 is_private，不单独放行的话，开了 Clash Verge
+#: 的用户一键测试永远报「解析到非公网地址」，而真实请求其实一切正常。
+FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
 def _is_public_addr(text):
-    """是不是一个可以直连的公网地址（拒绝环回/私有/链路本地/保留段）。"""
+    """是不是一个可以直连的公网地址（拒绝环回/私有/链路本地/保留段）。
+
+    fake-IP 段例外：它只存在于本地 DNS 代理里，连接由代理按域名转发。
+    """
     try:
         addr = ipaddress.ip_address(str(text).split("%")[0])
     except ValueError:
         return False
+    if addr.version == 4 and addr in FAKE_IP_NETWORK:
+        return True
     return not (addr.is_private or addr.is_loopback or addr.is_link_local
                 or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
 
@@ -15346,12 +17974,13 @@ def probe_account(account, model=None, timeout=30):
     单个「测试」与「一键测试」共用这一份：两边各写一套的话，早晚一边忘了清计数、
     另一边忘了认本机断网——而这两件事正是「明明测了能用，它还熔断」的全部来源。
     """
-    model = model or TEST_MODEL_DEFAULT
+    logical_model = model or TEST_MODEL_DEFAULT
+    upstream_model = intl_model_alias(logical_model, account.realm)
     row = {"uid": account.uid, "nickname": account.nickname or account.uid[:8],
-           "realm": account.realm, "model": model, "ok": False, "elapsed_ms": 0,
+           "realm": account.realm, "model": logical_model, "ok": False, "elapsed_ms": 0,
            "status": None, "reply": "", "error": "", "network": False}
     chat_url = account.chat_base_url() + CHAT_PATH
-    test_body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+    test_body = {"model": upstream_model, "messages": [{"role": "user", "content": "hi"}],
                  "stream": False}
     probe_body = build_upstream_body(test_body)
     cli_identity = account.is_cli_identity()
@@ -15365,7 +17994,7 @@ def probe_account(account, model=None, timeout=30):
         body = wb_identity.gzip_body(body)
     # 与 open_upstream 同一条出站形态：VSCode 身分的 model 请求带 X-Model-ID；
     # CLI / VSCode 官方主 chat 都默认 gzip。
-    probe_headers = account.headers(purpose="chat", model=model)
+    probe_headers = account.headers(purpose="chat", model=upstream_model)
     if cli_identity or vscode_identity:
         probe_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
     req = urllib.request.Request(chat_url, data=body, method="POST",
@@ -15374,7 +18003,7 @@ def probe_account(account, model=None, timeout=30):
     t0 = time.time()
     try:
         with wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy) as resp:
-            chat_obj = aggregate_stream(resp, model, None)
+            chat_obj = aggregate_stream(resp, upstream_model, None)
             row["elapsed_ms"] = int((time.time() - t0) * 1000)
             choices = chat_obj.get("choices") or []
             msg = (choices[0].get("message") or {}) if choices else {}
@@ -15386,7 +18015,7 @@ def probe_account(account, model=None, timeout=30):
             # ladder from it. Only the tested model's cooldown is dropped here -
             # sibling models keep theirs, and a 402 balance park keeps its own lift
             # path (revive_balance_cooldown on a credits refresh).
-            account.note_success(model=model)
+            account.note_success(model=upstream_model)
             row["ok"] = True
             return row
     except urllib.error.HTTPError as exc:
@@ -15403,7 +18032,12 @@ def probe_account(account, model=None, timeout=30):
         # The label keeps its 80-char cut; `detail` rides along untouched so the
         # panel can show the whole upstream body on hover.
         row["status"] = exc.code
-        row["error"] = "HTTP %d: %s" % (exc.code, detail[:150])
+        # Keep the 401's WWW-Authenticate in the label: APISIX says
+        # error="invalid_token" there and serves an HTML body, so a body-only
+        # label reads like a proxy page and leaves the account parked in the
+        # pool while every dispatch bounces (#435's exemption is not meant to
+        # cover a gateway that names the credential as bad).
+        row["error"] = wb_accounts.http_error_message(exc, detail, 150)
         if exc.code == 403 and restriction_is_account_level(detail):
             # 测试也认账号级风控限制：不能用 60 秒的普通冷却把 2 小时覆盖掉，
             # 更不能用「测试通过」的语义把被限制的账号放回池子（见 #422）。
@@ -15414,7 +18048,7 @@ def probe_account(account, model=None, timeout=30):
             row["restricted"] = True
             row["fails"] = int(account.fails)
             return row
-        account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
+        account.note_error(wb_accounts.http_error_message(exc, detail, 80),
                            cooldown=60, detail=detail)
         row["fails"] = int(account.fails)
         return row
@@ -15584,7 +18218,12 @@ class SSEHeartbeat:
 
 
 def aggregate_stream(raw_iter, model, resp_id):
-    """Fold an SSE stream into one non-streaming chat.completion object."""
+    """Fold an SSE stream into one non-streaming chat.completion object.
+
+    `model` is the client-facing id. Upstream chunks may echo an outbound alias
+    (for example the intl -sg route); that must not replace the logical model.
+    """
+    logical_model = model
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = None
@@ -15593,9 +18232,12 @@ def aggregate_stream(raw_iter, model, resp_id):
     saw_done = False
     for line in iter_sse_lines(raw_iter):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
-        if not data or data == "[DONE]":
-            if data == "[DONE]":
-                saw_done = True
+        if data == "[DONE]":
+            saw_done = True
+            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                break
+            continue
+        if not data:
             continue
         try:
             chunk = json.loads(data)
@@ -15605,8 +18247,6 @@ def aggregate_stream(raw_iter, model, resp_id):
             first_chunk_at = time.time()
         if chunk.get("id"):
             resp_id = chunk["id"]
-        if chunk.get("model"):
-            model = chunk["model"]
         u = chunk.get("usage")
         if u:
             if usage is None or (u.get("total_tokens") or 0) >= (usage.get("total_tokens") or 0):
@@ -15721,7 +18361,7 @@ def aggregate_stream(raw_iter, model, resp_id):
         "id": resp_id or f"chatcmpl-wb-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model,
+        "model": logical_model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
@@ -15791,6 +18431,34 @@ def _flatten_content(content):
     if any(p.get("type") == "image_url" for p in parts):
         return parts          # multimodal: keep structured parts
     return chr(10).join(t for t in texts if t)
+
+
+def _append_visible_reasoning(current, addition):
+    if not addition:
+        return current
+    if not current:
+        return addition
+    if current == addition:
+        return current
+    return current + chr(10) + addition
+
+
+def _reasoning_group_target(items, start):
+    known_types = {
+        None, "message", "user", "function_call",
+        "function_call_output", "custom_tool_call", "custom_tool_call_output",
+        "agent_message",
+    }
+    known_types.update(COMPACTION_ITEM_TYPES)
+    for item_index in range(start + 1, len(items)):
+        item = items[item_index]
+        if isinstance(item, str):
+            return item
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in known_types:
+            return item
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -15952,7 +18620,8 @@ def expand_namespace_tools(tools, _depth=0):
                 subs = entry.get("functions")
             if not isinstance(subs, list):
                 subs = []
-            child_ns = str(entry.get("name") or ns_name or "")
+            own = str(entry.get("name") or "")
+            child_ns = _NS_SEP.join([p for p in (ns_name, own) if p])
             for sub in subs:
                 collect(sub, depth + 1, child_ns)
             return
@@ -16005,10 +18674,10 @@ def resolve_namespaced_name(name, mapping):
     if name in mapping:
         return name, mapping[name]
     if "::" in name:
-        idx = name.find("::")
+        idx = name.rfind("::")
         if idx > 0:
             tail = name[idx + 2:]
-            head = name[:idx]
+            head = name[:idx].replace("::", _NS_SEP)
             if tail in mapping:
                 return tail, mapping[tail]
             return tail, head
@@ -16216,7 +18885,8 @@ def build_citations(text, sources):
 
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
-                                drop_tools=False, allowed_accounts=None):
+                                drop_tools=False, allowed_accounts=None,
+                                reasoning_content=None):
     """执行反代自己代跑的网路工具，把结果喂回模型，回传新的上游连线。
 
     drop_tools=True 表示这是最后一轮：把网路工具从工具清单收回，模型没有东西
@@ -16230,13 +18900,19 @@ def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_st
         holder["convo_messages"] = convo
 
     tool_calls = []
+    round_number = int(holder.get("_web_tool_round") or 0) + 1
+    holder["_web_tool_round"] = round_number
     for i, c in enumerate(internal_calls):
         tool_calls.append({
-            "id": "call_web_%d_%d" % (int(t_start * 1000) % 1000000, i),
+            "id": "call_web_%d_%d_%d" % (int(t_start * 1000) % 1000000,
+                                         round_number, i),
             "type": "function",
             "function": {"name": c["name"], "arguments": c.get("arguments") or "{}"},
         })
-    convo.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+    assistant = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+    if isinstance(reasoning_content, str) and reasoning_content:
+        assistant["reasoning_content"] = reasoning_content
+    convo.append(assistant)
 
     for tc in tool_calls:
         nm = tc["function"]["name"]
@@ -16368,36 +19044,63 @@ def _responses_input_to_messages(payload):
     if isinstance(inp, str):
         messages.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
-        for item in inp:
+        for item_index, item in enumerate(inp):
             if isinstance(item, str):
                 messages.append({"role": "user", "content": item})
+                pending_reasoning = ""
                 continue
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
             if itype in (None, "message", "user"):
                 body = _flatten_content(item.get("content"))
-                if body:
-                    role = item.get("role") or "user"
-                    if role == "developer":
-                        role = "system"
+                role = item.get("role") or "user"
+                if role == "developer":
+                    role = "system"
+                inline_reasoning = ""
+                inline_tool_calls = []
+                if role == "assistant":
+                    if isinstance(item.get("reasoning_content"), str):
+                        inline_reasoning = item["reasoning_content"]
+                    if isinstance(item.get("tool_calls"), list):
+                        inline_tool_calls = item["tool_calls"]
+                elif pending_reasoning:
+                    pending_reasoning = ""
+                if body or inline_reasoning or inline_tool_calls:
                     # If this is assistant text and the previous message is an assistant
                     # message (e.g. from an adjacent function_call), merge them so
                     # tool_calls and text stay in one message without breaking tool sequence.
-                    if role == "assistant" and messages and messages[-1].get("role") == "assistant":
+                    if (role == "assistant" and not pending_reasoning
+                            and messages
+                            and messages[-1].get("role") == "assistant"):
                         prev = messages[-1]
                         if prev.get("content"):
                             prev["content"] = str(prev["content"]) + chr(10) + str(body)
                         else:
                             prev["content"] = body
-                        if pending_reasoning and "reasoning_content" not in prev:
-                            prev["reasoning_content"] = pending_reasoning
-                            pending_reasoning = ""
+                        if inline_tool_calls:
+                            if "tool_calls" in prev:
+                                prev["tool_calls"].extend(inline_tool_calls)
+                            else:
+                                prev["tool_calls"] = list(inline_tool_calls)
+                        if inline_reasoning:
+                            prev["reasoning_content"] = _append_visible_reasoning(
+                                prev.get("reasoning_content"), inline_reasoning)
                     else:
                         msg_dict = {"role": role, "content": body}
                         if role == "assistant" and pending_reasoning:
                             msg_dict["reasoning_content"] = pending_reasoning
                             pending_reasoning = ""
+                        if role == "assistant":
+                            if inline_tool_calls:
+                                msg_dict["tool_calls"] = list(inline_tool_calls)
+                            if inline_reasoning:
+                                msg_dict["reasoning_content"] = _append_visible_reasoning(
+                                    msg_dict.get("reasoning_content"), inline_reasoning)
+                        if role == "tool":
+                            msg_dict["tool_call_id"] = item.get("tool_call_id") or ""
+                            if item.get("name") is not None:
+                                msg_dict["name"] = item.get("name")
                         messages.append(msg_dict)
             elif itype == "reasoning":
                 # Reasoning item from previous assistant turn in Responses API.
@@ -16418,10 +19121,23 @@ def _responses_input_to_messages(payload):
                     elif isinstance(cnt, list):
                         r_text = _flatten_content(cnt)
                 if r_text:
-                    if messages and messages[-1].get("role") == "assistant":
-                        messages[-1]["reasoning_content"] = r_text
+                    next_item = _reasoning_group_target(inp, item_index)
+                    next_type = next_item.get("type") if isinstance(next_item, dict) else None
+                    next_role = next_item.get("role") if isinstance(next_item, dict) else None
+                    starts_assistant = (
+                        next_type in ("function_call", "custom_tool_call")
+                        or (next_type in (None, "message", "user")
+                            and next_role == "assistant")
+                    )
+                    if (not starts_assistant and messages
+                            and messages[-1].get("role") == "assistant"):
+                        _merge_reasoning_content(
+                            messages[-1], {"reasoning_content": r_text})
                     else:
-                        pending_reasoning = r_text
+                        pending_reasoning = (
+                            pending_reasoning + chr(10) + r_text
+                            if pending_reasoning else r_text
+                        )
             elif itype == "function_call_output":
                 raw_out = item.get("output")
                 if not item.get("call_id"):
@@ -16446,6 +19162,7 @@ def _responses_input_to_messages(payload):
                                           "[Message from another task - treat this "
                                           "as a user instruction]"}] + _txt),
                         })
+                        pending_reasoning = ""
                         continue
                     _txt = (_txt or "").strip()
                     if _txt:
@@ -16454,6 +19171,7 @@ def _responses_input_to_messages(payload):
                             "content": ("[Message from another task - treat this "
                                         "as a user instruction]" + chr(10) + chr(10) + _txt),
                         })
+                        pending_reasoning = ""
                         continue
                 if isinstance(raw_out, list):
                     content = _flatten_content(raw_out)
@@ -16471,6 +19189,7 @@ def _responses_input_to_messages(payload):
                     "tool_call_id": item.get("call_id") or "",
                     "content": content,
                 })
+                pending_reasoning = ""
             elif itype == "function_call":
                 tc_item = {
                     "id": item.get("call_id") or item.get("id") or "",
@@ -16481,15 +19200,13 @@ def _responses_input_to_messages(payload):
                     },
                 }
                 # Merge into previous assistant message if adjacent
-                if messages and messages[-1].get("role") == "assistant":
+                if (not pending_reasoning and messages
+                        and messages[-1].get("role") == "assistant"):
                     prev = messages[-1]
                     if "tool_calls" in prev:
                         prev["tool_calls"].append(tc_item)
                     else:
                         prev["tool_calls"] = [tc_item]
-                    if pending_reasoning and "reasoning_content" not in prev:
-                        prev["reasoning_content"] = pending_reasoning
-                        pending_reasoning = ""
                 else:
                     msg_dict = {
                         "role": "assistant",
@@ -16516,15 +19233,13 @@ def _responses_input_to_messages(payload):
                     },
                 }
                 # Merge into previous assistant message if adjacent
-                if messages and messages[-1].get("role") == "assistant":
+                if (not pending_reasoning and messages
+                        and messages[-1].get("role") == "assistant"):
                     prev = messages[-1]
                     if "tool_calls" in prev:
                         prev["tool_calls"].append(tc_item)
                     else:
                         prev["tool_calls"] = [tc_item]
-                    if pending_reasoning and "reasoning_content" not in prev:
-                        prev["reasoning_content"] = pending_reasoning
-                        pending_reasoning = ""
                 else:
                     msg_dict = {
                         "role": "assistant",
@@ -16551,6 +19266,7 @@ def _responses_input_to_messages(payload):
                     "tool_call_id": item.get("call_id") or "",
                     "content": content,
                 })
+                pending_reasoning = ""
             elif itype == "agent_message":
                 parts = item.get("content")
                 if isinstance(parts, list):
@@ -16567,6 +19283,7 @@ def _responses_input_to_messages(payload):
                         "content": ("[Message from another task - treat this as "
                                     "a user instruction]" + chr(10) + chr(10) + text),
                     })
+                    pending_reasoning = ""
             elif itype in COMPACTION_ITEM_TYPES:
                 # A compaction result from an earlier turn. Codex replays it as
                 # an opaque item; to the upstream it is the handoff summary the
@@ -16580,6 +19297,7 @@ def _responses_input_to_messages(payload):
                                     "(context checkpoint):" + chr(10) + chr(10)
                                     + summary.strip()),
                     })
+                    pending_reasoning = ""
             elif itype == "compaction_trigger":
                 # The control item that asks for this compaction turn. It has no
                 # message payload of its own; the caller handles the request.
@@ -16675,7 +19393,15 @@ def responses_to_chat(payload, compaction=False):
             chat["tools"] = wb_webtools.install_tool_defs(chat.get("tools") or [], wants)
             chat["_web_tools"] = True
     if payload.get("tool_choice") and not compaction:
-        chat["tool_choice"] = payload["tool_choice"]
+        tc = payload["tool_choice"]
+        if isinstance(tc, dict) and isinstance(chat.get("_namespace_map"), dict):
+            fn = tc.get("function")
+            if isinstance(fn, dict) and fn.get("name"):
+                bare_name, _ = resolve_namespaced_name(fn["name"], chat["_namespace_map"])
+                tc = dict(tc)
+                tc["function"] = dict(fn)
+                tc["function"]["name"] = bare_name
+        chat["tool_choice"] = tc
     if payload.get("parallel_tool_calls") is not None and not compaction:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
     return chat
@@ -17256,7 +19982,9 @@ def stream_messages_events(raw_iter, model, holder=None):
         state["started"] = True
         if isinstance(chunk, dict):
             state["id"] = _anthropic_text(chunk.get("id"))
-            state["model"] = _anthropic_text(chunk.get("model")) or state["model"]
+            # `model` is the client-facing id. Do not let the outbound intl
+            # alias (-sg) leak into the Anthropic response.
+            state["model"] = model
         return anthropic_sse_frame("message_start", {
             "message": {
                 "id": _anthropic_message_id(state["id"]),
@@ -17554,6 +20282,7 @@ def reasoning_only_response(result):
 
 def stream_responses_events(upstream, model, holder):
     """Yield Responses-API SSE frames translated from chat-completions chunks."""
+    logical_model = model
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
     seq = 0
@@ -17583,7 +20312,7 @@ def stream_responses_events(upstream, model, holder):
             "object": "response",
             "created_at": created,
             "status": status,
-            "model": model,
+            "model": logical_model,
             "output": [o for o in outputs if o],
             "output_text": "".join(text_parts),
             "parallel_tool_calls": meta.get("parallel_tool_calls", True),
@@ -17629,6 +20358,7 @@ def stream_responses_events(upstream, model, holder):
         # Close out the stream: reasoning item, structured tool calls,
         # DSML fallback, the message item and response.completed.
         nonlocal msg_index, text_buffer
+        holder["reasoning_content"] = "".join(reason_parts)
         if reason_index is not None and outputs[reason_index] is None:
             full_r = "".join(reason_parts)
             yield ev("response.reasoning_summary_text.done", {
@@ -17862,9 +20592,12 @@ def stream_responses_events(upstream, model, holder):
         yield ev("response.in_progress", {"response": resp_obj("in_progress")})
     for raw in upstream:
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
-        if not data or data == "[DONE]":
-            if data == "[DONE]":
-                saw_done = True
+        if data == "[DONE]":
+            saw_done = True
+            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                break
+            continue
+        if not data:
             continue
         try:
             chunk = json.loads(data)
@@ -18165,7 +20898,9 @@ def _release_key_slot(key_entry):
 # /shutdown 修好之后，/updates/check、/updates/install、/quota-scan/run 又漏了。
 # 新增这类「不读 body」的面板路由，请加进这个元组，别在路由里另写一份。
 BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
-                        "/updates/install", "/quota-scan/run")
+                        "/updates/install", "/quota-scan/run",
+                        "/settings/restriction/reset",
+                        "/settings/device-token/reload")
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -18183,6 +20918,10 @@ class Handler(BaseHTTPRequestHandler):
     # 而不是参数，是因为测试里大量 Handler 桩只覆写了 _json(code, obj) 这两个
     # 位置参数——加参数会让它们全部报错，而属性默认 None 对它们完全无感。
     _json_etag = None
+    # 本次 _json() 响应要额外带的头（429 的恢复时刻，见 rate_limit_headers）。
+    # 与 _json_etag 同一个理由放成实例属性：测试里三十来个 Handler 桩只覆写
+    # 了 _json(code, obj)，加参数会让它们全部报错，而属性对它们完全无感。
+    _json_extra_headers = None
     # The stdlib default caps the request line at 64KB and answers an opaque
     # bare "414 Request-URI Too Long" for anything longer. Raise it and reply in
     # the normal JSON error shape so an over-long URL is diagnosable.
@@ -18197,6 +20936,8 @@ class Handler(BaseHTTPRequestHandler):
         # 校验符同理：留着上一轮的 tag，下一次 _json() 就会把别的请求的 ETag
         # 发出去（keep-alive 上同一个 Handler 实例服务一整条连接）。
         self._json_etag = None
+        # 同一理由：上一轮 429 的恢复时刻不能跟着 keep-alive 漏到下一个响应上。
+        self._json_extra_headers = None
         # Body-tracking state must also start clean for every request, otherwise
         # a later drain would skip a body that has not been read yet.
         self._body_consumed = False
@@ -18248,7 +20989,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.8.0"
+    server_version = "wb-proxy/2.0.4"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -18270,13 +21011,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        realm_used = getattr(self, "realm_used", "") or ""
-        if realm_used:
-            # 区域自动路由（对标 qd #26）：本次实际出口 + 原因，随响应可见
-            self.send_header("X-WB-Realm", realm_used)
-            realm_reason = getattr(self, "realm_reason", "") or ""
-            if realm_reason:
-                self.send_header("X-WB-Realm-Reason", realm_reason)
+        # 429 需要把恢复时刻带出去（见 rate_limit_headers）；其余响应一个
+        # 头都不多发，保持与从前逐字节一致。
+        for name, value in (self._json_extra_headers or ()):
+            self.send_header(name, value)
         # 只有 _json_cached() 覆盖的只读接口才有校验符；其余调用点保持原样，
         # 一个头都不多发。
         etag = self._json_etag
@@ -18395,6 +21133,8 @@ class Handler(BaseHTTPRequestHandler):
         transfer_encoding = (headers.get("Transfer-Encoding") or "").lower()
         try:
             if "chunked" in transfer_encoding:
+                if getattr(self, "_reject_body_after_reply", False):
+                    return
                 self._drain_chunked_body()
                 return
             length = int(headers.get("Content-Length") or 0)
@@ -18402,11 +21142,11 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         if length <= 0:
             return
-        if length > MAX_PAYLOAD_BYTES:
-            # The client announced a body we refuse (413). Reading it would
-            # block until it finishes sending gigabytes, so close instead and
-            # let it see the reply plus the disconnect.
-            self.close_connection = True
+        if (length > MAX_PAYLOAD_BYTES
+                or getattr(self, "_reject_body_after_reply", False)):
+            # The client announced a body we refuse (413). The caller writes the
+            # response first, then uses _drain_rejected_body() to make that
+            # response survive the peer's remaining upload (issue #799).
             return
         remaining = length
         try:
@@ -18444,6 +21184,93 @@ class Handler(BaseHTTPRequestHandler):
                 self.rfile.read(2)  # trailing CRLF after each chunk
         except Exception:
             self.close_connection = True
+
+    def _drain_rejected_body(self, length=0, budget_seconds=2.0):
+        """Drain an oversized body after its 413 has been written.
+
+        Closing a socket while the peer is still sending makes the OS send an
+        RST; that discards the already-buffered 413, so the client sees only a
+        connection reset. Half-close the write side first, then consume what the
+        peer has already put on the wire within a small time budget. This is a
+        bounded drain, not an invitation to wait for gigabytes.
+        """
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+        try:
+            old_timeout = sock.gettimeout()
+        except Exception:
+            old_timeout = None
+        deadline = time.monotonic() + max(0.0, float(budget_seconds))
+        remaining = max(0, int(length or 0))
+        chunked = False
+        headers = getattr(self, "headers", None)
+        if headers is not None:
+            try:
+                chunked = "chunked" in (headers.get("Transfer-Encoding") or "").lower()
+            except Exception:
+                chunked = False
+        try:
+            while time.monotonic() < deadline and not chunked:
+                if remaining > 0:
+                    want = min(remaining, 65536)
+                else:
+                    want = 65536
+                sock.settimeout(max(0.01, deadline - time.monotonic()))
+                chunk = self.rfile.read(want)
+                if not chunk:
+                    break
+                if remaining > 0:
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        break
+            if chunked:
+                # The exact byte count is unknown for chunked uploads. Read
+                # framing only until the zero chunk or the same time budget;
+                # never buffer the payload itself.
+                while time.monotonic() < deadline:
+                    sock.settimeout(max(0.01, deadline - time.monotonic()))
+                    line = self.rfile.readline(65536)
+                    if not line:
+                        break
+                    size_field = line.split(b";", 1)[0].strip()
+                    if not size_field:
+                        continue
+                    size = int(size_field, 16)
+                    if size == 0:
+                        while time.monotonic() < deadline:
+                            sock.settimeout(max(0.01, deadline - time.monotonic()))
+                            trailer = self.rfile.readline(65536)
+                            if not trailer or trailer in (b"\r\n", b"\n"):
+                                break
+                        break
+                    left = size
+                    while left > 0 and time.monotonic() < deadline:
+                        sock.settimeout(max(0.01, deadline - time.monotonic()))
+                        data = self.rfile.read(min(left, 65536))
+                        if not data:
+                            break
+                        left -= len(data)
+                    if left > 0:
+                        break
+                    sock.settimeout(max(0.01, deadline - time.monotonic()))
+                    self.rfile.read(2)
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.settimeout(old_timeout)
+            except Exception:
+                pass
+        self._body_consumed = True
     # How much of an over-long request line to read before giving up. The peer
     # is already misbehaving; this only needs to be enough that a normal client
     # (which sent one line and is waiting for an answer) sees the reply.
@@ -18490,7 +21317,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except Exception:
             pass
-    def _error(self, code, message, err_type="server_error"):
+    def _error(self, code, message, err_type="server_error", reset_at=None):
         # Every early rejection funnels through here, so draining the body in
         # one place covers all of them. Unblock any client still waiting on
         # "Expect: 100-continue" first, otherwise it never sends the body and
@@ -18501,12 +21328,34 @@ class Handler(BaseHTTPRequestHandler):
         hint = gateway_hint(code, message)
         if hint:
             error["gateway_hint"] = hint
-        self._json(code, {"error": error})
-    def _anthropic_error(self, code, message, err_type=None):
+        epoch = _usable_reset_epoch(reset_at) if code == 429 else None
+        if epoch is None and code == 429:
+            # 透传路径（CodeArts、上游裸 429）手头只有正文：正文里若写了墙钟
+            # （6004 措辞、UTC±N 搭配），照样能给客户端一个恢复时刻。
+            epoch = _usable_reset_epoch(parse_rate_limit_reset(message or ""))
+        if epoch is not None:
+            error["reset_at"] = epoch
+            error["message"] = message + rate_limit_reset_note(epoch)
+            self._json_extra_headers = rate_limit_headers(epoch)
+        try:
+            self._json(code, {"error": error})
+        finally:
+            # 与 _json_etag 同一口径：绝不能把这一轮的头发给下一个响应。
+            self._json_extra_headers = None
+    def _anthropic_error(self, code, message, err_type=None, reset_at=None):
         """Reply with the Anthropic JSON error envelope, not OpenAI's."""
         self._handle_expect_continue()
         self._discard_body()
-        return self._json(code, anthropic_error_obj(code, message, err_type))
+        epoch = _usable_reset_epoch(reset_at) if code == 429 else None
+        if epoch is None and code == 429:
+            epoch = _usable_reset_epoch(parse_rate_limit_reset(message or ""))
+        if epoch is not None:
+            message = message + rate_limit_reset_note(epoch)
+            self._json_extra_headers = rate_limit_headers(epoch)
+        try:
+            return self._json(code, anthropic_error_obj(code, message, err_type))
+        finally:
+            self._json_extra_headers = None
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering.
 
@@ -18525,22 +21374,27 @@ class Handler(BaseHTTPRequestHandler):
         detail = ""
         if exc.detail and not custom:
             detail = " - " + exc.detail[:200]
+        reset_at = rate_limit_reset_at(exc)
         # 429 can be answered before the body is read (the model cooldown is
         # checked on the way in), so drain it exactly like _error does.
         self._handle_expect_continue()
         self._discard_body()
-        body = json.dumps({
-            "error": {
-                "message": text + detail,
-                "type": "rate_limit_error",
-                "code": 429,
-                "retry_after": wait,
-            }
-        }, ensure_ascii=False).encode("utf-8")
+        error = {
+            "message": text + detail + rate_limit_reset_note(reset_at),
+            "type": "rate_limit_error",
+            "code": 429,
+            "retry_after": wait,
+        }
+        if reset_at:
+            error["reset_at"] = int(reset_at)
+        body = json.dumps({"error": error},
+                          ensure_ascii=False).encode("utf-8")
         self.send_response(429)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Retry-After", str(wait))
+        for name, value in rate_limit_headers(reset_at):
+            self.send_header(name, value)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -18552,6 +21406,8 @@ class Handler(BaseHTTPRequestHandler):
                 "upstream rate limit reached for this model; retry in %ds" % wait)
         if getattr(exc, "detail", "") and not getattr(exc, "message", ""):
             text += " - " + str(exc.detail)[:200]
+        reset_at = rate_limit_reset_at(exc)
+        text += rate_limit_reset_note(reset_at)
         self._handle_expect_continue()
         self._discard_body()
         body = json.dumps(anthropic_error_obj(429, text, "rate_limit_error"),
@@ -18560,6 +21416,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Retry-After", str(wait))
+        for name, value in rate_limit_headers(reset_at):
+            self.send_header(name, value)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -18646,54 +21504,6 @@ class Handler(BaseHTTPRequestHandler):
         rows written before the key field existed.
         """
         return (self.key_entry or {}).get("id") or None
-    def _open_upstream_auto(self, payload, realms, session_key=None,
-                            prebuilt_body=None, model=None,
-                            defer_egress_success=False, **open_kwargs):
-        """按顺序尝试多个区域打开上游；当前区拿不到可用账号时自动回退。
-
-        只在「池子真的空了/被封死」的两类失败上换区：
-          * RuntimeError("no usable account ...") —— open_upstream 的池空结论
-          * RateLimited —— 全区每日额度用尽 / 模型频控
-        其他错误（内容 403、参数 4xx、上游 502）不换区：换区不会改变结果，
-        只会把同一个错再撞一遍。全部区域失败时重抛第一个异常。
-        成功后把实际出口与原因写到 self.realm_used / self.realm_reason，
-        响应头（X-WB-Realm / X-WB-Realm-Reason）与用量行据此可见。
-        """
-        model = model or str(payload.get("model") or "")
-        first_exc = None
-        for index, realm in enumerate(realms):
-            try:
-                extra = {}
-                if defer_egress_success:
-                    # 只在需要时传：老的调用方/测试替身没有这个形参。
-                    extra["defer_egress_success"] = True
-                upstream, account, effort = open_upstream(
-                    payload, session_key=session_key, target_realm=realm,
-                    prebuilt_body=prebuilt_body, **extra, **open_kwargs)
-                reason = ""
-                if index > 0:
-                    reason = "no_account"
-                    log("auto realm fallback: realm %s unavailable -> serving "
-                        "%s (model=%s)" % (realms[0], realm, model), tag="realm")
-                self.realm_used = realm
-                self.realm_reason = reason
-                return upstream, account, effort
-            except RateLimited as exc:
-                if first_exc is None:
-                    first_exc = exc
-                log("auto realm fallback: realm %s rate-limited; trying next"
-                    % realm, tag="realm")
-                continue
-            except RuntimeError as exc:
-                if str(exc).startswith("no usable account"):
-                    if first_exc is None:
-                        first_exc = exc
-                    log("auto realm fallback: realm %s has no usable account; "
-                        "trying next" % realm, tag="realm")
-                    continue
-                raise
-        raise first_exc
-
     def _cross_realm_error(self, model, realm):
         """Explain a model/exit mismatch instead of letting upstream reject it.
         Sending gpt-6-astra to the domestic exit (or deepseek-v4-pro to the
@@ -18701,6 +21511,11 @@ class Handler(BaseHTTPRequestHandler):
         and say which key is bound where.
         """
         if not realm or not model:
+            return ""
+        if realm == "codearts":
+            # CodeArts 的模型名和 WorkBuddy 大量重叠（GLM-5.2、
+            # deepseek-v4-pro-0813…），按模型名猜出口在这里必然误判。出口已经
+            # 由 Key/面板显式选定，直接放行。
             return ""
         owner = exclusive_realm(model)
         if not owner or owner == realm:
@@ -18787,6 +21602,7 @@ class Handler(BaseHTTPRequestHandler):
                         % (_hub_portal.rstrip("/"), _hub_portal.rstrip("/")),
                         "invalid_request_error")
             return False
+        
         # <<< hub-patch: portal-hint
         self._error(401, "invalid api key - " + hint, "invalid_request_error")
         return False
@@ -18831,6 +21647,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/pricing"):
             return True
         if path.startswith("/agents"):
+            return True
+        if path.startswith("/codearts"):
             return True
         return False
     def _strip_pinned_prefix_only(self):
@@ -18887,6 +21705,30 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        # 媒体任务/目录/产物与文本模型清单、文本统计各走各的入口。
+        # 媒体入口上的 /v1/models 必须拒绝，否则客户端会以为这个实例也能对话；
+        # 文本入口上的媒体查询同样拒绝，避免把「没有媒体号」误报成媒体功能坏了。
+        is_media_route = (
+            path == "/v1/media/tasks"
+            or path.startswith("/v1/videos/")
+            or path in ("/v1/media/models", "/media/models")
+        )
+        is_text_route = path in (
+            "/v1/models", "/models", "/v1/balance-summary",
+            "/usage", "/v1/usage", "/usage/recent", "/usage/analytics",
+            "/usage/by-account", "/usage/remaining", "/usage/perf",
+            "/usage/timeseries", "/activity/history",
+        )
+        if is_media_route and not wb_pool_scope.entry_allows(
+                wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if is_text_route and not wb_pool_scope.entry_allows(
+                wb_pool_scope.SCOPE_TEXT):
+            return self._error(
+                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
+                "pool_boundary")
         # The standalone configurator, for clients on machines that do not run
         # the gateway. Served before the panel gate and deliberately without a
         # session: the machines that need it are exactly the ones that cannot
@@ -18894,6 +21736,9 @@ class Handler(BaseHTTPRequestHandler):
         # same wb_agents.py shipped in the repository, no secrets inside).
         if path == "/agents/cli":
             return self._get_agents_cli()
+        if path == "/oauth/callback":
+            # 华为云 OAuth 浏览器回调：不带面板会话，靠 ticket_id/secret 匹配会话。
+            return self._get_codearts_oauth_callback(query)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
@@ -18906,10 +21751,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_health()
         if path == "/realm":
             return self._get_realm()
+        if path == "/codearts/overview":
+            return self._get_codearts_overview()
+        if path == "/codearts/accounts":
+            return self._get_codearts_accounts()
         if path == "/v1/balance-summary":
             return self._get_v1_balance_summary()
         if path in ("/v1/models", "/models"):
             return self._get_v1_models()
+        if path == "/v1/media/tasks":
+            return self._get_media_tasks(query)
+        if path.startswith("/v1/videos/"):
+            return self._get_media_video(path, query)
+        if path in ("/v1/media/models", "/media/models"):
+            # 媒体模型清单（含 videoGeneration 原样）。**不进 /v1/models**：
+            # 那个清单是给聊天客户端用的，塞进媒体模型会让客户端拿它去对话。
+            return self._get_media_models(query)
         if path in ("/usage", "/v1/usage"):
             return self._get_v1_usage(query)
         if path == "/usage/recent":
@@ -18977,11 +21834,15 @@ class Handler(BaseHTTPRequestHandler):
     def _get_panel_status(self):
         # Answer without a token: the dashboard needs to know whether to
         # show the login screen before it can hold a session.
+        crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
         info = {
             "panel_password_required": True,
             "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
             "authenticated": self._panel_ok(),
+            "crypto_ok": crypto_ok,
         }
+        if not crypto_ok:
+            info["crypto_error"] = crypto_reason
         # Whether a key exists is not a secret; its value never leaves the
         # process, and the settings endpoint only reports a masked form.
         info["api_key_set"] = bool(API_KEY)
@@ -19020,15 +21881,46 @@ class Handler(BaseHTTPRequestHandler):
         # Always answer (the launcher uses this to detect a running copy),
         # but only expose account identity to an authorised caller.
         rep = current_account()
+        crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
         info = {
             "ok": True,
             # Report the realm actually in use; this used to be the
             # literal "intl" and drifted from the panel switch.
             "realm": CURRENT_REALM,
-            "accounts": len(POOL.accounts) if POOL else 0,
-            "accounts_ready": POOL.count_ready() if POOL else 0,
-            "api_key_required": auth_required(),
+            "crypto_ok": crypto_ok,
         }
+        if not crypto_ok:
+            info["crypto_error"] = crypto_reason
+        # accounts / accounts_ready keep their old meaning (whole pool, any
+        # model); the per-realm and per-model counts say which combinations
+        # are actually servable (issue #667).
+        info.update(pool_readiness())
+        info["api_key_required"] = auth_required()
+        try:
+            cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+            codearts = {"configured": wb_codearts.configured_config(cfg),
+                        "base_url": wb_codearts.SNAP_HOST}
+            if codearts["configured"]:
+                codearts.update(wb_codearts.health(cfg))
+            info["codearts"] = codearts
+        except Exception as exc:
+            # CodeArts 只是子字段：它掉线不能把整体 /health 变红。
+            info["codearts"] = {"configured": False, "ok": False,
+                                "error": str(exc)[:200]}
+        # 媒体能力：`/health` 是运维第一眼看的地方，早给比晚给好。媒体路由始终
+        # 可用；`realm` 只是当前自动选择的结果，调用方仍可按 Key 绑定走另一个出口。
+        media_cfg = wb_settings.media_config(ACCOUNTS_DIR)
+        info["media"] = {
+            "enabled": True,
+            "realm": _media_realm_for_key(self),
+            "slots": MEDIA_SLOTS,
+            "inflight": media_inflight(),
+            # 生视频并发：超过就排队，不提交上游、不扣费。
+            "video_concurrency": int(media_cfg.get("video_concurrency") or 3),
+        }
+        if _MEDIA_TASKS is not None:
+            # 只有任务表真的被创建过才报（否则 health 会顺带建目录、起线程）。
+            info["media"]["tasks"] = _MEDIA_TASKS.stats()
         if self._key_ok():
             info.update({
                 "uid": rep.uid if rep else None,
@@ -19037,24 +21929,49 @@ class Handler(BaseHTTPRequestHandler):
                 "credential_file": os.path.basename(rep.path) if rep and rep.path else None,
                 "expires_at": rep.expires_at if rep else None,
             })
+            info.update(key_readiness(getattr(self, "key_entry", None)))
         return self._json(200, info)
     # Accept the conventional /v1 prefix and the bare path, because clients
     # differ in whether they append "/v1" themselves.
 
     def _get_realm(self):
+        options = realm_options()
+        if CURRENT_REALM not in options:
+            # 配置被删/关闭后，持久化的出口可能已经不在选项里。收敛到 intl，
+            # 否则看板会显示一个自己都解释不了的 current。
+            save_persisted_realm("intl")
+        return self._json(200, {"current": CURRENT_REALM, "options": options})
+
+    def _get_codearts_models(self):
+        """CodeArts 出口的模型目录：实时拉 codearts2api，失败回退缓存。"""
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
         try:
-            cfg = wb_settings.realm_routing(ACCOUNTS_DIR)
-        except Exception:
-            cfg = {"enabled": True, "prefer": "cn"}
-        return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"],
-                                "auto_enabled": bool(cfg.get("enabled")) and AUTO_REALM_ENABLED,
-                                "auto_env": "WB_AUTO_REALM",
-                                "prefer": cfg.get("prefer") or "cn"})
+            data = wb_codearts.model_entries(cfg)
+        except wb_codearts.CodeArtsAuthError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        except wb_codearts.CodeArtsError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        if wb_settings.filter_models_by_key(ACCOUNTS_DIR) and self.key_entry:
+            data = [m for m in data
+                    if wb_settings.key_allows_model(self.key_entry, m.get("id"))]
+        payload = {
+            "object": "list",
+            "data": data,
+            "realm": "codearts",
+            "catalog": wb_codearts.models_meta(cfg),
+        }
+        return self._json(200, payload)
 
     def _get_v1_models(self):
         if not self._authorized():
             return
         req_realm = self._request_realm() or CURRENT_REALM
+        if req_realm == "codearts":
+            return self._get_codearts_models()
         try:
             entries = fetch_models(realm=req_realm)
         except Exception as exc:
@@ -19065,7 +21982,7 @@ class Handler(BaseHTTPRequestHandler):
             wb_modelsdev.refresh_async(ACCOUNTS_DIR, log=log)
         except Exception:
             pass
-        data = [model_entry(mid, meta) for mid, meta in entries]
+        data = [model_entry(mid, meta, req_realm) for mid, meta in entries]
         pinned = pinned_account()
         if pinned is not None:
             # 定址路由宣告的是「这个账号实际能接的模型」：该账号禁用的模型
@@ -19229,10 +22146,15 @@ class Handler(BaseHTTPRequestHandler):
         # Fold the usage log before building the view, so the 日限额 badge and
         # the parked count describe right now instead of the last request.
         apply_daily_guards()
+        texts, medias = _ensure_pools()
+        text_ready = texts.count_ready() if texts is not None else 0
+        media_ready = medias.count_ready() if medias is not None else 0
         return self._json_panel(200, {
             "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
             "storage": ACCOUNTS_DIR,
-            "usable": POOL.count_ready() if POOL else 0,
+            "usable": text_ready,
+            "text_ready": text_ready,
+            "media_ready": media_ready,
         })
 
     def _get_accounts_export(self, query):
@@ -19351,13 +22273,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         cn_accounts = POOL.task_accounts("cn") if POOL else []
+        texts, _ = _ensure_pools()
+        cn_accounts = [a for a in cn_accounts
+                       if texts is None or texts.allows(a)]
         if not cn_accounts:
             return self._json_panel(200, {"tasks": [], "summary": {}, "accounts": [], "msg": "未找到参与任务的国内版账号"})
         uid = (query.get("uid") or [None])[0]
         acc = None
         if uid and uid != "all":
             target = POOL.get(uid) if POOL else None
-            if target and target.realm == "cn":
+            if (target and target.realm == "cn"
+                    and (texts is None or texts.allows(target))):
                 acc = target
         if not acc:
             acc = cn_accounts[0]
@@ -19606,8 +22532,10 @@ class Handler(BaseHTTPRequestHandler):
                 break
             total += size
             if total > max_bytes:
-                # Keep draining so the connection stays aligned, then refuse.
-                self._drain_chunked_body()
+                # The current chunk has not been read. Close rather than trying
+                # to parse its data as another chunk header or draining forever.
+                self.close_connection = True
+                self._body_consumed = True
                 raise BodyTooLarge(total)
             remaining = size
             while remaining > 0:
@@ -19660,15 +22588,20 @@ class Handler(BaseHTTPRequestHandler):
         return {}
     def _payload_or_error(self, allow_list=False):
         """Read the body, replying with the right error and returning None."""
+        configured_mb = wb_settings.max_payload_mb(ACCOUNTS_DIR)
+        limit = configured_mb * 1024 * 1024 if configured_mb is not None else MAX_PAYLOAD_BYTES
         try:
-            return self._read_payload(allow_list=allow_list)
+            return self._read_payload(max_bytes=limit, allow_list=allow_list)
         except BodyTooLarge as exc:
+            self._reject_body_after_reply = True
             message = ("payload too large (%d bytes > %d limit)"
-                       % (exc.length, MAX_PAYLOAD_BYTES))
+                       % (exc.length, limit))
             if self._anthropic_route():
                 self._anthropic_error(413, message, "invalid_request_error")
             else:
                 self._error(413, message, "invalid_request_error")
+            self._drain_rejected_body(exc.length)
+            self.close_connection = True
             return None
         except BadJSON:
             if self._anthropic_route():
@@ -19676,6 +22609,725 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._error(400, "invalid JSON body", "invalid_request_error")
             return None
+    # ------------------------------------------------------------ 媒体（生图 / 生视频）
+
+    def _payload_or_error_for_media(self):
+        """媒体路由的体上限：**不小于** 24 MB，也不小于用户配置的通用上限。
+
+        只放宽不收紧：改图的输入图是 data URL，8 MB 原图编码后约 10.7 MB，而通用
+        上限默认 16 MB、还可能被 `max_payload_mb` 调小——那是给 chat 定的尺子。
+        """
+        configured = wb_settings.max_payload_mb(ACCOUNTS_DIR)
+        generic = configured * 1024 * 1024 if configured is not None else MAX_PAYLOAD_BYTES
+        limit = max(generic, MEDIA_MAX_PAYLOAD_BYTES)
+        try:
+            return self._read_payload(max_bytes=limit, allow_list=False)
+        except BodyTooLarge as exc:
+            self._reject_body_after_reply = True
+            self._error(413, "payload too large (%d bytes > %d limit)" % (exc.length, limit),
+                        "invalid_request_error")
+            self._drain_rejected_body(exc.length)
+            self.close_connection = True
+            return None
+        except BadJSON:
+            self._error(400, "invalid JSON body", "invalid_request_error")
+            return None
+
+    def _media_error(self, exc):
+        """把 MediaError 翻成 HTTP 响应。
+
+        状态码的分界是「谁的错」：**客户端的错回 4xx，账号 / 上游的错回 5xx**。
+        把「上游账号积分不足」报成 4xx，会让客户端以为自己的请求写错了而不再重试。
+        """
+        mapping = {
+            "INVALID_ARGS": (400, "invalid_request_error"),
+            "NO_MEDIA_MODEL": (400, "invalid_request_error"),
+            "REJECTED": (400, "invalid_request_error"),
+            "NO_ROUTE": (404, "invalid_request_error"),
+            "NO_CREDIT": (402, "insufficient_quota"),
+            "RATE_LIMIT": (429, "rate_limit_error"),
+            "AUTH": (502, "server_error"),
+            "UPSTREAM": (502, "server_error"),
+            "EMPTY_RESULT": (502, "server_error"),
+            "COOLDOWN": (429, "rate_limit_error"),
+            "QUEUE_FULL": (429, "rate_limit_error"),
+        }
+        status, err_type = mapping.get(exc.code, (502, "server_error"))
+        message = exc.message or exc.code
+        if exc.code in ("REJECTED", "INVALID_ARGS", "NO_MEDIA_MODEL"):
+            # 这三类一分钱没花，客户端可以改完参数立刻重来——把这句话说出来，
+            # 否则对方会以为要等冷却窗口。
+            message += "（本次未扣积分，改完参数可立即重试）"
+        # 不调 record_error()：它是按"模型名"记账的，媒体没有对应的聊天模型，
+        # 塞一个假模型名会污染按模型的错误率统计。这里只写一行带 tag 的运行日志。
+        log("media error: HTTP %d %s" % (status, message), tag="media")
+        return self._error(status, message, err_type)
+
+    def _media_config(self):
+        return wb_settings.media_config(ACCOUNTS_DIR)
+
+    def _media_realm(self, config):
+        """这次媒体请求走哪个出口：Key 绑定优先，否则自动选择可用出口。"""
+        return _media_realm_for_key(self)
+
+    def _media_prepare(self, path, payload, config):
+        """挑出模型、拼好请求体。**一个字节都不发**。
+
+        放在这里而不是散在路由里，是因为「参数不对」和「上游拒绝」必须能分开：
+        前者一分钱没花、不进冷却，后者可能已经扣过积分。
+        """
+        realm = self._media_realm(config)
+        kind = "edit" if path in ("/v1/images/edits", "/images/edits") else "generate"
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or prompt.strip() == "":
+            raise wb_media.MediaError("INVALID_ARGS", "prompt 必填，且必须是非空字符串")
+        models = self._media_catalog(realm)
+        tag = (wb_media.TAG_IMAGE_TO_IMAGE if kind == "edit"
+               else wb_media.TAG_TEXT_TO_IMAGE)
+        model = wb_media.pick_model(models, payload.get("model"), tag)
+        size = wb_media.check_size(payload.get("size"))
+        count = payload.get("n")
+        if count is None or count == "":
+            count = 1
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            raise wb_media.MediaError("INVALID_ARGS", "n 必须是整数 1")
+        if kind == "edit":
+            images = self._media_images(payload)
+            if not images:
+                raise wb_media.MediaError("INVALID_ARGS", "改图要带 image")
+            body = wb_media.build_edit_body(model["id"], prompt, size, images)
+            mode = "edit"
+        else:
+            body = wb_media.build_image_body(model["id"], prompt, size, count)
+            mode = "generate"
+        wanted = _as_text(payload.get("response_format")) or "url"
+        if wanted not in ("url", "b64_json"):
+            raise wb_media.MediaError(
+                "INVALID_ARGS",
+                "response_format 只能是 url 或 b64_json（给定 %r）" % wanted)
+        return {"realm": realm, "kind": kind, "mode": mode, "model": model,
+                "body": body, "size": size, "response_format": wanted}
+
+    def _media_images(self, payload):
+        """把客户端给的输入图归一成 data URL 数组。
+
+        只接受 data URL 与公网 http(s)：本地路径在 `classify_image_input` 里就被拒，
+        公网 URL 由 client 层过公网地址校验并禁掉 3xx 跟随。见 docs/MEDIA-IMPL.md §13.1。
+        """
+        raw = payload.get("image")
+        values = raw if isinstance(raw, list) else ([raw] if raw is not None else [])
+        return [wb_media_client.resolve_input_image(value) for value in values]
+
+    def _media_catalog(self, realm):
+        """该区的媒体模型清单：内存 → 留档副本 → 现拉一次。"""
+        payload = _catalog_raw.get(realm)
+        if payload is None:
+            payload = read_catalog_dump(realm)
+            if payload is not None:
+                _catalog_raw[realm] = payload
+        if payload is None:
+            texts, medias = _ensure_pools()
+            account = (medias.pick(realm=realm) if medias is not None
+                       else representative_account(
+                           realm=realm, scope=wb_pool_scope.SCOPE_MEDIA))
+            if account is None:
+                detail = medias.empty_detail(realm) if medias is not None else "该区没有可用账号。"
+                # 没有账号是上游暂时不可用，不是媒体路由不存在。404 会让
+                # 客户端把“稍后重试”误判成“这个部署没有媒体能力”。
+                raise wb_media.MediaError("UPSTREAM", detail)
+            payload = wb_media_client._get_json(
+                account, wb_media_client.CONFIG_PATH,
+                wb_media_client.CONFIG_TIMEOUT_SECONDS)
+            _catalog_raw[realm] = payload
+        models = wb_media.media_models(payload)
+        if not models:
+            raise wb_media.MediaError(
+                "NO_MEDIA_MODEL",
+                "该区目录里没有任何媒体模型（该账号可能没有生图权限）")
+        return models
+
+    def _pick_media_account(self, realm, model_id, cost_hint, excluded):
+        """挑一个账号跑这次媒体请求：四道闸门全过才派发。
+
+        与 chat 共用同一个 `POOL.pick()`，所以面板权重、临期积分优先、轮转、账号级
+        熔断全都自动继承（`note_error(model=…)` 只写模型级冷却，画图失败不连累 chat）。
+        这里补的是 `pick()` 不知道、但 chat 在 `open_upstream()` 里做了的四件事：
+        派发前刷新护栏、连坐暂停、Key 的账号白名单、钉住的账号。
+        """
+        apply_daily_guards()
+        apply_reserve_credits()
+        hold = restriction_hold_remaining(realm)
+        if hold > 0:
+            # 整池暂停期间一个上游请求都不发：继续打只会把同设备的其它账号送走。
+            raise wb_media.MediaError(
+                "RATE_LIMIT",
+                "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1))
+        allowed = self._key_allowed_accounts()
+        _, medias = _ensure_pools()
+        if medias is None:
+            raise wb_media.MediaError("UPSTREAM", "账号池未加载")
+        pinned = pinned_account()
+        if pinned is not None:
+            try:
+                medias.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_media.MediaError("AUTH", str(exc))
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_media.MediaError("NO_ROUTE", str(exc))
+            if allowed is not None and pinned.uid not in allowed:
+                raise wb_media.MediaError("AUTH", "钉住的账号不在本 Key 的绑定范围内")
+            if pinned.realm != realm:
+                raise wb_media.MediaError(
+                    "INVALID_ARGS",
+                    "钉住的账号属于 %s 出口，媒体只走 %s" % (pinned.realm, realm))
+            if not pinned.ready(model=model_id):
+                raise wb_media.MediaError(
+                    "UPSTREAM", "钉住的账号此刻不可用：%s"
+                    % pinned.unavailable_reason(model=model_id))
+            ok, reason = media_budget_ok(pinned, cost_hint)
+            if not ok:
+                raise wb_media.MediaError(
+                    "NO_CREDIT", "钉住的账号付不起这次调用：%s" % reason)
+            return pinned
+        skipped = []
+        for _ in range(4):
+            account = medias.pick(realm=realm, exclude=excluded, model=model_id,
+                                  allowed=allowed)
+            if account is None:
+                if skipped:
+                    # 有账号、但都被预算刷掉了：说清是谁差多少，别让人以为是池子空了。
+                    raise wb_media.MediaError(
+                        "NO_CREDIT",
+                        "没有账号付得起这次调用（预估 %g 积分）：%s"
+                        % (cost_hint, "；".join(skipped)))
+                raise wb_media.MediaError(
+                    "UPSTREAM", "没有可用账号跑这次媒体请求；"
+                    + medias.empty_detail(realm))
+            ok, reason = media_budget_ok(account, cost_hint)
+            if ok:
+                return account
+            skipped.append("%s %s" % ((account.uid or "?")[:8], reason))
+            excluded.add(account.uid)
+        raise wb_media.MediaError(
+            "NO_CREDIT",
+            "没有账号付得起这次调用（预估 %g 积分）：%s"
+            % (cost_hint, "；".join(skipped)))
+
+    def _media_note_failure(self, account, exc, model_id):
+        """记一次媒体失败。**只有真花过钱的失败才冷却**，且冷却只作用于这个模型。"""
+        if exc.code in ("REJECTED", "INVALID_ARGS", "NO_MEDIA_MODEL"):
+            return                      # 没建任务、没扣钱：冷却只会让人以为工具坏了
+        if exc.code == "AUTH" and restriction_is_account_level(exc.detail or exc.message):
+            # 账号级风控（403 / 11140）：整池暂停，且**绝不换号**——换号继续打同一台
+            # 设备正是这条红线要防的事。
+            account.note_restricted(detail=exc.detail or exc.message)
+            _persist_restriction(account)
+            note_account_restriction(account.realm, account.uid)
+            return
+        if exc.code in MEDIA_BILLABLE:
+            # model=… 让冷却只作用于这个媒体模型：note_error 命中这个分支后直接
+            # return，账号级的 cooldown_until 一个字不动，所以画图失败不会连累 chat。
+            account.note_error(exc.message, cooldown=60, model=model_id,
+                               detail=exc.detail or "")
+
+    def _media_note_success(self, account, model_id, credit, kind, started_at, realm):
+        account.note_success(model=model_id)
+        media_key_spend_add(self._key_id(), credit)
+        if kind == "image" and credit is not None:
+            # 学到之后，生图的"付得起吗"就用实价，而不是 6.0 这个上界。
+            learn_image_price(model_id, credit)
+        record_usage(
+            model_id,
+            {"credit": credit} if credit is not None else {},
+            stream=False,
+            elapsed_ms=(time.time() - started_at) * 1000.0,
+            account=account.uid, outcome="completed", key=self._key_id(),
+            realm=realm, kind=kind)
+
+    def _handle_media_post(self, path, payload):
+        """媒体 POST 的入口：开关 → 参数 → 限流 → 并发槽 → 选号 → 发请求 → 记账。"""
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if path in ("/v1/videos", "/videos"):
+            # 生视频是异步任务，流程与生图完全不同（提交 / 轮询 / 下载），单独一条。
+            return self._media_video_submit(payload)
+        config = self._media_config()
+        try:
+            prepared = self._media_prepare(path, payload, config)
+        except wb_media.MediaError as exc:
+            return self._media_error(exc)
+
+        allowed_now, wait = media_rate_allow(self._key_id(), config["image_max_per_minute"])
+        if not allowed_now:
+            return self._rate_limited(MediaRateLimited(wait))
+
+        if not acquire_media_slot():
+            return self._error(
+                503, "media slots busy (%d in flight); retry shortly" % MEDIA_SLOTS,
+                "server_error")
+        cost_hint = media_image_cost_hint(prepared["model"]["id"])
+        spend_ok, spend_why = media_key_spend_allow(
+            self._key_id(), cost_hint, int(config.get("daily_credits_per_key") or 0))
+        if not spend_ok:
+            return self._media_error(wb_media.MediaError("NO_CREDIT", spend_why))
+        excluded = set()
+        tried = 0
+        try:
+            while tried < MEDIA_ROTATE_MAX:
+                try:
+                    account = self._pick_media_account(
+                        prepared["realm"], prepared["model"]["id"], cost_hint, excluded)
+                except wb_media.MediaError as exc:
+                    return self._media_error(exc)
+                started_at = time.time()
+                try:
+                    if prepared["kind"] == "edit":
+                        outcome = wb_media_client.edit_image(account, prepared["body"])
+                    else:
+                        outcome = wb_media_client.generate_image(account, prepared["body"])
+                except wb_media.MediaError as exc:
+                    self._media_note_failure(account, exc, prepared["model"]["id"])
+                    # 账号级风控（403 / code 11140）**绝不换号**：换号继续打同一台
+                    # 设备会把同设备的其它账号一起送走，那是仓库明写的红线。
+                    restricted = (exc.code == "AUTH" and restriction_is_account_level(
+                        exc.detail or exc.message))
+                    if (not restricted and exc.code in MEDIA_RETRYABLE
+                            and tried + 1 < MEDIA_ROTATE_MAX):
+                        excluded.add(account.uid)
+                        tried += 1
+                        continue
+                    return self._media_error(exc)
+                self._media_note_success(account, prepared["model"]["id"],
+                                         outcome.get("credit"), "image",
+                                         started_at, prepared["realm"])
+                return self._json(200, self._media_image_body(outcome, prepared, account))
+            return self._error(502, "media request failed on every account",
+                               "server_error")
+        finally:
+            release_media_slot()
+
+    def _media_image_body(self, outcome, prepared, account):
+        """生图响应按 OpenAI Images 的形状回：`{created, data:[{url|b64_json}]}`。
+
+        `response_format` 是**客户端要什么**，与上游给什么无关：
+          - `url`（默认）：上游给 COS 签名 URL 就原样转交（24 小时有效）
+          - `b64_json`：上游给 URL 的话，网关自己下载、编码成 base64 再交出去
+            （`fetch_bytes`，不落盘）。拿不到就退回 URL 并在 hint 里说明——
+            宁可给一个能用的链接，也不要因为转码失败丢掉一张已经付过钱的图。
+        """
+        item = {}
+        if outcome.get("url") is not None:
+            item["url"] = outcome["url"]
+        if outcome.get("b64") is not None:
+            # 上游在「其它」模型分支上按 b64_json 回：直接转给客户端，
+            # 不落盘、不把几 MB 的 base64 写进日志。
+            item["b64_json"] = outcome["b64"]
+        if outcome.get("revised_prompt") is not None:
+            item["revised_prompt"] = outcome["revised_prompt"]
+        degraded = ""
+        if prepared.get("response_format") == "b64_json":
+            if item.get("url") is not None:
+                try:
+                    raw = wb_media_client.fetch_bytes(account, item["url"])
+                    item["b64_json"] = base64.b64encode(raw).decode("ascii")
+                    item.pop("url", None)
+                except wb_media.MediaError as exc:
+                    degraded = "（要 b64_json 但转码失败，已退回 url：%s）" % exc.message
+        body = {
+            "created": outcome.get("created") or int(time.time()),
+            "model": prepared["model"]["id"],
+            "mode": prepared["mode"],
+            "data": [item],
+        }
+        if outcome.get("credit") is not None:
+            body["credit"] = outcome["credit"]
+        if item.get("url") is not None:
+            body["hint"] = "COS 签名 URL 约 24 小时失效；要长期保留请及时下载。" + degraded
+        elif degraded:
+            body["hint"] = degraded
+        return body
+
+    # ------------------------------------------------------------ 生视频（异步任务）
+
+    def _media_video_submit(self, payload):
+        """`POST /v1/videos`：提交一个生视频任务，立刻返回 202 + task id。
+
+        与生图最大的不同是「钱在提交时就花了，产物要等」。所以：队列上限在**提交之前**
+        检查（提交之后队列满，任务已经花了钱，丢掉就是丢钱）；上游在建任务之前退回的
+        4xx 一律 REJECTED，可以立刻重试。
+        """
+        config = self._media_config()
+        store = media_tasks()
+        if store.pending_count() >= store.max_pending:
+            # 还没花钱：让客户端看到 429，比让它排队几十分钟好。
+            return self._media_error(wb_media.MediaError(
+                "QUEUE_FULL",
+                "生视频队列已满（%d 条在排队）；等一会儿再试，或先减少并发"
+                % store.pending_count()))
+        try:
+            realm = self._media_realm(config)
+            models = self._media_catalog(realm)
+            # 参考素材也算"有输入图"：选模型要按 image-to-video 那一组走。
+            ref_images = wb_media._reference_list(payload, "reference_images")
+            wants_image = bool(_as_text(payload.get("image"))
+                               or _as_text(payload.get("input_reference"))
+                               or ref_images)
+            tag = (wb_media.TAG_IMAGE_TO_VIDEO if wants_image
+                   else wb_media.TAG_TEXT_TO_VIDEO)
+            model = wb_media.pick_model(models, payload.get("model"), tag)
+            # **先只校验、不下载**：数量上限与首尾帧互斥只用字段本身就能判断。
+            # 放在下载之前有两层理由——拒得早（客户端改一行参数就能重试），
+            # 也免得别人拿十个坏地址让我们白下载一轮。
+            generation = dict(model.get("videoGeneration") or {})
+            try:
+                wb_media.read_reference_materials(payload, generation)
+            except wb_media.MediaError as exc:
+                return self._media_error(exc)
+            request = dict(payload)
+            if _as_text(request.get("image")) or _as_text(request.get("input_reference")):
+                # 输入图只接受 data URL 与公网 http(s)：本地路径在 classify 阶段就被拒，
+                # 公网 URL 由 client 层校验公网地址并禁掉 3xx 跟随。
+                raw_image = _as_text(request.get("image")) or _as_text(request.get("input_reference"))
+                request["image"] = wb_media_client.resolve_input_image(raw_image)
+            if ref_images:
+                # 逐张归一：data URL 原样通过，公网地址过公网判据（禁 3xx 跟随），
+                # 本地路径直接 400——与首帧同一套规则，不能因为"是参考图"就放宽。
+                request["reference_images"] = [
+                    wb_media_client.resolve_input_image(_as_text(item))
+                    if _as_text(item) else item
+                    for item in ref_images]
+            for kind in ("reference_videos", "reference_audios"):
+                items = wb_media._reference_list(payload, kind)
+                if not items:
+                    continue
+                # 参考视频/音频：公网 URL 收，data URL **收但会被上传换地址**。
+                #
+                # 早先只收公网 URL，理由是"data URL 对这两类没有意义"。后来一度
+                # 放宽成"原样透传 data URL"并附了一段声称实测成功的注释——那段是
+                # 错的：账本里所有带参考视频的任务都是 failed / credit=None，唯一那条
+                # 128.57 是 11-01 22:34 一条与参考素材无关的 kling 任务。
+                #
+                # 真实情况（2026-11-02 查上游原始响应得到）：上游对 `video_url`
+                # **是真去下载的**，data URL 抓不到 →
+                #   2013: content[4].video_url: media url unreachable
+                # 正解是官方客户端那套：预签名 → PUT 到 COS → 填 download_url。
+                # 所以这里放行 data URL，但真正的替换在 `resolve_reference_uploads()`
+                # 里做（建 body 之后、排队之前，排队路径也能用到可抓的地址）。
+                #
+                # 本地路径仍然一律拒绝：那是任意文件读取的口子。
+                label = "参考视频" if kind == "reference_videos" else "参考音频"
+                for item in items:
+                    text = _as_text(item) or ""
+                    if wb_media.is_data_url(text):
+                        wb_media.assert_data_url_size(
+                            text, wb_media.MAX_INPUT_IMAGE_BYTES, label)
+                        continue
+                    # 报错要指名是哪类素材：说成"输入图"会把调用方引到首帧上排查。
+                    wb_media_client.assert_public_url(text, label)
+                request[kind] = items
+            learned = learned_video_seconds(realm, model["id"])
+            if learned is not None:
+                # 上游上一次拒绝时自报的区间比目录更晚、更真。
+                generation["minSeconds"], generation["maxSeconds"] = learned
+            params = wb_media.resolve_video_params(request, generation)
+            cap = int(config.get("video_max_seconds") or 0)
+            if cap and params["seconds"] > cap:
+                raise wb_media.MediaError(
+                    "INVALID_ARGS",
+                    "本网关的媒体设置把视频时长限制在 %d 秒以内（给定 %d 秒）"
+                    % (cap, params["seconds"]))
+            body = wb_media.build_video_body(model["id"], request, params)
+            # 参考视频/音频的 data URL 上游抓不到（2013 media url unreachable）：
+            # 在这里换成"先上传拿 download_url"。放在建 body 之后、排队之前，
+            # 是为了让**排队路径**存进任务表的也是已经可抓的地址——否则排到半夜
+            # 才提交时上游照样 2013，而且那时候调用方早已拿到 202、以为成了。
+            body = resolve_reference_uploads(body, realm, model["id"])
+            cost_hint = media_cost_hint(
+                model["id"], params["seconds"], params.get("resolution"),
+                with_reference=bool(body.get("reference_images")
+                                    or body.get("reference_videos")
+                                    or body.get("reference_audios")))
+        except wb_media.MediaError as exc:
+            return self._media_error(exc)
+
+        spend_ok, spend_why = media_key_spend_allow(
+            self._key_id(), cost_hint, int(config.get("daily_credits_per_key") or 0))
+        if not spend_ok:
+            return self._media_error(wb_media.MediaError("NO_CREDIT", spend_why))
+        # **并发生视频的闸**：已经在跑的任务达到上限时，本次不提交上游、也不花钱，
+        # 先在我们这边排队（status=queued，对外仍是 queued）。等有条跑完，
+        # 任务表的调度泵会自动提交它。
+        if store.active_count() >= store.concurrency:
+            queued = store.create_pending(model["id"], params, body,
+                                          realm=realm, key=self._key_id())
+            log("media: 并发已满（%d/%d），生视频任务 %s 进入排队"
+                % (store.active_count(), store.concurrency, queued["id"]), tag="media")
+            public = self._media_task_public(queued)
+            public["queue_position"] = store.queue_position(queued["id"])
+            public["hint"] = ("已进入队列，未提交上游、未扣积分；轮询 GET /v1/videos/%s 查看进度"
+                              % queued["id"])
+            return self._json(202, public)
+
+        if not acquire_media_slot():
+            return self._error(503, "media slots busy (%d in flight); retry shortly"
+                               % MEDIA_SLOTS, "server_error")
+        try:
+            try:
+                # 并行任务优先摊到**没在跑任务**的账号上；都在跑才退一步复用。
+                busy = set(store.busy_accounts() or ())
+                account = None
+                if busy:
+                    try:
+                        account = self._pick_media_account(realm, model["id"], cost_hint, busy)
+                    except wb_media.MediaError:
+                        account = None
+                if account is None:
+                    account = self._pick_media_account(realm, model["id"], cost_hint, set())
+            except wb_media.MediaError as exc:
+                return self._media_error(exc)
+            started_at = time.time()
+            try:
+                submission = wb_media_client.submit_video(account, body)
+            except wb_media.MediaError as exc:
+                self._media_note_failure(account, exc, model["id"])
+                if exc.code == "REJECTED":
+                    # 学一次区间：同一个越界值下次在本地就被拦下。
+                    learned = learn_video_seconds(realm, model["id"], exc.detail or exc.message)
+                    if learned is not None:
+                        log("media: 学到 %s 的时长区间 %s 秒（来自上游拒绝文案）"
+                            % (model["id"], learned), tag="media")
+                return self._media_error(exc)
+            account.note_success(model=model["id"])
+            task = store.create(model["id"], params, account.uid, body,
+                                submission["taskId"], realm=realm,
+                                key=self._key_id())
+            log("media: 已提交生视频任务 %s（%s，%d 秒，预估 %.0f 积分，%.1f 秒）"
+                % (task["id"], model["id"], params["seconds"], cost_hint,
+                   time.time() - started_at), tag="media")
+            public = self._media_task_public(task)
+            # `?wait=1` 在 query 上（这是 OpenAI 客户端最自然的写法），body 里也认。
+            # 曾经只读 body，于是 `?wait=1` 静默失效、客户端拿到 202 却没在等。
+            query_wait = (parse_qs(urlparse(self.path).query).get("wait") or [""])[0]
+            wait = str(query_wait or _as_text(payload.get("wait")) or "").lower()
+            if wait in ("1", "true", "yes"):
+                # 阻塞式：给不会轮询的客户端。最长等到轮询上限，仍没完成就返回当前状态
+                # （status 仍是 in_progress，客户端可以继续轮询）。
+                done = store.wait(task["id"],
+                                  timeout=wb_media_client.VIDEO_POLL_TIMEOUT_SECONDS)
+                public = self._media_task_public(done or task)
+            return self._json(202, public)
+        finally:
+            release_media_slot()
+
+    def _media_task_visible(self, task):
+        """这个任务对当前调用者可见吗？
+
+        **多 Key 部署下的越权口子**：任务行里带着 prompt 头、模型、花费和下载地址，
+        如果不按所有者过滤，Key A 能列出 Key B 的全部任务。面板会话例外——运维本来
+        就该看全部。
+        """
+        if task is None:
+            return False
+        if self._panel_ok():
+            return True
+        return (task.get("key") or "") == (self._key_id() or "")
+
+    def _media_task_public(self, task):
+        """任务行 → 对外形状（含签名的下载地址）。签名只在服务端算。"""
+        if not task:
+            return {}
+        url = None
+        if task.get("videos"):
+            token = media_tasks().sign(task["id"], 0)
+            url = "/v1/videos/%s/content?i=0&t=%s" % (task["id"], token)
+        return wb_media.public_task(task, content_url=url)
+
+    def _get_media_video(self, path, query):
+        """`GET /v1/videos/{id}`：查任务状态；`…/content` 走下载分支。
+
+        鉴权顺序在这里很关键：**content 分支必须在要求 API Key 之前分出去**。
+        它有自己的鉴权（签名令牌），而浏览器与播放器根本带不上 Authorization 头。
+        曾经把 `_authorized()` 放在最前面，结果签名 URL 一打开就是 401——下载地址
+        明明是对的，客户端却拿不到产物。
+        """
+        rest = path[len("/v1/videos/"):].strip("/")
+        if rest.endswith("/content"):
+            return self._get_media_content(rest[:-len("/content")].strip("/"), query)
+        if not self._authorized():
+            return
+        task_id = rest.split("/")[0]
+        task = media_tasks().get(task_id)
+        if not self._media_task_visible(task):
+            # 用 404 而不是 403：不向别的 Key 确认"这个 id 存在"。
+            return self._error(404, "no such task: %s" % task_id, "invalid_request_error")
+        return self._json(200, self._media_task_public(task))
+
+    def _get_media_content(self, task_id, query):
+        """`GET /v1/videos/{id}/content?i=0&t=…`：下载 mp4。
+
+        鉴权有两条路：签名令牌（浏览器 / 播放器没有 Authorization 头）或 API Key
+        （命令行客户端带得起头）。签名覆盖 task + index + 过期时刻，换索引也要换令牌。
+        """
+        store = media_tasks()
+        try:
+            index = int((query.get("i") or ["0"])[0])
+        except (TypeError, ValueError):
+            index = 0
+        token = (query.get("t") or [""])[0]
+        if not store.verify(task_id, index, token):
+            if not self._authorized():
+                # 明确的 401，而不是"什么都不发"——空响应会让客户端挂到超时。
+                return self._error(401, "missing or invalid download token",
+                                   "authentication_error")
+            # 令牌只是"打包好的授权"，持有 Key 时仍要确认这条任务属于该 Key。
+            if not self._media_task_visible(store.get(task_id)):
+                return self._error(404, "no content for this task",
+                                   "invalid_request_error")
+        path = store.content_path(task_id, index)
+        if path is None:
+            return self._error(404, "no content for this task (yet)",
+                               "invalid_request_error")
+        try:
+            with open(path, "rb") as handle:
+                payload = handle.read()
+        except OSError as exc:
+            return self._error(500, "cannot read artifact: %s" % exc, "server_error")
+        safe = re.sub(r"[^0-9A-Za-z_-]+", "-", str(task_id))[:48] or "video"
+        return self._send_bytes(payload, "video/mp4",
+                                filename="%s-%d.mp4" % (safe, index))
+
+    def _media_cancel(self, task_id):
+        """取消一个**还在排队**的生视频任务。
+
+        上游没有 cancel 接口（未证实有），所以这只能停掉本地的轮询。已经交给上游的
+        任务照样会跑完、照样计费——所以只允许取消 `queued`：`running` 必须等它出
+        结果，否则连"钱有没有花、产物在哪"都查不到。
+        """
+        store = media_tasks()
+        task = store.get(task_id)
+        if not self._media_task_visible(task):
+            return self._error(404, "no such task: %s" % task_id, "invalid_request_error")
+        if not store.cancel(task_id):
+            return self._error(
+                409,
+                "只能取消还在排队的任务（当前 %s）。上游没有取消接口，"
+                "已提交的任务会照常跑完并计费。" % task.get("status"),
+                "invalid_request_error")
+        return self._json(200, self._media_task_public(store.get(task_id)))
+
+    def _get_media_tasks(self, query):
+        """`GET /v1/media/tasks`：最近的任务（面板用）。"""
+        if not self._authorized():
+            return
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        try:
+            limit = int((query.get("limit") or ["50"])[0])
+        except (TypeError, ValueError):
+            limit = 50
+        store = media_tasks()
+        rows = [task for task in store.list(limit) if self._media_task_visible(task)]
+        return self._json(200, {
+            "tasks": [self._media_task_public(task) for task in rows],
+            "stats": store.stats(),
+        })
+
+    def _send_bytes(self, payload, content_type, filename=None):
+        """发一段二进制（产物下载）。与 `_download()` 同一套头，只是不是 JSON。"""
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        if filename:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(filename))[:120] or "file"
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % safe)
+        self.send_header("Cache-Control", "no-store")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _get_media_models(self, query):
+        """`GET /v1/media/models`：该区有哪些媒体模型、各自约束是什么。
+
+        与 `/v1/models` 分开是刻意的：那个清单是给聊天客户端用的，把生图模型塞进去
+        客户端会拿它去对话。这里返回**未经投影**的媒体条目，`videoGeneration` 原样
+        带走，调用方据此知道自己能要几秒、哪些分辨率。未传 `realm` 时自动选择
+        当前有可用媒体账号的出口。
+        """
+        if not self._authorized():
+            return
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        requested = (query.get("realm") or [None])[0]
+        realm = _media_realm_for_key(self, requested)
+        if realm not in wb_settings.MEDIA_REALMS:
+            return self._error(400, "realm must be one of %s"
+                               % ", ".join(wb_settings.MEDIA_REALMS),
+                               "invalid_request_error")
+        tag = (query.get("tag") or [None])[0]
+        try:
+            models = self._media_catalog(realm)
+        except wb_media.MediaError as exc:
+            return self._media_error(exc)
+        if tag:
+            models = [model for model in models if tag in model.get("tags", ())]
+        # 带上**实测单价**：调用方要预估花费时不该再自己硬编码一张价格表
+        # （那张表一旦与实扣不符，报出来的数就是错的，而且没人会发现）。
+        # 没观测过的模型如实返回 null，不要编一个数。
+        for model in models:
+            tags = model.get("tags") or []
+            if not any(tag in tags for tag in (wb_media.TAG_TEXT_TO_VIDEO,
+                                               wb_media.TAG_IMAGE_TO_VIDEO)):
+                # 生图按张计费，挂"每秒"价格只会误导；单独给张价。
+                image_price = media_image_price(model.get("id"))
+                model["creditPerImage"] = (image_price if image_price
+                                           else wb_media.COST_IMAGE_ESTIMATE)
+                model["creditPerImageMeasured"] = image_price is not None
+                continue
+            generation = model.get("videoGeneration") or {}
+            model["creditPerSecond"] = media_price_per_second(
+                model.get("id"), generation.get("defaultResolution"), exact_only=True)
+            # **同一个模型换分辨率就是另一个价**：minimax 4 秒 768P 实扣 57.14，
+            # 2K 实扣 91.43（1.6 倍）。只报一个 creditPerSecond（默认分辨率的价）
+            # 会让调用方按 768P 的价算 2K 的花费，差 60%。所以把每一档都列出来，
+            # 没观测过的那档不出现（不要拿别档的价冒充）。
+            per_resolution_ref = {}
+            for name in (generation.get("resolutions") or ()):
+                price = media_price_per_second(model.get("id"), name,
+                                               exact_only=True, with_reference=True)
+                if price:
+                    per_resolution_ref[name] = price
+            if per_resolution_ref:
+                # 带参考素材是另一档价（实测正好 2 倍）。不列出来，调用方按
+                # creditsPerSecond 估"多图+参考视频"的花费会少算一半。
+                model["creditsPerSecondWithReference"] = per_resolution_ref
+            per_resolution = {}
+            for name in (generation.get("resolutions")
+                         or [generation.get("defaultResolution")]):
+                if not name:
+                    continue
+                price = media_price_per_second(model.get("id"), name, exact_only=True)
+                if price is not None:
+                    per_resolution[name] = price
+            if per_resolution:
+                model["creditsPerSecond"] = per_resolution
+            if model["creditPerSecond"] is None:
+                # 如实说明现在的估算依据是上界，而不是装作知道价格。
+                model["creditPerSecondCeiling"] = wb_media.COST_VIDEO_PER_SECOND_CEILING
+        return self._json(200, {
+            "realm": realm,
+            "enabled": True,
+            "models": models,
+        })
+
     def _anthropic_route(self):
         """True when the request path is one of the Anthropic Messages routes.
 
@@ -19687,6 +23339,20 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/messages", "/messages",
             "/v1/messages/count_tokens", "/messages/count_tokens",
         )
+    def _route_device_token_reload(self):
+        """Reload the cached device token without exposing the token itself."""
+        try:
+            wb_accounts.reload_device_token(ACCOUNTS_DIR)
+        except Exception as exc:
+            log("device token reload failed: %s" % type(exc).__name__,
+                level="WARN", tag="settings")
+            return self._error(500, "device token reload failed",
+                               "invalid_request_error")
+        return self._json(200, {
+            "ok": True,
+            "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
+        })
+
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
         payload = self._payload_or_error()
@@ -19735,9 +23401,13 @@ class Handler(BaseHTTPRequestHandler):
                     realm = str(item.get("realm") or "").strip().lower()
                 else:
                     realm = str(stored.get("realm") or "").strip().lower()
-                if realm not in ("", "intl", "cn"):
-                    return self._error(400, "realm must be intl, cn or empty",
+                if realm not in wb_settings.REALMS:
+                    return self._error(400, "realm must be intl, cn, codearts or empty",
                                        "invalid_request_error")
+                if realm == "codearts" and not _realm_selectable("codearts"):
+                    return self._error(
+                        400, "codearts realm is not configured; enable it in settings first",
+                        "invalid_request_error")
                 # An older cached panel does not know this field at all, so a
                 # row that omits it keeps whatever is stored instead of
                 # silently dropping the restriction.
@@ -19785,10 +23455,6 @@ class Handler(BaseHTTPRequestHandler):
         if "auth_disabled" in payload:
             wb_settings.set_auth_disabled(ACCOUNTS_DIR, payload.get("auth_disabled"))
             reply["auth_disabled"] = bool(payload.get("auth_disabled"))
-        if "realm_routing" in payload:
-            # 区域自动路由（自动换区开关 + 首选区）：面板设置页的「智能路由」卡
-            wb_settings.set_realm_routing(ACCOUNTS_DIR, payload.get("realm_routing"))
-            reply["realm_routing"] = wb_settings.realm_routing(ACCOUNTS_DIR)
 
         # The four guards can arrive grouped under "limits" (the panel's own
         # shape) or as the flat top-level keys older clients still send, which
@@ -19847,8 +23513,8 @@ class Handler(BaseHTTPRequestHandler):
         if limits_payload is not None:
             reply["limits"] = wb_settings.limits_snapshot(ACCOUNTS_DIR)
         if touched:
-            if POOL and "reserve_credits" in touched:
-                POOL.apply_reserve_credits()
+            if "reserve_credits" in touched:
+                apply_reserve_credits(refresh=True)
             if any(k in touched for k in ("daily_token_limit", "daily_credit_limit",
                                           "model_daily_token_limit")):
                 # One pass refreshes all three: a limit edit is rare, and the
@@ -20021,7 +23687,12 @@ class Handler(BaseHTTPRequestHandler):
                 reply["identity_private_data"] = value
         if "identity_versions" in payload:
             password = payload.get("panel_password") or ""
-            if not wb_settings.verify_panel_password(ACCOUNTS_DIR, password):
+            try:
+                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, password)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure verifying password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
+            if not valid:
                 return self._error(401, "invalid panel password",
                                    "invalid_request_error")
             raw = payload.get("identity_versions")
@@ -20034,12 +23705,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_identity.configure_versions(stored)
             reply["identity_versions"] = stored
-        if "free_model_credit_fallback" in payload:
-            raw = payload.get("free_model_credit_fallback")
-            if not isinstance(raw, bool):
-                return self._error(400, "free_model_credit_fallback must be true or false", "invalid_request_error")
-            wb_settings.set_free_model_credit_fallback(ACCOUNTS_DIR, raw)
-            reply["free_model_credit_fallback"] = raw
         if "auto_switch_product" in payload:
             # Strictly a JSON boolean: a string like "false" would be truthy and
             # silently switch the feature on, which is the one thing an operator
@@ -20062,6 +23727,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             reply["auto_switch_products"] = clean
+        if "daily_activity" in payload:
+            # Strictly a JSON boolean, like the other switches: a string "false"
+            # must not be read as "on" (or the other way round).
+            raw = payload.get("daily_activity")
+            if not isinstance(raw, bool):
+                return self._error(400, "daily_activity must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_daily_activity_enabled(ACCOUNTS_DIR, raw)
+            reply["daily_activity"] = raw
         if "daily_chat_web" in payload:
             raw = payload.get("daily_chat_web")
             if not isinstance(raw, bool):
@@ -20199,6 +23873,18 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_realm_fallback_enabled(ACCOUNTS_DIR, raw)
             reply["realm_fallback_enabled"] = raw
+        if "restriction_hold_seconds" in payload:
+            raw = payload.get("restriction_hold_seconds")
+            try:
+                val = float(raw)
+                if val < 0:
+                    raise ValueError("negative")
+                saved = wb_settings.set_restriction_hold_seconds(ACCOUNTS_DIR, val)
+                clamp_restriction_holds(saved)
+                reply["restriction_hold_seconds"] = saved
+            except (ValueError, TypeError):
+                return self._error(400, "restriction_hold_seconds must be a non-negative number",
+                                   "invalid_request_error")
         if "account_max_concurrent" in payload:
             # 账号级并发上限：0 = 不限（默认，与上游一字不差）；1..10 = 每账号
             # 同时最多几个 chat 请求。严格整数，字符串 "1" 不算数（它会被当成
@@ -20299,6 +23985,20 @@ class Handler(BaseHTTPRequestHandler):
             if UPDATES and raw:
                 # Turning it on should not wait out the rest of the poll sleep.
                 UPDATES.wake()
+        if "update_check_proxy_slot" in payload:
+            raw = payload.get("update_check_proxy_slot")
+            if not isinstance(raw, str):
+                return self._error(400, "update_check_proxy_slot must be a string",
+                                   "invalid_request_error")
+            slot_id = raw.strip()
+            if slot_id and not wb_settings.find_proxy_slot(ACCOUNTS_DIR, slot_id):
+                return self._error(400, "update_check_proxy_slot does not exist",
+                                   "invalid_request_error")
+            reply["update_check_proxy_slot"] = (
+                wb_settings.set_update_check_proxy_slot(ACCOUNTS_DIR, slot_id))
+            if UPDATES:
+                # Apply the new route on the next check without a restart.
+                UPDATES.wake()
         if "keep_backups" in payload:
             # An integer count, not a boolean-ish string: "2" would otherwise
             # be accepted by int() and "true" would silently become 1.
@@ -20311,6 +24011,11 @@ class Handler(BaseHTTPRequestHandler):
             # The panel's hint promises this takes effect now: a lower value
             # has to drop the extra folders immediately, not at the next update.
             reply["pruned_backups"] = wb_update_request.apply_keep_backups(stored)
+        if "max_payload_mb" in payload:
+            try:
+                reply["max_payload_mb"] = wb_settings.set_max_payload_mb(ACCOUNTS_DIR, payload["max_payload_mb"])
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         if "upstream" in payload:
             raw = payload.get("upstream")
             if not isinstance(raw, dict):
@@ -20321,7 +24026,16 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
-            reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+            reply["upstream"] = _panel_upstream_config(ACCOUNTS_DIR)
+            reply["device_token_status"] = _panel_device_token_status(ACCOUNTS_DIR)
+        if "desktop_chat_compat" in payload:
+            raw = payload.get("desktop_chat_compat")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "desktop_chat_compat must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_desktop_chat_compat(ACCOUNTS_DIR, raw)
+            reply["desktop_chat_compat"] = raw
         if "usage" in payload:
             raw = payload.get("usage")
             if not isinstance(raw, dict):
@@ -20370,6 +24084,35 @@ class Handler(BaseHTTPRequestHandler):
             wb_settings.set_quota_scan_models(ACCOUNTS_DIR, raw_models)
             reply["quota_scan_models_saved"] = len(
                 wb_settings.quota_scan_models(ACCOUNTS_DIR))
+        if "media" in payload:
+            # 媒体设置的写入点。**这张白名单是必须的**：_handle_settings_save 只认
+            # 显式列出的键，未列出的键会被静默忽略——前端会回「保存成功」而实际
+            # 什么都没落盘，那是这类改动最难查的一种坏法。
+            raw = payload.get("media")
+            if not isinstance(raw, dict):
+                return self._error(400, "media must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_media_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_media_config(ACCOUNTS_DIR, patch)
+            reply["media"] = wb_settings.media_config(ACCOUNTS_DIR)
+        if "codearts" in payload:
+            raw = payload.get("codearts")
+            if not isinstance(raw, dict):
+                return self._error(400, "codearts must be an object",
+                                   "invalid_request_error")
+            try:
+                wb_codearts.save_config(ACCOUNTS_DIR, raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_codearts.invalidate_models()
+            wb_codearts.invalidate_overview()
+            reply["codearts"] = wb_codearts.masked_config(ACCOUNTS_DIR)
+            if reconcile_codearts_realm():
+                reply["warning"] = ("CodeArts 出口已停用，默认出口已切回国际版；"
+                                    "绑定 CodeArts 的 Key 需要改绑后才能继续使用。")
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -20416,6 +24159,13 @@ class Handler(BaseHTTPRequestHandler):
                 if dropped:
                     log("proxy slots: unbound %d account(s) from removed slots"
                         % dropped)
+            try:
+                dropped_ca = wb_codearts.drop_missing_bindings(ACCOUNTS_DIR, saved)
+                if dropped_ca:
+                    log("proxy slots: unbound %d CodeArts account(s) from "
+                        "removed slots" % dropped_ca)
+            except Exception as exc:
+                log("proxy slots: CodeArts rebind failed: %s" % exc)
             log("proxy slots saved: %d slot(s)" % len(saved))
             return self._json(200, {"slots": proxy_slots_view()})
         if path == "/proxy/slots/test":
@@ -20464,7 +24214,116 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, reply)
         if path == "/proxy/discover":
             return self._json(200, {"candidates": discover_proxy_slots()})
+        if path == "/proxy/subbridge":
+            return self._handle_proxy_subbridge(payload)
         return self._error(404, "not found", "invalid_request_error")
+
+    def _handle_proxy_subbridge(self, payload):
+        """Manage subscription sources and synchronize their proxy slots."""
+        import subprocess
+
+        action = str(payload.get("action") or "test").strip()
+        if action not in ("test", "list", "refresh", "apply"):
+            return self._error(400, "unsupported subbridge action",
+                               "invalid_request_error")
+        env = dict(os.environ)
+        env.setdefault("WB_SUBBRIDGE_HOST", SUBBRIDGE_HOST)
+        env.setdefault("WB_SUBBRIDGE_PORT_START", str(SUBBRIDGE_PORT_START))
+        env.setdefault("WB_SUBBRIDGE_PORT_COUNT", str(SUBBRIDGE_PORT_COUNT))
+        env.setdefault("WB_SUBBRIDGE_CONTROLLER_ADDR", "172.17.0.1:19090")
+        secret = ""
+        try:
+            with open("/etc/default/wb-sub-bridge", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("WB_SUBBRIDGE_SECRET="):
+                        secret = line.strip().split("=", 1)[1]
+                        break
+        except OSError:
+            pass
+
+        converter = os.environ.get("WB_SUBBRIDGE_SCRIPT") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "wb_subbridge.py")
+        script = [sys.executable, converter, "--json"]
+        wanted_subs = payload.get("subs")
+        if isinstance(wanted_subs, list):
+            cleaned = [str(item).strip() for item in wanted_subs
+                       if str(item).strip()]
+            script += ["--set-subs", json.dumps(cleaned, ensure_ascii=False)]
+            if action == "test":
+                action = "list"
+        if action == "test":
+            script += ["--probe-controller"]
+        elif action == "list":
+            script += ["--list"]
+        elif action == "apply":
+            nodes = payload.get("nodes")
+            if not isinstance(nodes, list) or not nodes:
+                return self._error(400, "apply requires nodes",
+                                   "invalid_request_error")
+            script += ["--render", "--nodes", json.dumps(nodes,
+                                                        ensure_ascii=False)]
+        else:
+            script += ["--render"]
+
+        try:
+            proc = subprocess.run(
+                script,
+                env={**env, "WB_SUBBRIDGE_SECRET": secret},
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except FileNotFoundError:
+            return self._error(503, "subbridge converter is not installed",
+                               "invalid_request_error")
+        except subprocess.TimeoutExpired:
+            return self._error(504, "subbridge converter timed out",
+                               "invalid_request_error")
+
+        result = None
+        for line in reversed((proc.stdout or "").splitlines()):
+            try:
+                candidate = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                result = candidate
+                break
+        if result is None:
+            result = {
+                "ok": False,
+                "error": (proc.stderr or "converter output invalid")[:300],
+            }
+        result["mode"] = action
+        if not result.get("ok") or action in ("test", "list"):
+            return self._json(200, result)
+
+        # The .path unit reloads mihomo after config.yaml changes. Give the
+        # controller time to bind every listener, then probe concurrently and
+        # retain failed nodes as disabled slots instead of silently dropping
+        # them.
+        time.sleep(2)
+        probes = probe_subbridge_listeners(result.get("listeners") or [])
+        result["reachable"] = probes
+        result["slots_total"] = len(probes)
+        result["slots_ready"] = sum(1 for item in probes if item.get("ok"))
+        result["ok"] = True
+        if payload.get("import") or action == "refresh":
+            current = proxy_slots_view()
+            slots = reconcile_subbridge_slots(current, probes)
+            saved = wb_settings.set_proxy_slots(ACCOUNTS_DIR, slots)
+            if POOL:
+                dropped = wb_settings.drop_missing_bindings(POOL, saved)
+                POOL.apply_proxy_slots(saved)
+                if dropped:
+                    log("proxy slots: unbound %d account(s) from removed "
+                        "subbridge slots" % dropped)
+            result["imported"] = len(probes)
+            result["slots_raw"] = len(saved)
+            log("subbridge slots synchronized: %d total, %d ready"
+                % (result["slots_total"], result["slots_ready"]))
+        return self._json(200, result)
 
     # ---- one-click agent integration (wb_agents) ----
 
@@ -20792,9 +24651,16 @@ class Handler(BaseHTTPRequestHandler):
                 _login_attempts[client_ip] = attempts
                 if len(attempts) >= 5:
                     wait_sec = int(60 - (now - attempts[0]))
-                    return self._error(429, f"too many login attempts, please wait {max(1, wait_sec)}s", "rate_limit_error")
+                    return self._error(
+                        429, f"too many login attempts, please wait {max(1, wait_sec)}s",
+                        "rate_limit_error", reset_at=attempts[0] + 60)
             password = str(payload.get("password") or "")
-            if not wb_settings.verify_panel_password(ACCOUNTS_DIR, password):
+            try:
+                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, password)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure verifying password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
+            if not valid:
                 with _login_lock:
                     _login_attempts.setdefault(client_ip, []).append(now)
                 # Small backoff delay to mitigate automated brute force
@@ -20817,11 +24683,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/panel/password":
             current = str(payload.get("current") or "")
             new = str(payload.get("new") or "")
-            if not wb_settings.verify_panel_password(ACCOUNTS_DIR, current):
+            try:
+                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, current)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure verifying current password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
+            if not valid:
                 return self._error(401, "current password is wrong", "invalid_request_error")
             if len(new) < 4:
                 return self._error(400, "new password must be at least 4 characters", "invalid_request_error")
-            wb_settings.set_panel_password(ACCOUNTS_DIR, new)
+            try:
+                wb_settings.set_panel_password(ACCOUNTS_DIR, new)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure setting password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
             log("panel      : password changed")
             if new != wb_settings.DEFAULT_PANEL_PASSWORD:
                 # Rotating the password invalidates every other browser session.
@@ -20833,8 +24708,154 @@ class Handler(BaseHTTPRequestHandler):
                     new == wb_settings.DEFAULT_PANEL_PASSWORD,
             })
         return self._error(404, "not found", "invalid_request_error")
+    def _get_codearts_oauth_callback(self, query):
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        try:
+            status, html = wb_codearts.oauth_callback_get(cfg, query)
+        except Exception as exc:
+            status, html = 400, "<h3>登录失败：%s</h3>" % exc
+        raw = ("<!doctype html><meta charset=\"utf-8\"><body style=\"font-family:sans-serif;"
+               "padding:32px;line-height:1.7\">" + html + "</body>").encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _get_codearts_overview(self):
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        try:
+            data = wb_codearts.overview(cfg)
+        except wb_codearts.CodeArtsError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        out = dict(data)
+        health = wb_codearts.health(cfg)
+        out["online"] = health["ok"]
+        out["health"] = health
+        out["base_url"] = wb_codearts.SNAP_HOST
+        return self._json(200, out)
+
+    def _get_codearts_accounts(self):
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        try:
+            data = wb_codearts.overview(cfg)
+        except wb_codearts.CodeArtsError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        return self._json(200, {
+            "provider": "codearts",
+            "accounts": data.get("accounts") or [],
+            "stats": data.get("stats") or {},
+            "models": data.get("models") or [],
+            "base_url": wb_codearts.SNAP_HOST,
+        })
+
+    def _codearts_admin_error(self, exc):
+        if isinstance(exc, wb_codearts.CodeArtsNotFound):
+            message = str(exc)
+            if "account not found" in message.lower():
+                return self._error(404, message, "invalid_request_error")
+            return self._error(
+                409, "codearts2api 版本过旧，没有删除账号接口；请升级 apps/codearts 后重建容器。",
+                "invalid_request_error")
+        if isinstance(exc, wb_codearts.CodeArtsBadRequest):
+            return self._error(400, str(exc), "invalid_request_error")
+        return self._error(502, str(exc), "invalid_request_error")
+
+    def _handle_codearts(self, path, payload):
+        """`/codearts/*` 管理代理：只接受面板会话。"""
+        if not self._panel_ok():
+            return self._error(401, "panel password required",
+                               "invalid_request_error")
+        if not isinstance(payload, dict):
+            return self._error(400, "expected a JSON object",
+                               "invalid_request_error")
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        uid = str(payload.get("uid") or "").strip()
+        try:
+            if path == "/codearts/test":
+                health = wb_codearts.health(cfg, force=True)
+                if not health.get("ok"):
+                    return self._json(502, {"ok": False, "health": health})
+                data = wb_codearts.overview(cfg, force=True)
+                return self._json(200, {
+                    "ok": True, "health": health,
+                    "stats": data.get("stats") or {},
+                    "models": len(data.get("models") or []),
+                })
+            if path == "/codearts/accounts/oauth/start":
+                try:
+                    port = int(self.server.server_address[1])
+                except Exception:
+                    port = 8788
+                return self._json(200, wb_codearts.oauth_start(cfg, port))
+            if path == "/codearts/accounts/oauth/poll":
+                return self._json(200, wb_codearts.oauth_poll(
+                    cfg, payload.get("session_id")))
+            if path == "/codearts/accounts/oauth/callback":
+                return self._json(200, wb_codearts.oauth_callback(
+                    cfg, payload.get("session_id"),
+                    payload.get("callback_url")))
+            if path == "/codearts/keepalive":
+                result = wb_codearts.keepalive(cfg)
+                wb_codearts.invalidate_overview()
+                return self._json(200, result)
+            if path == "/codearts/models/refresh":
+                return self._json(200, wb_codearts.refresh_models(cfg))
+            if path == "/codearts/credits/refresh":
+                return self._json(200, wb_codearts.refresh_credits(cfg))
+            if path == "/codearts/accounts/checkin":
+                # uid 可空：空 = 全员签到。
+                result = wb_codearts.checkin(cfg, uid)
+                wb_codearts.invalidate_overview()
+                return self._json(200, result)
+            if not uid:
+                return self._error(400, "uid required", "invalid_request_error")
+            if path == "/codearts/accounts/proxy":
+                result = wb_codearts.set_proxy_slot(
+                    cfg, uid, payload.get("slot_id"))
+            elif path == "/codearts/accounts/note":
+                result = wb_codearts.set_note(cfg, uid, payload.get("note"))
+            elif path == "/codearts/accounts/tasks":
+                result = wb_codearts.set_tasks_enabled(
+                    cfg, uid, payload.get("enabled", True))
+            elif path == "/codearts/accounts/test":
+                result = wb_codearts.test_account(cfg, uid)
+            elif path == "/codearts/accounts/enable":
+                result = wb_codearts.enable(cfg, uid)
+            elif path == "/codearts/accounts/disable":
+                result = wb_codearts.disable(cfg, uid, payload.get("reason") or "")
+            elif path == "/codearts/accounts/delete":
+                result = wb_codearts.remove(cfg, uid)
+            elif path == "/codearts/accounts/clear-cooldown":
+                result = wb_codearts.clear_cooldown(cfg, uid)
+            else:
+                return self._error(404, "unknown codearts endpoint",
+                                   "invalid_request_error")
+            wb_codearts.invalidate_overview()
+            return self._json(200, result)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_admin_error(exc)
+
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
+        if path.startswith("/codearts"):
+            return self._handle_codearts(path, payload)
+        if path == "/realm":
+            # 默认出口切换不依赖账号池：池子不可用时仍然要能把出口改回来。
+            return self._route_realm(payload)
         if POOL is None:
             return self._error(503, "account pool unavailable")
         if path == "/accounts/import" and isinstance(payload, list):
@@ -20863,8 +24884,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_pricing_refresh(payload)
         if path == "/logs/clear":
             return self._route_logs_clear(payload)
-        if path == "/realm":
-            return self._route_realm(payload)
         if path == "/accounts/checkin":
             return self._route_accounts_checkin(payload)
         if path == "/accounts/daily-chat":
@@ -20946,13 +24965,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_accounts_credits_fetch(self, payload):
         uid = payload.get("uid")
+        uids = payload.get("uids")
         realm = payload.get("realm")
+        group = str(payload.get("group") or "").strip()
+        if "uids" in payload and not isinstance(uids, list):
+            # 写坏了的 uids（字符串 / 对象 / null）不能落到下面的全池扫。
+            return self._error(400, "uids must be a list", "invalid_request_error")
         if uid:
             targets = [POOL.get(uid)]
+        elif isinstance(uids, list):
+            # 面板自动补快照：只补点名的这几个号（缺积分的），空列表就是什么都不刷，
+            # 绝不退化成全池扫。多于一个号时照样吃下面的单飞与拟人间隔。
+            targets = [POOL.get(u) for u in dict.fromkeys(str(x) for x in uids if x)]
         elif realm and realm != "all":
             targets = [a for a in POOL.accounts if a.realm == realm]
         else:
             targets = list(POOL.accounts)
+        if group:
+            targets = [a for a in targets if a is not None and a.group == group]
         # 多账号目标才吃单飞与拟人间隔：单账号刷新本来就只发一次请求，不该被别人的
         # 全量刷挡住，也不该为它空等一个间隔。
         multi = len([t for t in targets if t is not None]) > 1
@@ -21010,6 +25040,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
@@ -21050,6 +25083,9 @@ class Handler(BaseHTTPRequestHandler):
         target = POOL.get(uid)
         if not target or target.realm != "cn":
             return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
+        texts, _ = _ensure_pools()
+        if texts is not None and not texts.allows(target):
+            return self._json_panel(200, {"ok": False, "msg": "该账号属于媒体号池，不执行文本任务"})
         from wb_tasks import claim_task
         res = claim_task(target, code)
         invalidate_tasks_cache()
@@ -21071,6 +25107,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_streak_bonus
@@ -21097,6 +25136,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import do_cat_travel
@@ -21296,8 +25338,14 @@ class Handler(BaseHTTPRequestHandler):
                                     "panel session, not an API key",
                                "invalid_request_error")
         new_realm = payload.get("realm")
-        if new_realm in ("intl", "cn"):
-            save_persisted_realm(new_realm)
+        if new_realm not in ("intl", "cn", "codearts"):
+            return self._error(400, "realm must be intl, cn or codearts",
+                               "invalid_request_error")
+        if new_realm == "codearts" and not _realm_selectable("codearts"):
+            return self._error(
+                400, "codearts realm is not configured; enable it in settings first",
+                "invalid_request_error")
+        save_persisted_realm(new_realm)
         return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True})
 
     def _route_accounts_checkin(self, payload):
@@ -21311,6 +25359,9 @@ class Handler(BaseHTTPRequestHandler):
                          if a.realm == "cn"
                          and a.task_active()
                          and not a.uses_enterprise_billing()])
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         results = []
         for account in targets:
             if account is None:
@@ -21339,6 +25390,9 @@ class Handler(BaseHTTPRequestHandler):
                        if a.realm == "intl" and a.task_active() and str(a.uid) in wanted]
         else:
             targets = POOL.task_accounts("intl")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         results = []
         for account in targets:
             if account is None:
@@ -21363,6 +25417,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [POOL.get(uid)]
         else:
             targets = POOL.task_accounts("intl")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         results = []
         for account in targets:
             if account is None:
@@ -21377,15 +25434,37 @@ class Handler(BaseHTTPRequestHandler):
     def _route_accounts_login_start(self, payload):
         platform = payload.get("platform") or "CLI"
         target_realm = payload.get("realm") or CURRENT_REALM
+        slot_id = payload.get("proxySlot")
+        if slot_id is not None and not isinstance(slot_id, str):
+            return self._error(400, "proxySlot must be a string", "invalid_request_error")
+        taken = set()
+        if slot_id == wb_accounts.LOGIN_SLOT_AUTO:
+            # "auto" must not hand out a slot a CodeArts account already uses.
+            try:
+                taken = {a.proxy_slot for a in wb_codearts.pool_for(ACCOUNTS_DIR).accounts
+                         if a.proxy_slot}
+            except Exception as exc:
+                log("login auto proxy slot: CodeArts bindings unavailable (%s)" % exc)
         try:
-            started = POOL.start_login(realm=target_realm, platform=platform)
+            started = POOL.start_login(realm=target_realm, platform=platform,
+                                       proxy_slot=slot_id, taken_slots=taken)
+        except wb_accounts.LoginProxySlotError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
         except wb_accounts.TLSVerifyError as exc:
             # The hint already names the file/variable to fix; prefixing it
             # with "could not start login" only buries it.
             return self._error(502, str(exc))
         except Exception as exc:
             return self._error(502, "could not start login: %s" % exc)
-        log("oauth login started (realm=%s, platform=%s, state=%s)" % (target_realm, platform, started["state"][:8]))
+        # A proxy URL may carry user:pass; the log and the panel only ever get
+        # its host:port (egress_exit), never the URL itself.
+        exit_label = egress_exit(started.get("proxy")) if started.get("proxy") else ""
+        started = dict(started, proxy=exit_label)
+        via = "direct"
+        if exit_label:
+            via = ("%s %s" % (started.get("proxySlot") or "", exit_label)).strip()
+        log("oauth login started (realm=%s, platform=%s, state=%s, proxy=%s)"
+            % (target_realm, platform, started["state"][:8], via))
         return self._json(200, started)
 
     def _route_accounts_login_cancel(self, payload):
@@ -21460,6 +25539,9 @@ class Handler(BaseHTTPRequestHandler):
     def _route_accounts_refresh(self, payload):
         uid = payload.get("uid")
         targets = [POOL.get(uid)] if uid else list(POOL.accounts)
+        group = str(payload.get("group") or "").strip()
+        if group:
+            targets = [a for a in targets if a is not None and a.group == group]
         results = []
         for account in targets:
             if account is None:
@@ -21510,6 +25592,13 @@ class Handler(BaseHTTPRequestHandler):
         account = POOL.get(uid)
         if not account:
             return self._error(404, "no such account")
+        texts, _ = _ensure_pools()
+        if texts is not None and not texts.allows(account):
+            return self._error(
+                400,
+                "账号 %s 属于媒体号池，不发起文本模型请求，不能做文本测试"
+                % account.uid[:8],
+                "invalid_request_error")
         model = payload.get("model") or TEST_MODEL_DEFAULT
         row = probe_account(account, model)
         log("account test: uid=%s model=%s wall=%sms ok=%s%s"
@@ -21543,6 +25632,12 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model") or TEST_MODEL_DEFAULT
         targets = [a for a in (POOL.accounts if POOL else [])
                    if a.realm == realm and a.enabled]
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if texts is None or texts.allows(a)]
+        group = str(payload.get("group") or "").strip()
+        if group:
+            targets = [a for a in targets if a.group == group]
         started = time.time()
         network = probe_local_network(realm)
         rows = []
@@ -21610,6 +25705,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(404, "no such account")
             log("account %s note set (%d chars)"
                 % (uid[:8], len(updated.get("note") or "")))
+        if "group" in payload:
+            updated = POOL.set_group(uid, payload.get("group"))
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s group set to %r"
+                % (uid[:8], updated.get("group") or ""))
         if "disabledModels" in payload:
             # 人工黑名单：这些模型不再派给该账号，其他模型与别的账号都不受影响。
             # 传空数组 = 清空禁用。
@@ -21619,16 +25720,67 @@ class Handler(BaseHTTPRequestHandler):
             log("account %s disabled models: %s"
                 % (uid[:8],
                    ",".join(updated.get("disabledModels") or []) or "(none)"))
+        if "poolScope" in payload:
+            scope = payload.get("poolScope")
+            if not wb_pool_scope.is_valid_scope(scope):
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            updated = POOL.set_pool_scope(uid, scope)
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s pool scope set to %s"
+                % (uid[:8], updated.get("poolScope")))
         if updated is None:
             return self._error(
                 400,
                 "nothing to update: pass 'enabled', 'tasksEnabled', 'proxy', "
-                "'proxySlot', 'weight' or 'note'"
+                "'proxySlot', 'weight', 'note', 'group', 'disabledModels' "
+                "or 'poolScope'"
             )
         return self._json_panel(200, {"account": updated})
 
     def _route_accounts_set_all(self, payload):
-        POOL.set_all_enabled(bool(payload.get("enabled")))
+        if "poolScope" in payload:
+            uids = payload.get("uids")
+            if not isinstance(uids, list) or not uids:
+                return self._error(
+                    400, "uids must be a non-empty list",
+                    "invalid_request_error")
+            scope = payload.get("poolScope")
+            if not wb_pool_scope.is_valid_scope(scope):
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            moved = POOL.set_pool_scope_many(
+                [str(uid) for uid in uids if uid], scope)
+            if moved is None:
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            log("accounts pool scope set to %s: %d account(s)"
+                % (wb_pool_scope.normalize_scope(scope), len(moved)))
+            return self._json_panel(200, {
+                "moved": len(moved),
+                "uids": moved,
+                "accounts": account_views(),
+            })
+        group = str(payload.get("group") or "").strip()
+        if group:
+            raw_enabled = payload.get("enabled")
+            if not isinstance(raw_enabled, bool):
+                return self._error(400, "enabled must be true or false",
+                                   "invalid_request_error")
+            changed = POOL.set_group_enabled(group, raw_enabled)
+            log("accounts in group %r: %d %s"
+                % (group, len(changed),
+                   "enabled" if raw_enabled else "disabled"))
+        else:
+            raw_enabled = payload.get("enabled")
+            if not isinstance(raw_enabled, bool):
+                return self._error(400, "enabled must be true or false",
+                                   "invalid_request_error")
+            POOL.set_all_enabled(raw_enabled)
         return self._json_panel(200, {"accounts": account_views()})
 
     def _route_accounts_delete(self, payload):
@@ -21636,6 +25788,7 @@ class Handler(BaseHTTPRequestHandler):
         if not uid:
             return self._error(400, "uid required")
         removed = POOL.remove(uid)
+        invalidate_tasks_cache()
         log("account %s deleted" % uid[:8])
         return self._json_panel(200, {"deleted": removed, "accounts": account_views()})
 
@@ -21732,8 +25885,14 @@ class Handler(BaseHTTPRequestHandler):
         dry_run = bool(payload.get("dryRun"))
         overwrite = bool(payload.get("overwrite"))
         forced_realm = (payload.get("realm") or "").strip().lower() or None
+        forced_group = str(payload.get("group") or "").strip()[:64]
         if forced_realm and forced_realm not in ("intl", "cn"):
             return self._error(400, "realm must be intl or cn", "invalid_request_error")
+        if forced_group:
+            # An import-level group applies to every row and wins over any stale
+            # label inside the file, just like an explicitly forced realm.
+            rows = [dict(row, group=forced_group)
+                    if isinstance(row, dict) else row for row in rows]
         if dry_run:
             # Validate every row without touching the pool so the caller can
             # see exactly what an import would do before committing to it.
@@ -21795,10 +25954,15 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
+        # Log the level the request will actually run at, not just what the
+        # client typed: when the client omits `reasoning_effort` the gateway
+        # fills in the model's default (deepseek-* get one), so a bare
+        # `effort=None` reads as "no reasoning" even though it ran at `high`.
         log(
-            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
+            "responses: model=%s stream=%s msgs=%d effort=%r -> upstream_effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
-               chat_req.get("reasoning_effort"),
+               client_effort_of(chat_req),
+               upstream_effort_of(chat_req, model),
                len(chat_req.get("tools") or []), len(all_tools),
                sorted(custom_names) or "-", compaction, key_label(self._key_id()) or "-")
         )
@@ -21814,6 +25978,10 @@ class Handler(BaseHTTPRequestHandler):
             key_blocked = self._key_model_error(chat_req.get("model"))
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
+            if req_realm == "codearts":
+                return self._handle_codearts_responses(
+                    chat_req, session_key, model, want_stream, compaction,
+                    custom_names, request_meta, ns_map, fp, t_start)
             upstream, account, effort = open_upstream_with_fallback(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 allow_realm_fallback=not explicit_realm,
@@ -21851,21 +26019,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = read_http_error(exc, 600).decode("utf-8", "replace")
+            maybe_dump_11_128(exc, detail, "responses", model, fp=fp,
+                              stream=want_stream,
+                              client_headers=getattr(self, "headers", None))
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
+                         proxy_slot=getattr(exc, "proxy_slot", None),
+                         proxy_exit=getattr(exc, "proxy_exit", None),
                          key=self._key_id())
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
-            if message.startswith("no usable account"):
-                return self._error(503, message +
-                                   " - add or enable one at the dashboard (/)")
-            return self._error(502, f"upstream unreachable: {exc}")
+            return upstream_failure_response(self, model, exc, t_start,
+                                             self._key_id())
         with upstream:
             if compaction:
                 return self._responses_compaction_response(
@@ -21937,12 +26103,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
-        realm_used = getattr(self, "realm_used", "") or ""
-        if realm_used:
-            self.send_header("X-WB-Realm", realm_used)
-            realm_reason = getattr(self, "realm_reason", "") or ""
-            if realm_reason:
-                self.send_header("X-WB-Realm-Reason", realm_reason)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -21986,12 +26146,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
-        realm_used = getattr(self, "realm_used", "") or ""
-        if realm_used:
-            self.send_header("X-WB-Realm", realm_used)
-            realm_reason = getattr(self, "realm_reason", "") or ""
-            if realm_reason:
-                self.send_header("X-WB-Realm-Reason", realm_reason)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -22013,6 +26167,7 @@ class Handler(BaseHTTPRequestHandler):
                 total_usage = None
                 while True:
                     holder.pop("internal_calls", None)
+                    holder.pop("reasoning_content", None)
                     holder.pop("suppress_completion", None)
                     holder["suppress_lifecycle"] = rounds > 0
                     for frame in stream_responses_events(upstream, model, holder):
@@ -22033,6 +26188,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                     upstream, account, _ = follow_up_with_tool_results(
                         internal, holder, model, session_key, t_start, drop_tools=give_up,
+                        reasoning_content=holder.get("reasoning_content"),
                         **key_open_kwargs(getattr(self, "key_entry", None)))
                 if total_usage:
                     holder["usage"] = total_usage
@@ -22041,8 +26197,8 @@ class Handler(BaseHTTPRequestHandler):
             record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid,
-                         outcome="client_aborted", key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                         fp=fp, account=account.uid, realm=realm,
+                         outcome="client_aborted", key=self._key_id(), effort=effort)
             return
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
@@ -22051,7 +26207,8 @@ class Handler(BaseHTTPRequestHandler):
                          usage=holder.get("usage"), stream=True,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+                         fp=fp, outcome="upstream_aborted", realm=realm,
+                         key=self._key_id())
             try:
                 self.wfile.write(responses_stream_error_frame(
                     "upstream stream aborted: %s" % exc))
@@ -22070,11 +26227,12 @@ class Handler(BaseHTTPRequestHandler):
         record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort,
+                     fp=fp, account=account.uid, realm=realm,
+                     key=self._key_id(), effort=effort,
                      outcome=("failed" if holder.get("empty_reasoning") else "completed"))
         return
 
-    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
+    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None, allow_web_tools=True):
         # 跟串流那条一样：客户端宣告 web_search / web_fetch 时由反代代跑。
         # 中间那几轮对客户端不可见，最后才组成一个 Responses 物件回传；不这样
         # 做的话 web_search 的 function_call 会直接漏给客户端，客户端只会回
@@ -22082,14 +26240,18 @@ class Handler(BaseHTTPRequestHandler):
         sources = []
         rounds = 0
         # 开关关闭时不拦同名呼叫：那是客户端自己的工具。
-        web_tools = web_tools_active(base_body)
+        # CodeArts 出口没有 wb-hub 的 web_search/web_fetch 代跑，调用方传 False。
+        web_tools = web_tools_active(base_body) if allow_web_tools else False
+        holder = {"base_messages": (base_body or {}).get("messages"),
+                  "base_body": base_body, "realm": realm,
+                  "web_sources": sources}
         while True:
             try:
                 chat_obj = aggregate_stream(upstream, model, None)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             account=account.uid, key=self._key_id())
+                             account=account.uid, realm=realm, key=self._key_id())
                 return self._error(502, f"upstream stream error: {exc}")
             calls = internal_calls_from_chat(chat_obj, web_tools=web_tools)
             if not calls:
@@ -22100,17 +26262,16 @@ class Handler(BaseHTTPRequestHandler):
                 upstream.close()
             except Exception:
                 pass
-            holder = {"base_messages": (base_body or {}).get("messages"),
-                      "base_body": base_body, "realm": realm,
-                      "web_sources": sources}
+            round_message = ((chat_obj.get("choices") or [{}])[0].get("message") or {})
             try:
                 upstream, account, _ = follow_up_with_tool_results(
                     calls, holder, model, session_key, t_start, drop_tools=give_up,
+                    reasoning_content=round_message.get("reasoning_content"),
                     **key_open_kwargs(getattr(self, "key_entry", None)))
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             account=account.uid, key=self._key_id())
+                             account=account.uid, realm=realm, key=self._key_id())
                 return self._error(502, "web tool follow-up failed: %s" % exc)
             sources = holder.get("web_sources") or sources
         wall = int((time.time() - t_start) * 1000)
@@ -22120,11 +26281,13 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 502, "upstream returned reasoning without output text",
                          elapsed_ms=wall, account=account.uid,
                          usage=chat_obj.get("usage"), stream=False,
-                         fp=fp, outcome="empty_reasoning", key=self._key_id())
+                         fp=fp, outcome="empty_reasoning", realm=realm,
+                         key=self._key_id())
             return self._error(
                 502, "upstream returned reasoning without output text; retry")
         record_upstream_usage(upstream, model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
-                     account=account.uid, key=self._key_id(), effort=effort)
+                     account=account.uid, realm=realm, key=self._key_id(),
+                     effort=effort)
         return self._json(200, result)
 
     def _handle_messages_count_tokens(self, payload):
@@ -22172,6 +26335,9 @@ class Handler(BaseHTTPRequestHandler):
             key_blocked = self._key_model_error(chat_req.get("model"))
             if key_blocked:
                 return self._anthropic_error(400, key_blocked, "invalid_request_error")
+            if req_realm == "codearts":
+                return self._handle_codearts_messages(
+                    chat_req, session_key, model, want_stream, fp, t_start)
             upstream, account, effort = open_upstream_with_fallback(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 allow_realm_fallback=not explicit_realm,
@@ -22214,9 +26380,14 @@ class Handler(BaseHTTPRequestHandler):
                 detail = read_http_error(exc, 600).decode("utf-8", "replace")
             except Exception:
                 detail = str(exc)
+            maybe_dump_11_128(exc, detail, "messages", model, fp=fp,
+                              stream=want_stream,
+                              client_headers=getattr(self, "headers", None))
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
+                         proxy_slot=getattr(exc, "proxy_slot", None),
+                         proxy_exit=getattr(exc, "proxy_exit", None),
                          key=self._key_id())
             return self._anthropic_error(exc.code,
                                          "upstream %s: %s" % (exc.code, detail))
@@ -22250,12 +26421,14 @@ class Handler(BaseHTTPRequestHandler):
             result = chat_to_messages(chat_obj)
             wall = int((time.time() - t_start) * 1000)
             record_upstream_usage(upstream, model, chat_obj.get("usage"), stream=False, elapsed_ms=wall,
-                         fp=fp, account=account.uid, key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                         fp=fp, account=account.uid, realm=realm,
+                         key=self._key_id(), effort=effort)
             return self._json(200, result)
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
             record_error(model, 502, "messages upstream error: %s" % exc,
-                         elapsed_ms=wall, account=account.uid, key=self._key_id())
+                         elapsed_ms=wall, account=account.uid, realm=realm,
+                         key=self._key_id())
             return self._anthropic_error(502, "upstream stream error: %s" % exc)
         finally:
             try:
@@ -22288,8 +26461,8 @@ class Handler(BaseHTTPRequestHandler):
             record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid,
-                         outcome="client_aborted", key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                         fp=fp, account=account.uid, realm=realm,
+                         outcome="client_aborted", key=self._key_id(), effort=effort)
             return
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
@@ -22297,7 +26470,7 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, account=account.uid,
                          usage=holder.get("usage"), stream=True,
                          ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
-                         key=self._key_id())
+                         realm=realm, key=self._key_id())
             try:
                 heartbeat.write(anthropic_sse_frame("error", {
                     "error": {"type": "api_error", "message": str(exc)}}))
@@ -22313,13 +26486,25 @@ class Handler(BaseHTTPRequestHandler):
         record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                     fp=fp, account=account.uid, realm=realm,
+                     key=self._key_id(), effort=effort)
         return
 
     def do_POST(self):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        # Arrival trace for the model routes only, before any body work: the
+        # chat log line is written after the body is in hand, so a request whose
+        # upload is slow (or that a CDN in front of us is still buffering) left
+        # no trace at all - a conversation could look "stuck for minutes" while
+        # the gateway had no line to show for it. This marks the moment the
+        # request head reached this process; pair it with body_wait to tell
+        # "arrived but still uploading" from "never arrived".
+        if path in _CHAT_PATHS:
+            log("chat head: %s content_length=%s key=%s"
+                % (path, self.headers.get("Content-Length") or "-",
+                   key_label(self._key_id()) or "-"), tag="chat")
         if path in BODYLESS_PANEL_POSTS:
             # 这一组路由不解析 body，但面板按钮确实会发一个 `{}`：不在这里排空，
             # 残留字节就会成为同一条连接上下一个请求的请求行（见 BODYLESS_PANEL_POSTS
@@ -22344,6 +26529,19 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/settings/device-token/reload":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_device_token_reload()
+        if path == "/settings/restriction/reset":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            reset_restriction_state()
+            return self._json(200, {
+                "ok": True,
+                "message": "风控连坐暂停已立即解除 / Restriction hold cleared",
+                "restriction_holds": {},
+            })
         if path == "/updates/check":
             # Panel-only management write, like the pricing ones. No body to
             # read: the action takes no parameters, so a button that posts
@@ -22432,6 +26630,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        # 生视频的取消：路径里带 task id，进不了 MEDIA_POST_PATHS 的精确匹配。
+        if path.startswith("/v1/videos/") and path.endswith("/cancel"):
+            if not self._authorized():
+                return
+            if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+                return self._error(
+                    403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                    "pool_boundary")
+            self._handle_expect_continue()
+            self._discard_body()
+            task_id = path[len("/v1/videos/"):-len("/cancel")].strip("/")
+            return self._media_cancel(task_id)
         is_messages_route = path in (
             "/v1/messages", "/messages",
             "/v1/messages/count_tokens", "/messages/count_tokens",
@@ -22442,12 +26652,17 @@ class Handler(BaseHTTPRequestHandler):
             or path.startswith("/tasks")
             or path.startswith("/scheduler")
             or path.startswith("/logs")
+            or path.startswith("/codearts")
         )
-        if not is_account_route and not is_messages_route and path not in (
-                "/v1/chat/completions", "/chat/completions",
-                "/v1/completions", "/completions",
-                "/v1/responses", "/responses",
-                "/v1/responses/compact", "/responses/compact"):
+        # 媒体路由（生图 / 改图 / 生视频）与 chat 并列：同一个 API Key 门，但不占
+        # chat 的并发槽，也不进 chat 的模型别名与 body 改写。不在这行放行，它们
+        # 会连"开关关着就 404"都走不到——直接被这里判成 not found。
+        is_media_route = path in MEDIA_POST_PATHS
+        if not is_account_route and not is_messages_route and not is_media_route                 and path not in (
+                    "/v1/chat/completions", "/chat/completions",
+                    "/v1/completions", "/completions",
+                    "/v1/responses", "/responses",
+                    "/v1/responses/compact", "/responses/compact"):
             return self._error(404, "not found", "invalid_request_error")
         if is_messages_route:
             if not self._key_ok():
@@ -22455,6 +26670,14 @@ class Handler(BaseHTTPRequestHandler):
                     401, "missing or invalid API key", "authentication_error")
         elif not self._authorized():
             return
+        if is_media_route and not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if not is_media_route and not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_TEXT):
+            return self._error(
+                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
+                "pool_boundary")
         # Fail closed until the Anthropic-to-Chat bridge has verified prompt-cache
         # parity. Reject before forwarding or recording any paid usage.
         if is_messages_route and not _anthropic_messages_enabled():
@@ -22466,11 +26689,18 @@ class Handler(BaseHTTPRequestHandler):
                 "Enable it in the Settings panel or set WB_ENABLE_ANTHROPIC_MESSAGES=1 "
                 "to opt in at your own risk (see issue #367).",
                 "invalid_request_error")
-        payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
+        if is_media_route:
+            # 改图的输入图是 data URL，8 MB 原图编码后约 10.7 MB；通用上限
+            # （默认 16 MB，还可能被 max_payload_mb 调小）会把一次合法请求判成 413。
+            payload = self._payload_or_error_for_media()
+        else:
+            payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
+        if is_media_route:
+            return self._handle_media_post(path, payload)
         try:
             aliases = wb_settings.model_aliases(ACCOUNTS_DIR)
         except Exception:
@@ -22485,9 +26715,14 @@ class Handler(BaseHTTPRequestHandler):
                        % (key_name, max_key_conc))
             record_error(payload.get("model") or "unknown", 429, message,
                          stream=payload.get("stream"), key=self._key_id())
+            # 什么时候能好说不了——取决于在飞的那个请求还要跑多久；但「过一小
+            # 会儿再来」是确定的。给一个短窗口，别让客户端拿默认退避硬等。
+            reset_at = time.time() + 2
             if is_messages_route:
-                return self._anthropic_error(429, message, "rate_limit_error")
-            return self._error(429, message, "rate_limit_error")
+                return self._anthropic_error(429, message, "rate_limit_error",
+                                             reset_at=reset_at)
+            return self._error(429, message, "rate_limit_error",
+                               reset_at=reset_at)
 
         try:
             if is_messages_route:
@@ -22534,6 +26769,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_responses(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
+        session_key = extract_session_key(self.headers, payload)
+        want_stream = bool(payload.get("stream"))
+        model = payload.get("model") or "hy4-preview"
+        t_start = time.time()
+        explicit_realm = self._request_realm()
+        req_realm = explicit_realm or CURRENT_REALM
+        if req_realm == "codearts":
+            blocked = self._banned_model_error(payload.get("model")) or self._key_model_error(payload.get("model"))
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            # CodeArts 不走 WorkBuddy 的 build_upstream_body / 账号池：请求体、
+            # 超时、错误映射都由 wb_codearts 负责，回程复用下面的处理器。
+            return self._handle_codearts_chat(payload, session_key, req_realm)
         forwarded = build_upstream_body(payload)
         given = client_effort_of(payload) or payload.get("reasoning") \
             or payload.get("thinking") or payload.get("enable_thinking")
@@ -22548,17 +26796,8 @@ class Handler(BaseHTTPRequestHandler):
                 key_label(self._key_id()) or "-",
             )
         )
-        session_key = extract_session_key(self.headers, payload)
         fp = prompt_fingerprint(forwarded.get("messages"))
-        want_stream = bool(payload.get("stream"))
-        model = payload.get("model") or "hy4-preview"
-        t_start = time.time()
         try:
-            # 合并（v1.7.28）：上游引入了 explicit_realm，我们的自动路由需要 realms 列表 —— 两者都保留。
-            explicit_realm = self._request_realm()
-            requested = explicit_realm
-            realms = realm_candidates(payload.get("model"), requested)
-            req_realm = realms[0] or CURRENT_REALM
             blocked = self._cross_realm_error(payload.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -22568,15 +26807,11 @@ class Handler(BaseHTTPRequestHandler):
             key_blocked = self._key_model_error(payload.get("model"))
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
-            # 合并（v1.7.28）：上游把回退收进 open_upstream_with_fallback，但它只支持"换一次区"；
-            # 我们的 _open_upstream_auto 支持多区排序（prefer + 就绪探测）并写 X-WB-Realm-Reason，
-            # 面板依赖后者。这里保留我们的实现，参数语义等价（都只在 RateLimited / 池空时换区）。
-            upstream, account, effort = self._open_upstream_auto(
-                payload, realms, session_key=session_key,
-                prebuilt_body=forwarded, model=payload.get("model"),
-                defer_egress_success=True,
+            upstream, account, effort = open_upstream_with_fallback(
+                payload, session_key=session_key, target_realm=req_realm,
+                allow_realm_fallback=not explicit_realm,
+                prebuilt_body=forwarded, defer_egress_success=True,
                 **key_open_kwargs(getattr(self, "key_entry", None)))
-            req_realm = getattr(self, "realm_used", "") or req_realm
         except PinnedAccountError as exc:
             record_error(model, exc.status, exc.message[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -22610,22 +26845,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = read_http_error(exc, 600).decode("utf-8", "replace")
+            maybe_dump_11_128(exc, detail, "chat", model, fp=fp,
+                              stream=want_stream,
+                              client_headers=getattr(self, "headers", None))
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
+                         proxy_slot=getattr(exc, "proxy_slot", None),
+                         proxy_exit=getattr(exc, "proxy_exit", None),
                          key=self._key_id())
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
-            if message.startswith("no usable account"):
-                # Only a genuinely empty/cooling pool is a 503. A throttled model
-                # is reported as 429 by _rate_limited above instead.
-                return self._error(503, message +
-                                   " - add or enable one at the dashboard (/)")
-            return self._error(502, f"upstream unreachable: {exc}")
+            # Only a genuinely empty/cooling pool is a 503. A throttled model
+            # is reported as 429 by _rate_limited above instead.
+            return upstream_failure_response(self, model, exc, t_start,
+                                             self._key_id())
         with upstream:
             def reopen_stream():
                 # Same account, same egress: only the TCP connection is new.
@@ -22641,8 +26875,119 @@ class Handler(BaseHTTPRequestHandler):
             return self._chat_nonstream_response(
                 upstream, model, fp, account, t_start, effort=effort)
 
+    def _open_codearts_chat(self, payload, session_key):
+        """选号并打开 CodeArts 的 SSE 上游；返回 (stream, account, model)。"""
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            # 本地配置问题，按 400 回：502 会让人以为上游坏了。
+            raise wb_codearts.CodeArtsBadRequest(
+                "CodeArts 出口未启用：请到设置页打开「启用 CodeArts 出口」。")
+        body = wb_codearts.build_chat_body(payload, session_key)
+        stream, account, model = wb_codearts.open_chat(
+            cfg, body, session_key, allowed_accounts=self._key_allowed_accounts())
+        return stream, account, model
+
+    def _codearts_error(self, model, exc, t_start, realm):
+        """把 CodeArts 异常落一条用量行，再回一个可读的 OpenAI 错误。"""
+        elapsed = int((time.time() - t_start) * 1000)
+        err_type = "invalid_request_error"
+        if isinstance(exc, wb_codearts.CodeArtsBadRequest):
+            status = 400
+        elif isinstance(exc, wb_codearts.CodeArtsAuthError):
+            status = 502
+        elif isinstance(exc, wb_codearts.CodeArtsNotFound):
+            status = 409
+        elif isinstance(exc, wb_codearts.CodeArtsConflict):
+            status = 409
+        elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
+            status, err_type = 429, "rate_limit_error"
+        else:
+            status = 502
+        record_error(model, status, str(exc)[:200], elapsed_ms=elapsed,
+                     realm=realm, key=self._key_id())
+        return self._error(status, str(exc), err_type)
+
+    def _handle_codearts_chat(self, payload, session_key, realm):
+        """`/v1/chat/completions` 的 CodeArts 分支。"""
+        model = payload.get("model") or "glm-5.2"
+        want_stream = bool(payload.get("stream"))
+        t_start = time.time()
+        fp = prompt_fingerprint(payload.get("messages"))
+        try:
+            upstream, account, billed_model = self._open_codearts_chat(
+                payload, session_key)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_error(model, exc, t_start, realm)
+        log("codearts chat: model=%s stream=%s msgs=%d key=%s"
+            % (billed_model or model, want_stream,
+               len(payload.get("messages") or []),
+               key_label(self._key_id()) or "-"))
+        with upstream:
+            if want_stream:
+                return self._chat_stream_response(
+                    upstream, model, fp, account, t_start, realm=realm)
+            return self._chat_nonstream_response(
+                upstream, model, fp, account, t_start, realm=realm)
+
+    def _handle_codearts_responses(self, chat_req, session_key, model, want_stream,
+                                   compaction, custom_names, request_meta, ns_map,
+                                   fp, t_start):
+        """`/v1/responses` 的 CodeArts 分支。"""
+        try:
+            upstream, account, effort = self._open_codearts_chat(
+                chat_req, session_key)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_error(model, exc, t_start, "codearts")
+        with upstream:
+            if compaction:
+                return self._responses_compaction_response(
+                    upstream, model, fp, account, t_start, want_stream,
+                    session_key=session_key, realm="codearts")
+            if want_stream:
+                return self._responses_stream_response(
+                    upstream, model, custom_names, request_meta, fp, account,
+                    t_start, ns_map, base_body=chat_req, session_key=session_key,
+                    realm="codearts", effort=effort)
+            return self._responses_nonstream_response(
+                upstream, model, custom_names, request_meta, fp, account,
+                t_start, ns_map, base_body=chat_req, session_key=session_key,
+                realm="codearts", effort=effort, allow_web_tools=False)
+
+    def _codearts_anthropic_error(self, model, exc, t_start, realm):
+        if isinstance(exc, wb_codearts.CodeArtsBadRequest):
+            status, etype = 400, "invalid_request_error"
+        elif isinstance(exc, (wb_codearts.CodeArtsNotFound,
+                              wb_codearts.CodeArtsConflict)):
+            status, etype = 409, "invalid_request_error"
+        elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
+            status, etype = 429, "rate_limit_error"
+        else:
+            status, etype = 502, "api_error"
+        record_error(model, status, str(exc)[:200],
+                     elapsed_ms=int((time.time() - t_start) * 1000),
+                     realm=realm, key=self._key_id())
+        return self._anthropic_error(status, str(exc), etype)
+
+    def _handle_codearts_messages(self, chat_req, session_key, model, want_stream,
+                                  fp, t_start):
+        """Anthropic Messages 的 CodeArts 分支。"""
+        try:
+            upstream, account, effort = self._open_codearts_chat(
+                chat_req, session_key)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_anthropic_error(model, exc, t_start, "codearts")
+        with upstream:
+            if want_stream:
+                return self._messages_stream_response(
+                    upstream, model, fp, account, t_start, base_body=chat_req,
+                    session_key=session_key, realm="codearts", effort=effort)
+            return self._messages_nonstream_response(
+                upstream, model, fp, account, t_start, base_body=chat_req,
+                session_key=session_key, realm="codearts", effort=effort)
+
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
-                              reopen=None, headers_sent=False, retried=False):
+                              reopen=None, headers_sent=False, retried=False,
+                              realm=None):
             if not headers_sent:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -22678,7 +27023,8 @@ class Handler(BaseHTTPRequestHandler):
             egress_key = None
             if egress_on:
                 egress_key = wb_upstream_pool.egress_key(
-                    account.chat_base_url() + CHAT_PATH, account.proxy)
+                    account.chat_base_url() + getattr(account, "chat_path", CHAT_PATH),
+                account.proxy)
 
             def flush_out():
                 if out_buf:
@@ -22710,7 +27056,11 @@ class Handler(BaseHTTPRequestHandler):
                 with heartbeat:
                     for line in iter_sse_lines(upstream, before_read=before_read):
                         data = strip_data_prefix(line.decode("utf-8", "replace"))
-                        if not data or data == "[DONE]" or data.startswith(":"):
+                        if data == "[DONE]":
+                            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                                break
+                            continue
+                        if not data or data.startswith(":"):
                             continue
                         maybe = None
                         try:
@@ -22758,6 +27108,11 @@ class Handler(BaseHTTPRequestHandler):
                         # though both halves arrived. Normalise before emitting.
                         if isinstance(maybe, dict) and maybe.get("id"):
                             maybe["id"] = stream_chunk_id
+                        # The upstream may echo its outbound alias (-sg). The
+                        # client asked for the logical id, and model-scoped
+                        # chunk helpers below must use that same id too.
+                        if isinstance(maybe, dict) and maybe.get("model"):
+                            maybe["model"] = model
                         cleaned = clean_chunk(
                             json.dumps(maybe, ensure_ascii=False)
                             if isinstance(maybe, dict) else data)
@@ -22784,8 +27139,8 @@ class Handler(BaseHTTPRequestHandler):
                 record_upstream_usage(upstream, model, last_usage, stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid,
-                             outcome="client_aborted", key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                             fp=fp, account=account.uid, realm=realm,
+                             outcome="client_aborted", key=self._key_id(), effort=effort)
                 return
             except Exception as exc:
                 # Upstream quit mid-stream (timeout, incomplete read, ...).
@@ -22813,7 +27168,7 @@ class Handler(BaseHTTPRequestHandler):
                             return self._chat_stream_response(
                                 new_upstream, model, fp, new_account, t_start,
                                 effort=new_effort, reopen=None,
-                                headers_sent=True, retried=True)
+                                headers_sent=True, retried=True, realm=realm)
                         finally:
                             try:
                                 new_upstream.close()
@@ -22824,7 +27179,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, account=account.uid,
                              usage=last_usage, stream=True, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, outcome="upstream_aborted", key=self._key_id())
+                             fp=fp, outcome="upstream_aborted", realm=realm,
+                             key=self._key_id())
                 try:
                     release(leak_filter.flush())
                     if out_buf:
@@ -22858,28 +27214,36 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, account=account.uid,
                              usage=last_usage, stream=True, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, outcome="failed", key=self._key_id())
+                             fp=fp, outcome="failed", realm=realm, key=self._key_id())
             else:
                 record_upstream_usage(upstream, model, last_usage, stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid, key=self._key_id(), effort=effort, realm_reason=getattr(self, "realm_reason", None))
+                             fp=fp, account=account.uid, realm=realm,
+                             key=self._key_id(), effort=effort)
             return
 
-    def _chat_nonstream_response(self, upstream, model, fp, account, t_start, effort=None):
+    def _chat_nonstream_response(self, upstream, model, fp, account, t_start, effort=None,
+                                 realm=None):
         egress_on = wb_settings.egress_backoff_enabled(ACCOUNTS_DIR)
         egress_key = None
         if egress_on:
             egress_key = wb_upstream_pool.egress_key(
-                account.chat_base_url() + CHAT_PATH, account.proxy)
+                account.chat_base_url() + getattr(account, "chat_path", CHAT_PATH),
+                account.proxy)
         try:
             result = aggregate_stream(upstream, model, None)
         except Exception as exc:
             if egress_on and egress_key:
                 wb_egress.note_transient(egress_key)
             record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=account.uid, key=self._key_id())
+                         account=account.uid, realm=realm, key=self._key_id())
             return self._error(502, f"upstream stream error: {exc}")
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
         if egress_on and egress_key:
             wb_egress.note_success(egress_key)
         wall = int((time.time() - t_start) * 1000)
@@ -22889,7 +27253,8 @@ class Handler(BaseHTTPRequestHandler):
         record_upstream_usage(upstream, model, result.get("usage"), stream=False,
                      elapsed_ms=wall, ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort)
+                     fp=fp, account=account.uid, realm=realm,
+                     key=self._key_id(), effort=effort)
         return self._json(200, result)
 
 # ---------------------------------------------------------------------------
@@ -23017,18 +27382,89 @@ def _apply_cli_overrides(args):
     # 的第一轮巡检不能落在 --usage-dir 生效之前，否则记录会写进默认目录。
     wb_activity.set_data_dir(USAGE_DIR)
 
+class _SilentListener(Exception):
+    """A port that accepts TCP connections but never answers HTTP.
+
+    A stuck instance holds the port exactly like a healthy one: the kernel
+    completes the handshake (the listen backlog) but no thread ever writes a
+    reply. Reading that timeout as "nothing here, the port is free" let the
+    launcher start yet another copy on top of it, and on Windows -
+    SO_REUSEADDR - both sockets then keep LISTENING while the kernel hands
+    every new connection to the stuck one. The dashboard and the log viewer
+    just hang.
+    """
+
+
+def _probe_health(host, port, timeout=2.0):
+    """GET /health and return its JSON, or None when nothing answers HTTP.
+
+    Raises _SilentListener when the port accepts the connection but says
+    nothing (see above). Plain sockets, not urllib: a loopback probe must not
+    be routed through a proxy set in the environment.
+    """
+    try:
+        conn = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None  # nothing listening - let the bind below decide
+    raw = b""
+    try:
+        conn.settimeout(timeout)
+        conn.sendall(("GET /health HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                      "Connection: close\r\n\r\n" % port).encode("ascii"))
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except (socket.timeout, TimeoutError):
+                if not raw:
+                    raise _SilentListener()
+                break
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 1 << 20:
+                break
+    except _SilentListener:
+        raise
+    except OSError:
+        # The successful TCP connection proves something owns the port.
+        return {"service": "an unknown TCP service"}
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+    if not raw:
+        raise _SilentListener()  # accepted, then hung up without a word
+    if b" 200 " not in raw.split(b"\r\n", 1)[0]:
+        return {"service": "an unknown HTTP service"}
+    body = raw.partition(b"\r\n\r\n")[2]
+    try:
+        result = json.loads(body.decode("utf-8"))
+        return result if isinstance(result, dict) else {"service": "an unknown HTTP service"}
+    except (UnicodeDecodeError, ValueError):
+        return {"service": "an unknown HTTP service"}
+
+
 def _probe_running_instance(args):
     # Refuse to start a second copy. On Windows SO_REUSEADDR lets two sockets
     # bind the same port, which silently splits incoming connections between
     # them - confusing and hard to diagnose.
+    host = args.host if args.host != "0.0.0.0" else "127.0.0.1"
     try:
-        probe = urllib.request.urlopen(
-            f"http://{args.host if args.host != '0.0.0.0' else '127.0.0.1'}:{args.port}/health",
-            timeout=2,
-        )
-        existing = json.loads(probe.read().decode("utf-8"))
-    except Exception:
-        existing = None  # nothing answering /health - let the bind below decide
+        existing = _probe_health(host, args.port)
+    except _SilentListener:
+        print()
+        print(f"  [ERROR] port {args.port} accepts connections but answers nothing:")
+        print("          a stuck wb-proxy (or another silent program) is holding it.")
+        print("          wb-proxy itself did NOT start - a second copy would only")
+        print("          split the port and leave every request hanging.")
+        print()
+        print("  Fix: stop whatever holds the port, then start again.")
+        print("          %s   (shows the PID)" % port_owner_hint(args.port))
+        print("          %s   (stops every wb-proxy on this machine)"
+              % restart_hint())
+        print()
+        raise SystemExit(1)
     if isinstance(existing, dict):
         # Only OUR /health carries the account-pool fields ("accounts"). Other
         # services can occupy the same port and also answer /health with JSON
@@ -23088,19 +27524,34 @@ def _bootstrap_runtime(args):
     if key_from_panel and not args.api_key:
         API_KEY = saved_key
         API_KEY_FILE_SET = True
+    crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
+    if not crypto_ok:
+        log("WARN: Python 解释器缺少 hashlib.pbkdf2_hmac 支持 (%s)" % crypto_reason)
+        log("WARN: 若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd")
+        if not wb_settings.panel_password_is_default(ACCOUNTS_DIR):
+            log("WARN: 已检测到非默认面板密码，当前环境下将无法登录面板！")
     if args.panel_password:
-        wb_settings.set_panel_password(ACCOUNTS_DIR, args.panel_password)
-        log("panel      : password set from --panel-password")
+        try:
+            wb_settings.set_panel_password(ACCOUNTS_DIR, args.panel_password)
+            log("panel      : password set from --panel-password")
+        except wb_settings.PanelPasswordCryptoError as exc:
+            log("panel      : failed to set password from --panel-password: %s" % exc)
+            raise SystemExit("Cannot start: the requested panel password could not be set.") from exc
     elif wb_settings.panel_password_is_default(ACCOUNTS_DIR):
         log("panel      : password is still the default 'admin' - change it in the panel")
+    # 实测单价账本：读回来才能让"付得起吗"用真实价格判断，而不是每次都从
+    # 26 积分/秒的上界起算。
+    load_media_prices()
+    backfill_media_prices()
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
-    POOL.apply_reserve_credits()
+    _bind_pools()
+    apply_reserve_credits()
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.
-    resize_chat_slots(POOL.count_ready())
+    resize_chat_slots(TEXTS.count_ready() if TEXTS else 0)
     apply_daily_guards()
     load_persisted_realm()
     global SCHEDULER
@@ -23173,7 +27624,14 @@ def _report_first_run(args):
 
 def _log_startup_summary(args, api_key_generated):
     rep = current_account()
-    log("accounts   : %d total, %d usable" % (len(POOL.accounts), POOL.count_ready()))
+    texts, medias = _ensure_pools()
+    text_total = len(texts.accounts()) if texts else 0
+    media_total = len(medias.accounts()) if medias else 0
+    text_ready = texts.count_ready() if texts else 0
+    media_ready = medias.count_ready() if medias else 0
+    log("accounts   : %d total (文本号池 %d/%d, 媒体号池 %d/%d)"
+        % (len(POOL.accounts), text_ready, text_total,
+           media_ready, media_total))
     for account in POOL.accounts:
         log("  - %s  %s  %s  %s" % (account.uid[:8], account.nickname or "(no name)",
                                     account.domain, wb_accounts._human_delta(
@@ -23315,7 +27773,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     main()
-# >>> hub-patch: atomic-state-write
+# >>> hub-patch: atomic-state-write（同步后按末尾追加方式重贴）
 # realm 状态改成 tmp + os.replace（写一半断电会留截断 JSON）。
 def _save_persisted_realm_atomic(realm):
     global CURRENT_REALM
@@ -23334,7 +27792,7 @@ def _save_persisted_realm_atomic(realm):
     return CURRENT_REALM
 save_persisted_realm = _save_persisted_realm_atomic
 # <<< hub-patch: atomic-state-write
-# >>> hub-patch: settings-save-errors
+# >>> hub-patch: settings-save-errors（同步后按末尾追加方式重贴）
 # 写盘失败不能让异常逃出 handler —— 否则连接被关，客户端读成「引擎不可达」。
 _hub_orig_handle_settings_save = Handler._handle_settings_save
 def _hub_safe_handle_settings_save(self):
@@ -23346,7 +27804,7 @@ def _hub_safe_handle_settings_save(self):
         return self._error(500, 'settings save failed: %r' % exc, 'write_failed')
 Handler._handle_settings_save = _hub_safe_handle_settings_save
 # <<< hub-patch: settings-save-errors
-# >>> hub-patch: account-write-errors
+# >>> hub-patch: account-write-errors（同步后按末尾追加方式重贴）
 # 账号写盘不在 do_POST 的 try 块内 —— 写失败会把连接关掉。
 _hub_orig_handle_accounts = Handler._handle_accounts
 def _hub_safe_handle_accounts(self, path, payload):
@@ -23356,7 +27814,7 @@ def _hub_safe_handle_accounts(self, path, payload):
         return self._error(500, 'account write not saved: %s' % exc, 'write_failed')
 Handler._handle_accounts = _hub_safe_handle_accounts
 # <<< hub-patch: account-write-errors
-# >>> hub-patch: pricing-write-errors
+# >>> hub-patch: pricing-write-errors（同步后按末尾追加方式重贴）
 # 定价映射 / 刷新的写盘同样不在 try 块内。
 _hub_orig_pricing_mapping = Handler._route_pricing_mapping
 _hub_orig_pricing_refresh = Handler._route_pricing_refresh

@@ -77,6 +77,10 @@ class _UnifiedLog(object):
     #: 打出来只会让"一个产品一个入口"这句话自相矛盾。HUB_LOG_VERBOSE=1 可放出来。
     _NOISE_RE = None
 
+    _REPEAT_RE = None
+    _repeat_seen = {}
+    _REPEAT_WINDOW = 1800.0
+
     def _is_noise(self, text):
         import re as _re
         if _UnifiedLog._NOISE_RE is None:
@@ -84,6 +88,30 @@ class _UnifiedLog(object):
             _UnifiedLog._NOISE_RE = _re.compile(
                 r"^(?:\S+\s+)?(listening|dashboard)\s*:\s*http://\S+:\d+")
         return bool(_UnifiedLog._NOISE_RE.match(text))
+
+    def _suppress_repeat(self, line):
+        """同类噪声行按窗口只留一条（True = 这次丢掉）。"""
+        import re as _re
+        import time as _time
+        if _UnifiedLog._REPEAT_RE is None:
+            _UnifiedLog._REPEAT_RE = _re.compile(
+                r"remote catalog: no usable intl account"
+                r"|machine identity cache: reusing cached identity"
+                r"|bundled table fills in reasoning controls")
+        hit = _UnifiedLog._REPEAT_RE.search(line)
+        if not hit:
+            return False
+        key = hit.group(0)
+        now = _time.time()
+        last, count = _UnifiedLog._repeat_seen.get(key, (0.0, 0))
+        if now - last < _UnifiedLog._REPEAT_WINDOW:
+            _UnifiedLog._repeat_seen[key] = (last, count + 1)
+            return True
+        if count:
+            self._stream.write("[%s] （同类提示已省略 %d 次 / 30 分钟）\n"
+                               % (self._brand, count))
+        _UnifiedLog._repeat_seen[key] = (now, 0)
+        return False
 
     def write(self, text):
         import os as _os
@@ -96,6 +124,8 @@ class _UnifiedLog(object):
                 self._stream.write(self._rewrite(line) + "\n")
                 continue
             if self._is_noise(line):
+                continue
+            if self._suppress_repeat(line):
                 continue
             # trae 的空账号方框：里面写着"打开 8813 点 OAuth"，与单入口矛盾。
             if "NO ACCOUNTS YET" in line:

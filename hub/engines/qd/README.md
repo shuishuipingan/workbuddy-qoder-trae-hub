@@ -70,7 +70,7 @@ curl http://127.0.0.1:8790/v1/chat/completions \
   -d '{"model": "Qwen3.8-Flash", "messages": [{"role": "user", "content": "你好"}]}'
 ```
 
-Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配置」页一键写入配置，写入前会自动备份，随时可还原。详见[客户端接入](docs/clients.md)。
+看板「智能体配置」覆盖 **31 个热门客户端 / Harness**，其中 **13 类支持自动配置与还原**：Claude Code、Codex CLI、OpenCode、DSH、Crush、Aider、Continue、Pi、Factory Droid、GitHub Copilot CLI、OpenHands CLI、Kilo CLI、Mistral Vibe。其他客户端按实际能力提供安装检测和手动接入指引；API 示例和客户端模板只使用 `YOUR_API_KEY`。详见[客户端接入](docs/clients.md)。
 
 ## 文档
 
@@ -88,6 +88,16 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 | [实现原理](docs/internals.md) | 请求链路、设备指纹、容错重试、工具调用回读 |
 | [开发与测试](docs/development.md) | 模块结构、测试、维护脚本 |
 | [更新日志](CHANGELOG.md) | 各版本变更 |
+
+## 🔗 相关：多平台合集面板
+
+如果你同时在用别的 AI 编程平台账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **Qoder**（每日额度按账号轮转领取、凭证自动续期），另外还统管 **WorkBuddy / CodeBuddy / Trae / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
+
+---
 
 ## 致谢
 

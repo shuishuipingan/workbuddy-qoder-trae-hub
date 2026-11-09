@@ -1,180 +1,113 @@
-<div align="center">
+<h1 align="center">Qoder2API-Hub</h1>
 
-# WorkBuddy × Qoder × Trae-hub
+<p align="center">
+  把 Qoder 国内版（qoder.com.cn）与国际版（qoder.com）封装成 OpenAI / Anthropic 兼容接口的多账号网关
+</p>
 
-**把三套 AI 客户端登录态，合成为一个本地 OpenAI / Anthropic 兼容网关**
+<p align="center">
+  <a href="https://github.com/shuishuipingan/qoder2api-hub/releases"><img src="https://img.shields.io/github/v/release/shuishuipingan/qoder2api-hub?style=flat-square" alt="Release"></a>
+  <a href="https://github.com/shuishuipingan/qoder2api-hub/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/shuishuipingan/qoder2api-hub/tests.yml?branch=main&style=flat-square&label=tests" alt="Tests"></a>
+  <img src="https://img.shields.io/badge/Python-3.9+-blue?style=flat-square" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/dependencies-zero-ff69b4?style=flat-square" alt="Zero dependencies">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT"></a>
+</p>
 
-[![release](https://img.shields.io/github/v/release/shuishuipingan/workbuddy-qoder-trae-hub?style=flat-square&color=orange)](https://github.com/shuishuipingan/workbuddy-qoder-trae-hub/releases)
-[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
-[![python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![docker](https://img.shields.io/badge/ghcr.io-available-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/shuishuipingan/workbuddy-qoder-trae-hub/pkgs/container/workbuddy-qoder-trae-hub)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Docker-lightgrey?style=flat-square)](#-快速开始)
+![网关总览](docs/img/dashboard.png)
 
-**一把 Key 调三家 · 一个面板管全部 · 一个端口对外**
+## 特性
 
-</div>
-
----
-
-## 这是什么
-
-`WorkBuddy`、`Qoder`、`Trae` 三家的客户端各自带一套反代网关，各管各的账号、各开各的端口、各有一套看板。
-同时用三家的时候，你得开三个窗口、记三套地址、把同一个客户端配置三遍 —— 而且一个账号挂了，客户端只会报错，不会自己换到另一家。
-
-本仓库把这三套**原样收进 `hub/engines/`**（一行未改，只在固定的 `hub-patch` 标记块里补了错误处理与提示），
-在它们上面加了一层**融合层 `hub/`**，把「三家」对外收敛成「一家」：
-
-| 收敛到什么 | 具体是什么 |
-|---|---|
-| **一个进程** | 三家引擎在同一个 Python 进程里跑，模块名前缀天然隔离（`wb_*` / `qoder_*` / `trae_*`），互不污染 |
-| **一个端口** | 只有 `8817` 对外；三家引擎的端口仅监听 `127.0.0.1`，外部连不上 |
-| **一把 Key** | 合并 Key 按「模型在谁家、哪个区可用」自动选路；`401/429/502/503/504` 自动换下一家，客户端无感 |
-| **一个面板** | 账号池、模型清单、数据指标、请求流水、网关 Key、福利中心、设置在同一个 React 看板里 |
-| **一套协议** | 对外统一 OpenAI Chat / Responses 与 Anthropic Messages（含 SSE 流式），客户端填同一个 `base_url` |
-
-**能接什么客户端**：Codex、Claude Code、Cherry Studio、ChatBox、LobeChat、NextChat、任何支持自定义 `base_url` 的 OpenAI 兼容客户端，
-以及 Anthropic 协议的客户端（走 `/v1/messages`，`x-api-key` 与 `Authorization` 都认）。
-
-**升级不会丢数据**：账号、用量、日志、面板设置全部落在本地，一键更新只覆盖代码路径。
-
-## 架构
-
-```mermaid
-flowchart LR
-    C[OpenAI / Anthropic 客户端<br/>Codex · Claude Code · Cherry Studio] -->|:8817 /v1| P
-
-    subgraph P[门户 portal · 单端口]
-      direction TB
-      R[合并路由<br/>模型 → 引擎/区域]
-      H[/api/hub/*<br/>聚合与看板/]
-      S[静态面板 admin/]
-    end
-
-    P -->|内部回环| W[wb 引擎 :8811<br/>WorkBuddy]
-    P -->|内部回环| Q[qd 引擎 :8812<br/>Qoder]
-    P -->|内部回环| T[trae 引擎 :8813<br/>Trae]
-
-    W --> WU[(账号池 / 用量)]
-    Q --> QU[(账号池 / 用量)]
-    T --> TU[(账号池 / 用量)]
-```
-
-**请求路径**：客户端 → 门户（鉴权 + 选路）→ 引擎（选号 + 上游协议）→ 上游。
-**看板路径**：浏览器 → 门户 `/api/hub/*`（一次拿三家）→ 引擎 `/usage`、`/accounts`。
-
-## 功能
-
-### 网关
-
-- **合并 Key**：一把 Key 调三家；按模型可用性选引擎与区域，`401/429/502/503/504` 自动换下一家
-- **Key 作用域**：每把合并 Key 可限制「只用哪些模型」「只用哪些引擎」，越权返回 `403 model_not_allowed` / `503 engine_not_allowed`
-- **协议**：`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（Anthropic，含 `x-api-key`）、`/v1/models`
-- **流式**：SSE 边收边发；已向客户端写出字节后**绝不重发**（避免同一个回答来两遍）
-- **别名**：`/v1/*` 与 `/api/v1/*` 等价，客户端填哪个都行
-
-### 面板
-
-| 页面 | 内容 |
-|---|---|
-| 总览 | 三家健康、合并 Key 数、路由统计、自检 |
-| 账号池 | 三家账号统一列表：签到状态、积分（含增减）、出口区域、启停、测试、导入、批量签到 |
-| 模型清单 | 三家模型合并去重，标出可用性 |
-| 数据指标 | 区间切换（今天/7 天/30 天/本月/全部/自定义）+ 6 项 KPI + Top 账号/模型/提供商 + 活跃热力图 + 缓存命中率 + 趋势图 |
-| 请求流水 | 三家日志合并、按级别/引擎过滤、详情与复制 |
-| 网关 Key | 引擎 Key 与合并 Key 的管理（含作用域、一键测试） |
-| 福利中心 | 每日签到、Token 保活、权益刷新 |
-| 设置 | 限额四护栏、面板密码、代理槽位、定价、高级设置（引擎全部开关）、**版本与更新** |
-
-### 运维
-
-- **一键更新**：面板里检查 GitHub Release → 立即更新（只覆盖代码，**账号/用量/设置一律不动**）→ 自动重启
-- **同步上游**：`python hub/tools/sync_upstream.py --wb --qd --trae`，带逐字节校验
-- **发布闸门**：`python hub/tools/release_check.py`（前端 75 项 + hub 324 项判据 + 上游一致性 + 重启不丢数据 + 写失败可诊断）
+- **三种协议**：OpenAI Chat Completions、Responses API（Codex）、Anthropic Messages（Claude Code）
+- **双区多账号**：国内版 / 国际版独立账号池与出口，按模型自动选区；账号轮询、会话亲和、故障冷却换号
+- **免客户端登录**：OAuth 设备授权、PAT 导入，或直接导入本机官方客户端已登录的凭证
+- **模型与官方同源**：动态拉取官方清单，含峰谷价、上下文窗口、思考档位和禁用原因
+- **签到与保活**：自动领取每日 Credits 活动，定时刷新 Token
+- **防风控**：出站身份形态对齐官方客户端，可选的单号并发闸门与请求节奏控制，`/health` 提供排队 / 限流 / 拒绝信号遥测
+- **Web 看板**：账号、用量与性能指标、请求流水、限额护栏、智能体一键配置
+- **零依赖**：只用 Python 标准库（COSY 签名、AES / RSA 都是纯 Python 实现），另提供 amd64 / arm64 Docker 镜像
 
 ## 快速开始
 
-### Windows
-
-```bat
-:: 双击
-WorkBuddy x Qoder x Trea-hub.bat
-```
-
-首次启动会自己建目录、起三家引擎、打印入口地址与合并 Key。浏览器打开 <http://127.0.0.1:8817>，面板密码默认 `admin`（登录后请立刻改）。
-
-### Linux / macOS
+需要 Python 3.9+ 或 Docker。先获取代码：
 
 ```bash
-./start-hub.sh          # 前台
-./start-hub-lan.sh      # 允许局域网访问（会强制要 Key）
+git clone https://github.com/shuishuipingan/qoder2api-hub.git
+cd qoder2api-hub
 ```
 
-### Docker
+然后选一种方式启动：
 
-```bash
-docker run -d --name wqt-hub \
-  -p 18791:8817 \
-  -v "$PWD/data:/app/data" \
-  ghcr.io/shuishuipingan/workbuddy-qoder-trae-hub:latest
-# 宿主机 18791 → 容器门户 8817；另外 18789/18790/18792 是三家引擎（调试时才用）
-```
-
-或 `docker compose up -d`（见仓库内 `docker-compose.yml`）。
-
-### 客户端怎么填
-
-```
-Base URL : http://127.0.0.1:8817/v1
-API Key  : 面板「网关 Key」里那把合并 Key（mrg-…）
-Model    : auto，或任意一家模型的名字
-```
-
-## 目录结构
-
-```
-hub/
-  __init__.py          版本与引擎注册表（唯一真源）
-  server.py            单进程编排：起三家引擎 + 门户
-  core/
-    portal.py          单端口门户：路由、鉴权、SSE 透传、聚合 API
-    router.py          合并路由：模型 → 引擎/区域，快照与冷却
-    aggregator.py      读端聚合：/api/hub/*
-    settings.py keys.py paths.py
-    updater.py         版本检查与一键更新（只覆盖代码，不动数据）
-  engines/{wb,qd,trae}/ 三家引擎（原样收编，只留 hub-patch 标记块）
-  tools/               同步、校验、发布闸门、面板部署
-  tests/               23 个套件 / 324 条判据
-admin/                 React 19 + Vite 面板（static/ 是构建产物，可直接跑）
-docs/merge/            融合工程笔记（设计、接口样本、验收矩阵）
-```
-
-## 与上游的关系
-
-本仓库是**融合层**，三家引擎的著作权归各自上游项目所有，按原许可证使用：
-
-| 引擎 | 上游 | 说明 |
+| 平台 | 启动 | 停止 |
 |---|---|---|
-| WorkBuddy | `ardeyouxipianyi/workbuddy2api-hub` | 原样收录，补错误处理块 |
-| Qoder | `shuishuipingan/qoder2api-hub` | 同上 |
-| Trae | `trae2api-hub` | 同上 |
+| Windows | 双击 `start-qoder-proxy.bat`（后台运行，日志写入 `qoder-proxy.log`） | `stop-qoder-proxy.bat` |
+| Linux / macOS | `chmod +x *.sh && ./start-qoder-proxy.sh`（前台运行；会写 `qoder-proxy.pid`） | `Ctrl+C`，常驻时用 `./stop-qoder-proxy.sh` |
+| Docker | `docker compose up -d` | `docker compose down` |
 
-融合层（`hub/`、`admin/`、`docs/`）以 MIT 发布，见 [LICENSE](./LICENSE)。
+启动后：
 
-## 数据与隐私
+- **API**：`http://127.0.0.1:8790/v1`
+- **看板**：`http://127.0.0.1:8790/`，默认密码 `admin`，首次登录后请到「设置」修改
 
-- **账号、用量、日志、面板设置全部落在本地**，仓库里不含任何真实账号、Key 或用量数据
-- `.gitignore` 硬性排除 `accounts/`、`usage/`、`logs/`、`state/`、`hub/settings.json`
-- 面板密码默认 `admin`，**局域网模式下强制要求 Key**，首次启动自动生成并持久化
-- 一键更新只覆盖代码路径，数据路径在 `updater.PROTECTED` 里写死跳过
+在看板「账号」页点 **+ 添加账号 (OAuth)**，到浏览器里完成授权，账号就加好了。
+
+> Docker 以局域网模式启动，会强制使用 API Key。首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看。
+> 局域网共享、改端口、出口代理见[部署](docs/deployment.md)。
+
+## 接入客户端
+
+| 客户端 | Base URL | 协议 |
+|---|---|---|
+| OpenAI 兼容客户端（Cherry Studio、Chatbox、NextChat 等） | `http://127.0.0.1:8790/v1` | Chat Completions |
+| Codex CLI | `http://127.0.0.1:8790/v1` | Responses API |
+| Claude Code | `http://127.0.0.1:8790`（不带 `/v1`） | Anthropic Messages |
+
+- **模型名**：填 `/v1/models` 返回的 `id`，也就是官方模型名，例如 `Qwen3.8-Max`
+- **API Key**：在看板「设置」中生成。本机运行且没有配置任何 Key 时，可以留空
+
+```bash
+curl http://127.0.0.1:8790/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3.8-Flash", "messages": [{"role": "user", "content": "你好"}]}'
+```
+
+看板「智能体配置」覆盖 **31 个热门客户端 / Harness**，其中 **13 类支持自动配置与还原**：Claude Code、Codex CLI、OpenCode、DSH、Crush、Aider、Continue、Pi、Factory Droid、GitHub Copilot CLI、OpenHands CLI、Kilo CLI、Mistral Vibe。其他客户端按实际能力提供安装检测和手动接入指引；API 示例和客户端模板只使用 `YOUR_API_KEY`。详见[客户端接入](docs/clients.md)。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [部署](docs/deployment.md) | 本机 / 局域网 / Docker 部署、防火墙、出口代理、升级 |
+| [配置参考](docs/configuration.md) | 命令行参数、环境变量、API Key、模型闸门、限额护栏 |
+| [账号与签到](docs/accounts.md) | 添加账号、凭证生命周期、签到与活动规则、定时调度 |
+| [客户端接入](docs/clients.md) | 各协议的接入方式、智能体一键配置 |
+| [模型](docs/models.md) | 模型来源、命名、双区路由、峰谷价、思考档位 |
+| [接口参考](docs/api.md) | HTTP 端点与鉴权方式 |
+| [故障排查](docs/troubleshooting.md) | 常见问题、诊断脚本、已知限制 |
+| [风控与排队](docs/risk-control-and-queueing.md) | 上游的风控维度与处置等级、多账号为什么仍会排队、官方客户端逆向结论 |
+| [风控处置手册](docs/risk-control-playbook.md) | 出口 / 身份 / 调度 / 请求 / 观测各层的处置办法，容器与数据中心的落地方案 |
+| [实现原理](docs/internals.md) | 请求链路、设备指纹、容错重试、工具调用回读 |
+| [开发与测试](docs/development.md) | 模块结构、测试、维护脚本 |
+| [更新日志](CHANGELOG.md) | 各版本变更 |
+
+## 🔗 相关：多平台合集面板
+
+如果你同时在用别的 AI 编程平台账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **Qoder**（每日额度按账号轮转领取、凭证自动续期），另外还统管 **WorkBuddy / CodeBuddy / Trae / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
+
+---
 
 ## 致谢
 
-- 三家引擎的上游作者
-- 面板视觉与交互参考了 Linear / Vercel 的产品语言
-- 统计页版式参考了 Agent2API 的报表设计
+- [mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)：双区常量表、OAuth 设备授权与 PAT 交换、COSY 签名与自定义 Base64、签到与保活排程
+- [Liki4/qodercli2api](https://github.com/Liki4/qodercli2api)：OAuth 与推理协议的逆向记录（PKCE、deviceToken / jobToken、SSE 信封）
+- [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)：设备指纹派生（`derive_id`）、整点排程、DeepSeek 思维链回填
+- WorkBuddy2API-Hub：本项目架构、看板交互与功能矩阵的蓝本
 
-<div align="center">
+## 免责声明
 
-**如果这个项目帮你省了切换账号的时间，点个 ⭐ 就够了**
+本项目是非官方的自托管网关，仅供技术研究，以及个人在私有环境中使用自己合法授权的账号。本项目不提供任何账号或额度。请遵守 Qoder 官方服务条款，不得用于商业转售、恶意并发等滥用行为。
 
-</div>
+[MIT License](LICENSE)

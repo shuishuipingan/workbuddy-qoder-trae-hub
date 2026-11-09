@@ -82,6 +82,10 @@ def _prune(windows, now):
             continue
         if reset_at < now - MAX_AGE:
             continue
+        try:
+            cap_at = float(row.get("cap_at") or 0.0)
+        except (TypeError, ValueError):
+            cap_at = 0.0
         out[str(key)] = {
             "uid": uid,
             "model": model,
@@ -89,6 +93,10 @@ def _prune(windows, now):
             "attempts": int(row.get("attempts") or 0),
             "last_try": float(row.get("last_try") or 0),
             "last_result": str(row.get("last_result") or "")[:200],
+            # 「上游判定额度用满」的标记与撞线时刻：跟窗口一起落盘，重启后
+            # 仍然知道这条窗口是 6004 而不是一次临时 429（issue #668）。
+            "cap": bool(row.get("cap")),
+            "cap_at": cap_at,
         }
     return out
 
@@ -143,11 +151,16 @@ def _save(accounts_dir):
 
 # --------------------------------------------------------------- 对外接口
 
-def schedule(accounts_dir, uid, model, reset_at, now=None):
+def schedule(accounts_dir, uid, model, reset_at, now=None, cap=False, cap_at=0.0):
     """登记一个额度窗口，返回是否新增/更新了记录。
 
     同一个窗口的重复 429（一次限流会连着撞好几次）时间戳不变，这里直接返回
     False，避免每次 429 都重写一遍状态文件。
+
+    `cap` 记下"这条窗口是上游 6004 判定额度用满"，`cap_at` 是那一刻的墙钟。
+    两者跟窗口一起落盘，于是**任何模型**（不只免费模型）都能跨重启保住
+    "这是配额用尽、撞线于何时"这个事实——面板区分「配额耗尽」与「临时限流」
+    靠的就是它（issue #668）。
     """
     uid = str(uid or "")
     model = str(model or "")
@@ -158,6 +171,10 @@ def schedule(accounts_dir, uid, model, reset_at, now=None):
         return False
     if not uid or not model or not accounts_dir or reset_at <= now:
         return False
+    try:
+        cap_at = float(cap_at or 0.0)
+    except (TypeError, ValueError):
+        cap_at = 0.0
     if not wb_settings.window_probe(accounts_dir):
         return False
     with _lock:
@@ -165,6 +182,12 @@ def schedule(accounts_dir, uid, model, reset_at, now=None):
         key = _key(uid, model)
         row = windows.get(key)
         if row and abs(float(row.get("reset_at") or 0) - reset_at) < 1.0:
+            # 同一个窗口的重复 429：只补上缺失的"额度用满"标记，别重写整条。
+            if cap and not row.get("cap"):
+                row["cap"] = True
+                row["cap_at"] = cap_at or time.time()
+                _save(accounts_dir)
+                return True
             return False
         windows[key] = {
             "uid": uid,
@@ -173,6 +196,8 @@ def schedule(accounts_dir, uid, model, reset_at, now=None):
             "attempts": 0,
             "last_try": 0.0,
             "last_result": "",
+            "cap": bool(cap),
+            "cap_at": cap_at or (time.time() if cap else 0.0),
         }
         _save(accounts_dir)
         return True
@@ -225,6 +250,8 @@ def snapshot(accounts_dir=None, now=None):
             "reset_in": max(0, int(reset_at - now)),
             "attempts": int(row.get("attempts") or 0),
             "last_result": str(row.get("last_result") or ""),
+            "cap": bool(row.get("cap")),
+            "cap_at": float(row.get("cap_at") or 0.0),
         })
     return out
 
@@ -336,6 +363,7 @@ def _probe(account, model):
     """
     import wb_proxy  # 函数内导入：wb_proxy 顶层会拉起调度器，避免循环依赖
     url = account.chat_base_url() + wb_proxy.CHAT_PATH
+    model = wb_proxy.intl_model_alias(model, account.realm)
     headers = account.headers(purpose="chat")
     body = {
         "model": model,

@@ -43,6 +43,7 @@ const OverviewView = lazyWithReload(() => import('@/views/overview'));
 const AccountsView = lazyWithReload(() => import('@/views/accounts'));
 const ModelsView = lazyWithReload(() => import('@/views/models'));
 const MetricsView = lazyWithReload(() => import('@/views/metrics'));
+const RoutingView = lazyWithReload(() => import('@/views/routing'));
 const LogsView = lazyWithReload(() => import('@/views/logs'));
 const ApiView = lazyWithReload(() => import('@/views/api'));
 const SettingsView = lazyWithReload(() => import('@/views/settings'));
@@ -73,7 +74,8 @@ export default function Authenticated() {
               <Route path="/accounts" element={<AccountsView />} />
               <Route path="/models" element={<ModelsView />} />
               <Route path="/metrics" element={<MetricsView />} />
-              <Route path="/logs" element={<LogsView />} />
+              <Route path="/routing" element={<RoutingView />} />
+            <Route path="/logs" element={<LogsView />} />
               <Route path="/api" element={<ApiView />} />
               <Route path="/settings" element={<SettingsView />} />
             <Route path="/keys" element={<KeysView />} />

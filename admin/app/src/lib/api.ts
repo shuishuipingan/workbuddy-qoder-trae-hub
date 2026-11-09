@@ -595,3 +595,28 @@ export const hubUpdateApply = () =>
     API + "/hub/update/apply", {}, { timeoutMs: 120000 });
 export const hubRestart = () =>
   post<{ ok: boolean; restarting?: boolean; reason?: string }>(API + "/hub/update/restart", {}, { timeoutMs: 15000 });
+
+// ---------------------------------------------------------------- 路由编排
+
+export type RouteHop = { engine: string; realm: string };
+export type RouteRule = {
+  id: string; name: string; enabled: boolean; priority: number;
+  match: { models: string[]; realms: string[]; engines: string[] };
+  action: { chain: RouteHop[]; stop_on_miss: boolean };
+};
+export type RoutingDoc = {
+  rules: RouteRule[];
+  policy: { strategy: string; session_affinity: boolean; max_fallbacks: number };
+  revision: number;
+};
+export type RoutePreview = {
+  model: string; realm: string | null; matched_rule: string | null;
+  matched_name: string | null; rules_total: number;
+  hops: { engine: string; realm: string; ready: number; holds_model: boolean }[];
+};
+
+export const hubRouting = () => get<RoutingDoc>(API + "/hub/routing", { timeoutMs: 20000 });
+export const hubRoutingSave = (doc: RoutingDoc) =>
+  post<RoutingDoc>(API + "/hub/routing", doc, { timeoutMs: 20000 });
+export const hubRoutePreview = (model: string, realm?: string) =>
+  post<RoutePreview>(API + "/hub/routing/preview", { model, realm: realm || null }, { timeoutMs: 60000 });

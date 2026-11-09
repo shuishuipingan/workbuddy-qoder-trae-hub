@@ -1,6 +1,6 @@
-import { Activity, Boxes, Coins, KeyRound, LayoutDashboard, ScrollText, Settings, Users, Key } from 'lucide-react';
+import { Activity, Boxes, Coins, KeyRound, LayoutDashboard, ScrollText, Settings, Users, Key, Route } from 'lucide-react';
 
-export type RouteId = "overview" | "accounts" | "models" | "metrics" | "logs" | "api" | "keys" | "settings" | "rewards";
+export type RouteId = "overview" | "accounts" | "models" | "metrics" | "routing" | "logs" | "api" | "keys" | "settings" | "rewards";
 
 export type RouteMeta = {
   id: RouteId;
@@ -15,6 +15,7 @@ export const ROUTES: RouteMeta[] = [
   { id: "accounts", path: "/accounts", labelKey: "nav.accounts", icon: Users, group: "main" },
   { id: "models", path: "/models", labelKey: "nav.models", icon: Boxes, group: "main" },
   { id: "metrics", path: "/metrics", labelKey: "nav.metrics", icon: Activity, group: "main" },
+  { id: "routing", path: "/routing", labelKey: "nav.routing", icon: Route, group: "main" },
   { id: "logs", path: "/logs", labelKey: "nav.logs", icon: ScrollText, group: "ops" },
   { id: "api", path: "/api", labelKey: "nav.api", icon: KeyRound, group: "ops" },
   { id: "keys", path: "/keys", labelKey: "nav.keys", icon: Key, group: "config" },

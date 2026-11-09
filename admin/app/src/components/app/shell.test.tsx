@@ -52,7 +52,7 @@ describe('AuthGate', () => {
 });
 
 describe('AppShell', () => {
-  it('已登录后渲染 9 个导航项，并高亮当前页', async () => {
+  it('已登录后渲染 10 个导航项，并高亮当前页', async () => {
     sessionStorage.setItem("hub-panel-token", "tk");
     mockFetch((url) => {
       if (url.includes("/health")) return json({ ok: true });
@@ -61,7 +61,7 @@ describe('AppShell', () => {
     renderApp();
     await waitFor(() => expect(screen.getAllByRole("link").length).toBeGreaterThanOrEqual(9));
     const links = screen.getAllByRole("link");
-    expect(links.length).toBe(9);
+    expect(links.length).toBe(10);
   });
 
   // 回归守卫：切换轮次里 App.tsx 曾被简化成不含 ToastProvider，

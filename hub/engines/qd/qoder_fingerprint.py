@@ -120,6 +120,34 @@ _VM_DRIVER_FILES = (
 )
 
 
+
+_SBC_MARKERS = ("raspberry pi", "banana pi", "orange pi", "rock pi", "tinker board",
+                "odroid", "beaglebone", "nanopi", "radxa", "khadas")
+
+
+def _linux_sbc_model():
+    """读设备树 model，判断是不是单板计算机（issue #123）。
+
+    树莓派这类 SBC 在 ARM 上会暴露一些"像虚拟机"的特征（无 hypervisor 的
+    精简 /proc/cpuinfo、systemd-detect-virt 可能报 docker/none），此前的启发式
+    会把它们误判成 KVM。设备树里的型号名是权威且便宜的判据。
+    """
+    for path in ("/proc/device-tree/model",
+                 "/sys/firmware/devicetree/base/model"):
+        try:
+            with open(path, "rb") as fh:
+                text = fh.read(200).decode("utf-8", "replace").strip("\x00 \n")
+        except Exception:
+            continue
+        if not text:
+            continue
+        low = text.lower()
+        for mark in _SBC_MARKERS:
+            if mark in low:
+                return text
+    return ""
+
+
 def vm_brand_cn(brand: str) -> str:
     """虚拟化平台中文名（未知品牌原样返回）。"""
     b = str(brand or "").strip()
@@ -150,6 +178,11 @@ def _vm_level_cn(score):
 def _local_vm_evidence():
     """本机交叉校验：返回 (evidence 列表, 品牌提示 或 '')。全部中文描述。"""
     evidence, hint = [], ""
+    # 0) 单板计算机（树莓派等）：设备树型号是权威判据，命中就不再往下猜
+    #    —— issue #123：树莓派 3B+ 曾被误判成 KVM 虚拟机。
+    _sbc = _linux_sbc_model()   # 非 Linux 上设备树不存在，函数自身返回空
+    if _sbc:
+        return ["检测到单板计算机：%s" % _sbc], ""
     # 1) CPU 型号字符串（注册表 / /proc/cpuinfo）
     cpu = ""
     if os.name == "nt":

@@ -109,6 +109,7 @@ UI_LANGUAGE_VALUES = ("zh", "zh-Hant", "en")
 # reads as off - the opposite of the switches above - because turning it on
 # makes the gateway send a request on its own schedule.
 UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
+UPDATE_CHECK_PROXY_SLOT_KEY = "update_check_proxy_slot"
 # The last-check bookkeeping for that daily check. One small object, never a
 # general update-state store: see update_check_state().
 UPDATE_CHECK_STATE_KEY = "update_check"
@@ -144,6 +145,24 @@ REALM_FALLBACK_ENABLED_KEY = "realm_fallback_enabled"
 ACCOUNT_MAX_CONCURRENT_KEY = "account_max_concurrent"
 #: 上限值域：0 = 不限；1..10 是「每账号同时几个」。10 只是防手滑的上界。
 ACCOUNT_MAX_CONCURRENT_MAX = 10
+
+
+DESKTOP_CHAT_COMPAT_KEY = "desktop_chat_compat"
+
+
+def desktop_chat_compat(accounts_dir):
+    """Whether desktop chat requests use the SDK-compatible wire profile."""
+    return load(accounts_dir).get(DESKTOP_CHAT_COMPAT_KEY) is True
+
+
+def set_desktop_chat_compat(accounts_dir, enabled):
+    """Persist the desktop chat compatibility switch and return its value."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[DESKTOP_CHAT_COMPAT_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 def account_max_concurrent(accounts_dir):
@@ -235,10 +254,44 @@ def settings_path(accounts_dir):
     return os.path.join(accounts_dir, "settings.json")
 
 
+class PanelPasswordCryptoError(RuntimeError):
+    """Raised when hashlib.pbkdf2_hmac is missing or fails due to interpreter environment issues."""
+    pass
+
+
+def check_pbkdf2_available():
+    """Verify hashlib.pbkdf2_hmac is functional in this interpreter.
+
+    Returns (ok: bool, reason: str).
+    """
+    if not hasattr(hashlib, "pbkdf2_hmac"):
+        return False, "module 'hashlib' has no attribute 'pbkdf2_hmac'"
+    try:
+        hashlib.pbkdf2_hmac("sha256", b"smoke", b"salt", 1)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
-    return hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), rounds
-    ).hex()
+    if not hasattr(hashlib, "pbkdf2_hmac"):
+        raise PanelPasswordCryptoError(
+            "当前 Python 解释器缺少 hashlib.pbkdf2_hmac 支持，无法进行密码哈希计算。"
+            "若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd。"
+        )
+    try:
+        salt_bytes = bytes.fromhex(salt_hex)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid password salt hex: {exc}") from exc
+    try:
+        return hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt_bytes, rounds
+        ).hex()
+    except (AttributeError, ImportError, ModuleNotFoundError, NotImplementedError, RuntimeError, OSError) as exc:
+        raise PanelPasswordCryptoError(
+            f"当前 Python 解释器计算 hashlib.pbkdf2_hmac 失败: {exc}。"
+            "若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd。"
+        ) from exc
 
 
 # settings.json 的解析结果按 (path, mtime, size) 缓存：请求热路径上它被读约 10
@@ -337,7 +390,9 @@ def verify_panel_password(accounts_dir, password):
     rounds = int(data.get("panel_password_rounds") or PBKDF2_ROUNDS)
     try:
         given = _digest(password, salt, rounds)
-    except Exception:
+    except PanelPasswordCryptoError:
+        raise
+    except ValueError:
         return False
     return hmac.compare_digest(given, stored)
 
@@ -399,7 +454,23 @@ def ensure_launcher_key(accounts_dir):
 # Each key can be bound to one upstream realm, so several clients can hit
 # different exits at the same time instead of sharing the global switch.
 
-REALMS = ("", "intl", "cn")
+REALMS = ("", "intl", "cn", "codearts")
+
+
+def codearts_config(accounts_dir):
+    """CodeArts 配置的薄包装，避免 wb_settings ↔ wb_codearts 的模块级循环。"""
+    import wb_codearts
+    return wb_codearts.load_config(accounts_dir)
+
+
+def set_codearts_config(accounts_dir, patch):
+    import wb_codearts
+    return wb_codearts.save_config(accounts_dir, patch)
+
+
+def codearts_configured(accounts_dir):
+    import wb_codearts
+    return wb_codearts.configured(accounts_dir)
 
 
 def _clean_model_patterns(value):
@@ -1575,6 +1646,21 @@ def set_upstream_config(accounts_dir, cfg):
     return clean
 
 
+def max_payload_mb(accounts_dir):
+    value = load(accounts_dir).get("max_payload_mb")
+    return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 256 else None
+
+
+def set_max_payload_mb(accounts_dir, value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 256:
+        raise ValueError("max_payload_mb must be an integer between 1 and 256")
+    with _lock:
+        data = load(accounts_dir)
+        data["max_payload_mb"] = value
+        save(accounts_dir, data)
+    return value
+
+
 USAGE_DEFAULTS = {
     "hour_keep_hours": 48,
     "day_keep_days": 32,
@@ -1624,6 +1710,110 @@ def set_usage_config(accounts_dir, patch):
         data["usage"] = deep_merge(data.get("usage"), clean)
         save(accounts_dir, data)
     return clean
+
+# ---------------------------------------------------------------- 媒体能力（生图 / 生视频）
+#
+# 媒体路由始终开启，不再提供总开关、媒体出口或出站身份设置。出口由 API Key
+# 绑定优先，未绑定时自动选择当前有可用媒体账号的出口；身份跟随账号自身。
+#
+# 每一项限额都有上限：面板输入框贴错一位数就会把「每分钟 6 次」变成
+# 「每分钟 600 次」，那等于关掉了这道闸。
+
+MEDIA_DEFAULTS = {
+    # 每个 API Key 每分钟最多几次生图。6 次/分钟 × 5.71 积分 ≈ 34 积分/分钟。
+    "image_max_per_minute": 6,
+    # 视频时长上限（秒）。与目录的 maxSeconds 取小值。
+    "video_max_seconds": 15,
+    # 每个 API Key 每天最多在媒体上花多少积分；0 = 不限。
+    # 这是第二道闸门：key 级防「一个客户端把整个池子烧光」，账号级的
+    # daily_credit_limit 防「某个账号被烧穿」。两层都过才派发。
+    # **默认不限**（0）。设一个有限的默认值等于替用户决定花多少，而失败模式很难看：
+    # 跑到一半撞额度，客户端只看到 402，还得自己猜是不是该改配置。
+    "daily_credits_per_key": 0,
+    # 同时跑几条生视频。超过就排队（不提交上游、不扣费），等有任务结束再自动提交。
+    # 3 是"三条并行、各占一个账号"的默认：再多会放大同一账号的风控面，
+    # 而账号数不足时排队比硬塞更划算。
+    "video_concurrency": 3,
+}
+
+MEDIA_LIMITS = {
+    "image_max_per_minute": 60,
+    "video_max_seconds": 60,
+    "daily_credits_per_key": 100000,
+    # 上限压在媒体并发槽（4）以内：再大也没有东西去跑。
+    "video_concurrency": 8,
+}
+
+#: 每个数值项的合法下界。生图次数与视频时长至少 1 秒/次；每日额度允许 0（不限）。
+MEDIA_MINIMUMS = {
+    "image_max_per_minute": 1,
+    "video_max_seconds": 1,
+    "daily_credits_per_key": 0,
+    "video_concurrency": 1,
+}
+
+MEDIA_REALMS = ("cn", "intl")
+
+
+def validate_media_patch(raw):
+    """严格校验面板提交的媒体设置补丁。
+
+    未知键**报错**而不是忽略：静默忽略会让前端拼错字段名时显示「保存成功」、
+    而实际什么都没存——那是最难查的一类问题。
+    """
+    out = {}
+    for key, value in (raw or {}).items():
+        # Old panel tabs may still submit these after an in-place upgrade.
+        # Ignore them instead of failing a save whose four limits are valid.
+        if key in ("enabled", "realm", "identity"):
+            continue
+        if key not in MEDIA_DEFAULTS:
+            raise ValueError("unknown media setting %r" % key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("%s must be a whole number" % key)
+        if value < MEDIA_MINIMUMS[key]:
+            raise ValueError("%s cannot be less than %d" % (key, MEDIA_MINIMUMS[key]))
+        if value > MEDIA_LIMITS[key]:
+            raise ValueError("%s cannot be more than %d" % (key, MEDIA_LIMITS[key]))
+        out[key] = value
+    return out
+
+
+def media_config(accounts_dir, environ=None):
+    """媒体限额（带默认值，坏值回落到默认值而不是抛）。"""
+    stored = load(accounts_dir).get("media")
+    stored = stored if isinstance(stored, dict) else {}
+    out = {}
+    for key, default in MEDIA_DEFAULTS.items():
+        value = stored.get(key, default)
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < MEDIA_MINIMUMS[key] or value > MEDIA_LIMITS[key]):
+            out[key] = default
+        else:
+            out[key] = value
+    return out
+
+
+def set_media_config(accounts_dir, patch):
+    """持久化一份校验过的媒体设置补丁。"""
+    clean = validate_media_patch(patch)
+    with _lock:
+        data = load(accounts_dir)
+        current = data.get("media")
+        current = current if isinstance(current, dict) else {}
+        # Keep partial patches useful while dropping obsolete enabled/realm/
+        # identity keys from settings files written by older versions.
+        merged = {}
+        for key, default in MEDIA_DEFAULTS.items():
+            value = current.get(key, default)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < MEDIA_MINIMUMS[key] or value > MEDIA_LIMITS[key]):
+                value = default
+            merged[key] = value
+        merged.update(clean)
+        data["media"] = merged
+        save(accounts_dir, data)
+    return merged
 
 PROMPT_DEFAULTS = {
     "mode": "passthrough",
@@ -1705,21 +1895,6 @@ def set_enable_anthropic_messages(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data["enable_anthropic_messages"] = enabled
-        save(accounts_dir, data)
-    return enabled
-
-
-def free_model_credit_fallback(accounts_dir):
-    """Whether exhausted free models (deepseek-v4.1-flash) can fall back to credit siblings."""
-    return load(accounts_dir).get("free_model_credit_fallback") is True
-
-
-def set_free_model_credit_fallback(accounts_dir, enabled):
-    """Persist the free model credit fallback toggle. Returns the stored boolean."""
-    enabled = bool(enabled)
-    with _lock:
-        data = load(accounts_dir)
-        data["free_model_credit_fallback"] = enabled
         save(accounts_dir, data)
     return enabled
 
@@ -1811,45 +1986,6 @@ def set_auto_switch_product(accounts_dir, enabled):
 
 #: 出站身份自动切换允许落在哪些身份上（默认三条都允许，保持旧行为）。
 AUTO_SWITCH_PRODUCTS = ("workbuddy", "vscode", "cli")
-
-
-
-def realm_routing(accounts_dir):
-    """区域自动路由配置：{"enabled": bool, "prefer": "cn"|"intl"}。
-
-    默认开启、默认国内优先：一个 key 同时覆盖国内版与国际版时，未显式指定
-    区域的请求先走 prefer（cn），国内无可用账号（额度 / 熔断 / 冷却 / 日限额
-    全算）自动回退另一区。配置写在 settings.json 的 realm_routing 键；
-    环境变量 WB_AUTO_REALM=0 可整体关闭（进程级）。
-    """
-    try:
-        data = load(accounts_dir)
-        cfg = data.get("realm_routing")
-        if not isinstance(cfg, dict):
-            cfg = {}
-        enabled = cfg.get("enabled", True) is not False
-        prefer = str(cfg.get("prefer") or "cn").strip().lower()
-        if prefer not in ("cn", "intl"):
-            prefer = "cn"
-        return {"enabled": bool(enabled), "prefer": prefer}
-    except Exception:
-        return {"enabled": True, "prefer": "cn"}
-
-
-def set_realm_routing(accounts_dir, cfg):
-    """Persist the realm-routing block. Returns the stored config."""
-    if not isinstance(cfg, dict):
-        raise ValueError("realm_routing must be an object")
-    enabled = cfg.get("enabled", True) is not False
-    prefer = str(cfg.get("prefer") or "cn").strip().lower()
-    if prefer not in ("cn", "intl"):
-        raise ValueError("realm_routing.prefer must be cn or intl")
-    stored = {"enabled": bool(enabled), "prefer": prefer}
-    with _lock:
-        data = load(accounts_dir)
-        data["realm_routing"] = stored
-        save(accounts_dir, data)
-    return stored
 
 
 def auto_switch_products(accounts_dir):
@@ -2016,6 +2152,44 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
         data[EGRESS_BACKOFF_ENABLED_KEY] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+RESTRICTION_HOLD_SECONDS_KEY = "restriction_hold_seconds"
+DEFAULT_RESTRICTION_HOLD_SECONDS = 1800
+MAX_RESTRICTION_HOLD_SECONDS = 86400 * 7
+
+
+def restriction_hold_seconds(accounts_dir):
+    """How many seconds the gateway pauses dispatch when upstream reports an
+    unusual activity restriction (403 / 11140).
+
+    Defaults to 1800 seconds (30 minutes). When set to 0, restriction hold is
+    disabled. Operator can configure custom duration via panel settings.
+    """
+    val = load(accounts_dir).get(RESTRICTION_HOLD_SECONDS_KEY)
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+        return float(val)
+    env_val = os.environ.get("WB_RESTRICTION_HOLD_SECONDS")
+    if env_val is not None:
+        try:
+            return max(0.0, float(env_val))
+        except (ValueError, TypeError):
+            pass
+    return float(DEFAULT_RESTRICTION_HOLD_SECONDS)
+
+
+def set_restriction_hold_seconds(accounts_dir, value):
+    """Persist the restriction hold duration in seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("restriction_hold_seconds must be a non-negative number")
+    if value > MAX_RESTRICTION_HOLD_SECONDS:
+        raise ValueError("restriction_hold_seconds exceeds maximum allowed")
+    stored = int(value) if float(value).is_integer() else round(float(value), 1)
+    with _lock:
+        data = load(accounts_dir)
+        data[RESTRICTION_HOLD_SECONDS_KEY] = stored
+        save(accounts_dir, data)
+    return stored
 
 
 def realm_fallback_enabled(accounts_dir):
@@ -2186,6 +2360,31 @@ def set_log_db_max_bytes(accounts_dir, value):
         data[LOG_DB_MAX_BYTES_KEY] = stored
         save(accounts_dir, data)
     return stored
+
+
+def daily_activity_enabled(accounts_dir):
+    """Whether the scheduler runs the intl daily activity at all (master switch).
+
+    On unless the operator turns it off: an install that never touched the
+    setting keeps the scheduled daily activity exactly as before. Writing
+    ``false`` stops it (like ``daily_chat_web``, any stored value other than
+    unset / ``true`` reads as off; the panel and API only ever write booleans):
+    the scheduled slots, the forced "check now" cycle and the startup catch-up
+    all skip it, while the manual per-account / batch buttons in the panel
+    still work, because those are explicit operator actions.
+    """
+    value = load(accounts_dir).get("daily_activity")
+    return True if value is None else value is True
+
+
+def set_daily_activity_enabled(accounts_dir, enabled):
+    """Persist the daily-activity master switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_activity"] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 def daily_chat_web(accounts_dir):
@@ -2773,6 +2972,25 @@ def set_update_check_enabled(accounts_dir, enabled):
     return enabled
 
 
+def update_check_proxy_slot(accounts_dir):
+    """Proxy slot used only by the release checker; "" means direct."""
+    value = load(accounts_dir).get(UPDATE_CHECK_PROXY_SLOT_KEY)
+    return str(value or "").strip()[:64]
+
+
+def set_update_check_proxy_slot(accounts_dir, slot_id):
+    """Persist the optional update-check proxy slot. Returns the stored id."""
+    slot_id = str(slot_id or "").strip()[:64]
+    with _lock:
+        data = load(accounts_dir)
+        if slot_id:
+            data[UPDATE_CHECK_PROXY_SLOT_KEY] = slot_id
+        else:
+            data.pop(UPDATE_CHECK_PROXY_SLOT_KEY, None)
+        save(accounts_dir, data)
+    return slot_id
+
+
 def window_probe(accounts_dir):
     """是否在模型额度窗口重置时刻主动发探针请求，抢占新一轮计时。
 
@@ -2918,6 +3136,29 @@ def set_quota_scan_models(accounts_dir, models):
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")
 
 
+def normalize_proxy_url(url):
+    """Normalize user/vendor proxy input into standard http://[user:pass@]host:port.
+
+    Supports:
+      - host:port:user:pass or http://host:port:user:pass (vendor format)
+      - user:pass@host:port (adds missing http:// scheme)
+      - standard http://user:pass@host:port or http://host:port
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    scheme = "http"
+    if "://" in raw:
+        s, _, rest = raw.partition("://")
+        scheme = s.strip().lower() or "http"
+        raw = rest.strip()
+    parts = raw.split(":")
+    if len(parts) == 4 and parts[1].isdigit():
+        host, port, user, password = parts[0], parts[1], parts[2], parts[3]
+        return "%s://%s:%s@%s:%s" % (scheme, user, password, host, port)
+    return "%s://%s" % (scheme, raw)
+
+
 def _clean_slot_entry(entry, fallback_id=None):
     """Normalize one stored slot; returns None when unusable.
 
@@ -2928,7 +3169,7 @@ def _clean_slot_entry(entry, fallback_id=None):
     """
     if not isinstance(entry, dict):
         return None
-    url = str(entry.get("url") or "").strip()
+    url = normalize_proxy_url(entry.get("url"))
     if not url:
         return None
     slot_id = str(entry.get("id") or "").strip()
