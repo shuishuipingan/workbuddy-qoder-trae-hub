@@ -31,9 +31,12 @@ HOST="127.0.0.1"
 WB_PORT=8811
 QD_PORT=8812
 TRAE_PORT=8792
-PORTAL_PORT=18717
+PORTAL_PORT=8810
 DATA_ROOT="/data/opt/hub-data"
 TZ_NAME="Asia/Shanghai"
+# 统一面板口令：非空时写入 HUB_WB/QD/TRAE_PASSWORD，让融合面板能登录各引擎；
+# 三个引擎自身口令仍由各自 settings.json 管理（可用面板或脚本单独修改）。
+PANEL_PASSWORD=""
 
 DRY_RUN=0
 NO_START=0
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
         --portal-port) PORTAL_PORT="$2"; shift 2 ;;
         --data-root)   DATA_ROOT="$2"; shift 2 ;;
         --tz)          TZ_NAME="$2"; shift 2 ;;
+        --panel-password) PANEL_PASSWORD="$2"; shift 2 ;;
         --dry-run)     DRY_RUN=1; shift ;;
         --no-start)    NO_START=1; shift ;;
         --uninstall)   UNINSTALL=1; shift ;;
@@ -96,7 +100,15 @@ HUB_NAME=$(sed -n 's/^HUB_NAME = "\(.*\)"$/\1/p' "$HERE/hub/__init__.py" | head 
 [ -n "$HUB_NAME" ] || HUB_NAME="WorkBuddy x Qoder x Trae Hub"
 
 render() {
-    sed -e "s|@HUB_NAME@|$HUB_NAME|g" \
+    local body
+    if [ -z "$PANEL_PASSWORD" ]; then
+        body=$(grep -v '@PANEL_PASSWORD@' "$TEMPLATE")
+    else
+        body=$(sed "s|@PANEL_PASSWORD@|$PANEL_PASSWORD|g" "$TEMPLATE")
+    fi
+    printf '%s
+' "$body" | sed \
+        -e "s|@HUB_NAME@|$HUB_NAME|g" \
         -e "s|@PROJECT_DIR@|$HERE|g" \
         -e "s|@HUB_DATA_ROOT@|$DATA_ROOT|g" \
         -e "s|@TZ@|$TZ_NAME|g" \
@@ -104,8 +116,7 @@ render() {
         -e "s|@WB_PORT@|$WB_PORT|g" \
         -e "s|@QD_PORT@|$QD_PORT|g" \
         -e "s|@TRAE_PORT@|$TRAE_PORT|g" \
-        -e "s|@PORTAL_PORT@|$PORTAL_PORT|g" \
-        "$TEMPLATE"
+        -e "s|@PORTAL_PORT@|$PORTAL_PORT|g"
 }
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -166,6 +177,7 @@ cat <<EOF
   门户地址 : http://$HOST:$PORTAL_PORT/
   API 地址 : http://$HOST:$PORTAL_PORT/api/v1
   引擎端口 : wb=$WB_PORT qd=$QD_PORT trae=$TRAE_PORT（仅绑定 $HOST）
+  面板口令 : ${PANEL_PASSWORD:+已写入 HUB_*_PASSWORD（统一口令）}${PANEL_PASSWORD:-未设置（各引擎默认 admin）}
 
   查看日志 : journalctl -u $SERVICE_NAME -f
   升级代码 : git pull && systemctl restart $SERVICE_NAME

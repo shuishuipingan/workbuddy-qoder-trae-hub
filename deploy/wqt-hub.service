@@ -8,6 +8,9 @@ Type=simple
 WorkingDirectory=@PROJECT_DIR@
 Environment=HUB_DATA_ROOT=@HUB_DATA_ROOT@
 Environment=TZ=@TZ@
+Environment=HUB_WB_PASSWORD=@PANEL_PASSWORD@
+Environment=HUB_QD_PASSWORD=@PANEL_PASSWORD@
+Environment=HUB_TRAE_PASSWORD=@PANEL_PASSWORD@
 ExecStart=@PROJECT_DIR@/.venv/bin/python -m hub.server --host @HOST@ --wb-port @WB_PORT@ --qd-port @QD_PORT@ --trae-port @TRAE_PORT@ --portal-port @PORTAL_PORT@
 Restart=always
 RestartSec=3
