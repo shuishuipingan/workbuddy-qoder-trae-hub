@@ -160,6 +160,12 @@ button.mini{padding:3px 9px;font-size:11px}
   border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:12px 0;
   color:var(--accent);text-decoration:none;font-size:12px}
 .login-link:hover{border-color:var(--accent);background:#fff}
+.account-vpc-fields{display:flex;flex-direction:column;gap:8px;margin:12px 0}
+.account-vpc-fields[hidden]{display:none}
+.account-vpc-fields select,.account-vpc-fields input{width:100%;min-width:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit}
+.account-vpc-fields input:disabled{opacity:.55}
+.account-vpc-row{margin-top:6px;color:var(--dim);font-size:11px;overflow-wrap:anywhere}
+.account-vpc-row button{margin-left:6px}
 .hint{color:var(--dim);font-size:12px;margin:8px 0}
 .step{display:flex;gap:10px;align-items:flex-start;margin:10px 0}
 .step .n{flex:0 0 20px;height:20px;border-radius:50%;background:var(--panel2);
@@ -3246,8 +3252,8 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 .stat-kpi .s{font-size:11.5px!important;color:var(--text-secondary)!important;margin-top:10px!important;line-height:1.4!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}
 .stat-kpi::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--viz-success),transparent);opacity:0;transition:opacity .25s ease}
 .stat-kpi:hover::before{opacity:1}
-.stat-kpi:first-child .k::after,.stat-kpi:nth-child(4) .k::after{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--viz-success);box-shadow:0 0 8px var(--viz-success);animation:cpPulse 2.4s infinite ease-in-out;margin-left:auto}
-@keyframes cpPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.85)}}
+.stat-kpi-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--viz-success);box-shadow:0 0 8px var(--viz-success);opacity:.85;margin-left:auto;pointer-events:none}
+.stat-kpi:hover .stat-kpi-dot{opacity:1;box-shadow:0 0 10px var(--viz-success)}
 .stat-kpi .s{font-size:11px!important;color:var(--text-secondary)!important;margin-top:8px!important;line-height:1.4!important}
 
 .stat-grid2{display:grid;gap:16px;grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:16px!important}
@@ -3265,8 +3271,8 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
 .rank-val{font-size:12px!important;font-weight:600!important;font-family:ui-monospace,monospace!important;color:var(--text-secondary)!important}
 .rank-bar{grid-column:1/-1;height:5px!important;border-radius:999px!important;background:var(--bg-tertiary)!important;overflow:hidden!important}
 .rank-bar>i{position:relative;background:linear-gradient(90deg,var(--viz-success),color-mix(in srgb,var(--viz-success) 70%,#38bdf8))!important;box-shadow:0 0 10px color-mix(in srgb,var(--viz-success) 35%,transparent)!important;border-radius:999px!important}
-.rank-bar>i::after{content:'';position:absolute;top:0;bottom:0;left:0;right:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);transform:translateX(-100%);animation:barShimmer 3.2s infinite ease-in-out}
-@keyframes barShimmer{0%{transform:translateX(-100%)}45%,100%{transform:translateX(100%)}}
+.rank-bar>i::after{content:'';position:absolute;top:0;bottom:0;left:0;right:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.2),transparent);opacity:0;transition:opacity .2s ease}
+.rank-row:hover .rank-bar>i::after{opacity:1}
 
 .heat-wrap{overflow-x:auto;padding:8px 2px!important}
 .heat-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,11px);gap:3px;min-width:max-content}
@@ -4313,7 +4319,18 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
           </label>
         </div>
       </div>
-      <div class="step" id="step1"><div class="n">1</div><div class="t" id="step1Text">正在申请授权登录链接…</div></div>
+      <div class="account-vpc-fields" id="loginVpcFields" hidden>
+        <label for="loginVpcMode">国内版服务入口</label>
+        <select id="loginVpcMode" onchange="accountVpcChanged('login')">
+          <option value="inherit">继承（凭证域 / 环境默认）</option>
+          <option value="public">显式公网（不使用 VPC）</option>
+          <option value="instance">指定企业 VPC 实例</option>
+        </select>
+        <label for="loginVpcEndpoint">VPC 实例名或专属域</label>
+        <input id="loginVpcEndpoint" autocomplete="off" spellcheck="false" placeholder="TARGET 或 TARGET.vpc.qoder.com.cn" disabled oninput="accountVpcChanged('login')">
+        <p class="hint">仅国内版支持。先选入口，再生成授权链接；修改版本或入口后需重新生成。</p>
+      </div>
+      <div class="step" id="step1"><div class="n">1</div><div class="t" id="step1Text">请选择版本和服务入口，再生成授权链接</div></div>
       <div class="step" id="step2"><div class="n">2</div><div class="t">在浏览器里打开下方链接并完成登录授权</div></div>
       <div id="loginLinkBox"></div>
       <div class="step" id="step3"><div class="n">3</div><div class="t">等待授权回调完成（自动检测）</div></div>
@@ -4321,7 +4338,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
     </div>
     <div class="modal-ft">
       <button class="sec" onclick="closeLogin()">关闭</button>
-      <button onclick="restartLogin()">重新生成链接</button>
+      <button id="loginGenerate" onclick="restartLogin()">生成授权链接</button>
     </div>
   </div>
 </div>
@@ -4334,7 +4351,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
     </div>
     <div class="modal-bd">
       <p class="hint" style="margin-top:0">
-        只读检测本机桌面 App 与命令行客户端里已登录的凭证（国际版 / 国内版），
+        只读检测本机桌面 App 与命令行客户端里已登录的凭证（国际版 / 国内版及已配置的 VPC 实例），
         点击「导入」才会加入网关。导入后可删除原客户端或继续共用。
       </p>
       <div id="desktopScanBody"><p class="hint">正在检测…</p></div>
@@ -4364,13 +4381,24 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
                       border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
         <div style="display:flex;gap:18px;flex-wrap:wrap">
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-            <input type="radio" name="patRealm" value="cn" id="patRadioCn" checked>
+            <input type="radio" name="patRealm" value="cn" id="patRadioCn" checked onchange="accountVpcChanged('pat')">
             <span><b>国内版</b> (qoder.com.cn)</span>
           </label>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-            <input type="radio" name="patRealm" value="intl" id="patRadioIntl">
+            <input type="radio" name="patRealm" value="intl" id="patRadioIntl" onchange="accountVpcChanged('pat')">
             <span><b>国际版</b> (qoder.com)</span>
           </label>
+        </div>
+        <div class="account-vpc-fields" id="patVpcFields" hidden>
+          <label for="patVpcMode">国内版服务入口</label>
+          <select id="patVpcMode" onchange="accountVpcChanged('pat')">
+            <option value="inherit">继承（凭证域 / 环境默认）</option>
+            <option value="public">显式公网（不使用 VPC）</option>
+            <option value="instance">指定企业 VPC 实例</option>
+          </select>
+          <label for="patVpcEndpoint">VPC 实例名或专属域</label>
+          <input id="patVpcEndpoint" autocomplete="off" spellcheck="false" placeholder="TARGET 或 TARGET.vpc.qoder.com.cn" disabled oninput="accountVpcChanged('pat')">
+          <p class="hint">继承与显式公网不同；国际版不发送 VPC 配置。</p>
         </div>
         <div id="patBody" style="min-height:20px"></div>
       </div>
@@ -4633,7 +4661,7 @@ function cpStartLogin(){
 }
 function cpLoginVeil(){if(typeof document.createElement!=='function'||cpReduced())return;const veil=document.createElement('div');veil.className='cp-login-reveal-veil';document.body.appendChild(veil);setTimeout(()=>{try{veil.remove();}catch(e){}},720);}
 
-let loginState = null, loginTimer = null;
+let loginState = null, loginTimer = null, loginGeneration = 0;
 
 /* ---- Local admin design: additive helpers; existing IDs and APIs remain authoritative. ---- */
 function persistPanelToken(token, remember){
@@ -4804,91 +4832,128 @@ async function adminCopyExample(i){try{await navigator.clipboard.writeText(docum
 document.addEventListener('DOMContentLoaded',function(){adminRenderApiExamples();const remember=document.getElementById('panelRemember');if(remember){try{remember.checked=!!localStorage.getItem(PANEL_STORE);}catch(e){}}});
 
 
-function openLogin(){
-  const m = document.getElementById("loginModal");
-  if(m) m.classList.add("show");
+/* 账户入口三态：null 继承、空串显式公网、非空字符串指定实例。仅 CN 使用。 */
+function accountVpcValue(prefix, realm){
+  if(realm !== 'cn') return undefined;
+  const mode = document.getElementById(prefix + 'VpcMode');
+  if(!mode || mode.value === 'inherit') return null;
+  if(mode.value === 'public') return '';
+  const input = document.getElementById(prefix + 'VpcEndpoint');
+  const value = String(input && input.value || '').trim();
+  if(!value) throw new Error('请填写 VPC 实例名或专属域；使用公网请选择「显式公网」');
+  return value;
 }
-
-function closeLogin(){
-  const m = document.getElementById("loginModal");
-  if(m) m.classList.remove("show");
+function accountVpcSync(prefix, realm){
+  const fields = document.getElementById(prefix + 'VpcFields');
+  const mode = document.getElementById(prefix + 'VpcMode');
+  const input = document.getElementById(prefix + 'VpcEndpoint');
+  if(fields) fields.hidden = realm !== 'cn';
+  if(input) input.disabled = realm !== 'cn' || !mode || mode.value !== 'instance';
+}
+function cancelLoginRequest(){
+  loginGeneration++;
   if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
-  if(loginState){ postJSON("/accounts/login/cancel", {state: loginState}).catch(()=>{}); loginState = null; }
+  if(loginState){ postJSON('/accounts/login/cancel', {state:loginState}).catch(()=>{}); loginState = null; }
+  const linkBox = document.getElementById('loginLinkBox');
+  if(linkBox) linkBox.innerHTML = '';
+  const btn = document.getElementById('loginGenerate');
+  if(btn){ btn.disabled = false; btn.textContent = '生成授权链接'; }
 }
-
-function openLoginModal(){
-  openLogin();
-  const isCn = (window.VIEW_REALM === "cn");
-  const rCn = document.getElementById("radioCn");
-  const rIntl = document.getElementById("radioIntl");
-  if(rCn) rCn.checked = isCn;
-  if(rIntl) rIntl.checked = !isCn;
-  triggerLoginForSelectedRealm();
-}
-
-function switchLoginRealm(realm){
-  triggerLoginForSelectedRealm();
-}
-
-function restartLogin(){
-  triggerLoginForSelectedRealm();
-}
-
-async function triggerLoginForSelectedRealm(){
-  const checkedRadio = document.querySelector('input[name="loginRealm"]:checked');
-  const realm = checkedRadio ? checkedRadio.value : (window.VIEW_REALM || "intl");
-  const isCn = (realm === "cn");
-
-  if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
-  if(loginState){ postJSON("/accounts/login/cancel", {state: loginState}).catch(()=>{}); loginState = null; }
-
-  const linkBox = document.getElementById("loginLinkBox");
-  const statusBox = document.getElementById("loginStatus");
-  if(linkBox) linkBox.innerHTML = "";
-  if(statusBox) statusBox.textContent = "";
-
-  const s1 = document.getElementById("step1");
-  const s2 = document.getElementById("step2");
-  const s3 = document.getElementById("step3");
-  if(s1) s1.className = "step active";
-  if(s2) s2.className = "step";
-  if(s3) s3.className = "step";
-
-  const s1Text = document.getElementById("step1Text");
-  if(s1Text) s1Text.textContent = isCn ? "正在向 qoder.com.cn (国内版) 申请设备授权..." : "正在向 qoder.com (国际版) 申请设备授权...";
-
-  try{
-    const r = await postJSON("/accounts/login/start", {platform: "CLI", realm: realm});
-    loginState = r.state;
-    if(s1) s1.className = "step done";
-    if(s2) s2.className = "step active";
-    if(linkBox) linkBox.innerHTML =
-      '<a class="login-link" href="' + esc(r.authUrl) + '" target="_blank" rel="noopener">' + esc(r.authUrl) + '</a>'
-      + '<div class="hint">点击上方链接在浏览器里完成登录授权。登录完成后本窗口会自动检测并完成入池。</div>';
-    pollLogin();
-    loginTimer = setInterval(pollLogin, 2500);
-  }catch(e){
-    if(statusBox) statusBox.textContent = "发起失败: " + e.message;
-    if(s1) s1.className = "step";
+function accountVpcChanged(prefix){
+  const intl = document.getElementById(prefix === 'login' ? 'radioIntl' : 'patRadioIntl');
+  accountVpcSync(prefix, intl && intl.checked ? 'intl' : 'cn');
+  if(prefix === 'login'){
+    cancelLoginRequest();
+    const status = document.getElementById('loginStatus');
+    if(status) status.textContent = '版本或入口已变更，请重新生成授权链接。';
+    ['step1','step2','step3'].forEach(id=>{const el=document.getElementById(id);if(el)el.className='step';});
+    const step = document.getElementById('step1Text');
+    if(step) step.textContent = '请选择版本和服务入口，再生成授权链接';
   }
 }
-
+function openLogin(){
+  const m = document.getElementById('loginModal');
+  if(m) m.classList.add('show');
+}
+function closeLogin(){
+  const m = document.getElementById('loginModal');
+  if(m) m.classList.remove('show');
+  cancelLoginRequest();
+}
+function openLoginModal(){
+  openLogin();
+  const isCn = window.VIEW_REALM === 'cn';
+  const rCn = document.getElementById('radioCn'), rIntl = document.getElementById('radioIntl');
+  if(rCn) rCn.checked = isCn;
+  if(rIntl) rIntl.checked = !isCn;
+  const mode = document.getElementById('loginVpcMode'), input = document.getElementById('loginVpcEndpoint');
+  if(mode) mode.value = 'inherit';
+  if(input) input.value = '';
+  accountVpcChanged('login');
+  const status = document.getElementById('loginStatus');
+  if(status) status.textContent = '确认版本和入口后，点击「生成授权链接」。';
+}
+function switchLoginRealm(realm){ accountVpcChanged('login'); }
+function restartLogin(){ return triggerLoginForSelectedRealm(); }
+async function triggerLoginForSelectedRealm(){
+  const checkedRadio = document.querySelector('input[name="loginRealm"]:checked');
+  const realm = checkedRadio ? checkedRadio.value : (window.VIEW_REALM || 'intl');
+  cancelLoginRequest();
+  const generation = loginGeneration;
+  const linkBox = document.getElementById('loginLinkBox'), statusBox = document.getElementById('loginStatus');
+  const s1 = document.getElementById('step1'), s2 = document.getElementById('step2'), s3 = document.getElementById('step3');
+  const s1Text = document.getElementById('step1Text'), btn = document.getElementById('loginGenerate');
+  if(statusBox) statusBox.textContent = '';
+  if(s1) s1.className = 'step active';
+  if(s2) s2.className = 'step';
+  if(s3) s3.className = 'step';
+  try{
+    // 冻结本次请求的入口；任何后续变更都会递增代次，迟到响应不得重挂旧链接。
+    const vpc = accountVpcValue('login', realm);
+    const request = {platform:'CLI', realm:realm};
+    if(realm === 'cn') request.vpc = vpc;
+    if(btn){ btn.disabled = true; btn.textContent = '正在生成…'; }
+    if(s1Text) s1Text.textContent = '正在申请' + (realm === 'cn' ? '国内版' : '国际版') + '设备授权…';
+    const r = await postJSON('/accounts/login/start', request);
+    if(generation !== loginGeneration){
+      if(r.state) postJSON('/accounts/login/cancel', {state:r.state}).catch(()=>{});
+      return;
+    }
+    if(!r.state || !r.authUrl) throw new Error('授权响应缺少状态或链接');
+    loginState = r.state;
+    if(s1) s1.className = 'step done';
+    if(s2) s2.className = 'step active';
+    const endpoint = realm === 'cn' ? (r.vpcEndpoint ? 'VPC · ' + r.vpcEndpoint : '公网') : '国际版公网';
+    if(s1Text) s1Text.textContent = '本次授权入口：' + endpoint;
+    if(linkBox) linkBox.innerHTML = '<a class="login-link" href="' + esc(r.authUrl) + '" target="_blank" rel="noopener">' + esc(r.authUrl) + '</a>'
+      + '<div class="hint">本次入口：' + esc(endpoint) + '。请在浏览器完成授权；修改入口后原链接将移除，需重新生成。</div>';
+    loginTimer = setInterval(pollLogin, 2500);
+    pollLogin();
+  }catch(e){
+    if(generation !== loginGeneration) return;
+    if(statusBox) statusBox.textContent = '发起失败: ' + e.message;
+    if(s1) s1.className = 'step';
+  }finally{
+    if(generation === loginGeneration && btn){ btn.disabled = false; btn.textContent = loginState ? '重新生成链接' : '生成授权链接'; }
+  }
+}
 async function pollLogin(){
   if(!loginState) return;
+  const state = loginState, generation = loginGeneration;
   try{
-    const r = await getJSON("/accounts/login/poll?state=" + encodeURIComponent(loginState));
-    const s3 = document.getElementById("step3");
-    const statusBox = document.getElementById("loginStatus");
-    if(s3) s3.className = "step active";
+    const r = await getJSON('/accounts/login/poll?state=' + encodeURIComponent(state));
+    if(generation !== loginGeneration || state !== loginState) return;
+    const s3 = document.getElementById('step3'), statusBox = document.getElementById('loginStatus');
+    if(s3) s3.className = 'step active';
     if(statusBox) statusBox.textContent = r.message || r.status;
-    if(r.status === "ok"){
-      if(s3) s3.className = "step done";
-      if(statusBox) statusBox.textContent = "登录成功：" + (r.account && r.account.nickname) + " 已加入账号池";
+    if(r.status === 'ok'){
+      if(s3) s3.className = 'step done';
+      if(statusBox) statusBox.textContent = '登录成功：' + (r.account && r.account.nickname || '') + ' 已加入账号池';
       if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
       loginState = null;
       await loadAccounts();
-      setTimeout(closeLogin, 1200);
-    }else if(r.status === "error" || r.status === "expired" || r.status === "unknown"){
+      setTimeout(()=>{ if(generation === loginGeneration) closeLogin(); }, 1200);
+    }else if(r.status === 'error' || r.status === 'expired' || r.status === 'unknown'){
       if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
     }
   }catch(e){}
@@ -6721,6 +6786,31 @@ function accountCreditMain(cred){
   }
   return html + '</div>';
 }
+function accountVpcRow(a){
+  if(a.realm !== 'cn') return '';
+  const sources = {account:'账号覆盖', domain:'凭证域推断', default:'环境默认', public:'公网'};
+  const source = sources[a.vpcSource] || '来源未知';
+  const endpoint = typeof a.vpcEndpoint === 'string' ? a.vpcEndpoint : null;
+  const label = endpoint === null ? '入口未知' : (endpoint ? 'VPC · ' + endpoint : '公网');
+  const mode = a.vpcOverride === '' ? '显式公网' : (a.vpcOverride == null ? '继承' : '指定实例');
+  return '<div class="account-vpc-row">入口：' + esc(label) + ' · ' + esc(source) + '（' + mode + '）'
+    + '<button class="sec mini" data-uid="' + esc(String(a.uid || '')) + '" onclick="editAccountVpc(this.dataset.uid,this)">编辑入口</button></div>';
+}
+async function editAccountVpc(uid, btn){
+  const acc = (window.ACCOUNTS || []).find(a=>String(a.uid) === String(uid));
+  if(!acc || acc.realm !== 'cn') return;
+  const current = acc.vpcOverride == null ? '继承' : acc.vpcOverride;
+  const value = prompt('国内版服务入口：输入「继承」恢复凭证域 / 环境默认；留空显式使用公网；或填写 VPC 实例名 / 专属域。当前生效：' + (acc.vpcEndpoint || '公网'), current);
+  if(value === null) return;
+  const vpcEndpoint = value.trim() === '继承' ? null : value.trim();
+  if(btn){ btn.disabled = true; btn.textContent = '保存中…'; }
+  try{
+    await postJSON('/accounts/set', {uid:uid, vpcEndpoint:vpcEndpoint});
+    await loadAccounts();
+    toast('账号服务入口已保存', 'ok');
+  }catch(e){ toast('保存失败: ' + e.message, 'bad'); }
+  finally{ if(btn){ btn.disabled = false; btn.textContent = '编辑入口'; } }
+}
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -6802,7 +6892,7 @@ function accountRow(a){
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
     + '<div class="admin-row-group">组：' + esc(a.group || '未分组') + ' <button class="sec mini" data-uid="' + uidAttr + '" onclick="adminEditGroup(this.dataset.uid,this)">编辑组</button></div>'
-    + err + '</td>'
+    + (a.realm === 'cn' ? accountVpcRow(a) : '') + err + '</td>'
     + '<td style="text-align:center">' + state + _ckOff + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
     + '<td class="account-credit-cell" style="text-align:left">' + credText + compLine
@@ -7473,6 +7563,10 @@ function openPatImport(){
   const rIntl = document.getElementById('patRadioIntl');
   if(rCn) rCn.checked = (window.VIEW_REALM !== 'intl');
   if(rIntl) rIntl.checked = (window.VIEW_REALM === 'intl');
+  const mode = document.getElementById('patVpcMode'), endpoint = document.getElementById('patVpcEndpoint');
+  if(mode) mode.value = 'inherit';
+  if(endpoint) endpoint.value = '';
+  accountVpcChanged('pat');
   if(m) m.classList.add('show');
 }
 
@@ -7493,9 +7587,12 @@ async function doImportPat(btn){
   if(btn){ btn.disabled = true; btn.textContent = '导入中...'; }
   if(body) body.innerHTML = '<p class="hint">正在交换 jobToken 并拉取账号身份…</p>';
   try{
-    const r = await postJSON('/accounts/import/pat', {pat: pat, realm: realm});
+    const request = {pat:pat, realm:realm};
+    if(realm === 'cn') request.vpc = accountVpcValue('pat', realm);
+    const r = await postJSON('/accounts/import-pat', request);
     const a = (r.imported || [])[0] || {};
-    if(body) body.innerHTML = '<p class="hint" style="color:#26bb82">✓ 已导入 ' + esc(a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版') + '</p>';
+    const endpoint = realm === 'cn' ? ' · ' + (a.vpcEndpoint ? 'VPC · ' + a.vpcEndpoint : '公网') : '';
+    if(body) body.innerHTML = '<p class="hint" style="color:#26bb82">✓ 已导入 ' + esc(a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版') + esc(endpoint) + '</p>';
     toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版'));
     if(input) input.value = '';
     await loadAccounts();
@@ -9474,7 +9571,7 @@ function renderStatKpis(d){
   if(statSig("kpis", sig) || !box.querySelector(".stat-kpi")){
     box.innerHTML = tiles.map(t =>
       '<div class="stat-kpi" title="' + esc(t.k) + '">'
-      + '<div class="k">' + esc(t.k) + '</div>'
+      + '<div class="k"><span>' + esc(t.k) + '</span>' + (t.id === 'kpiReq' || t.id === 'kpiDays' ? '<span class="stat-kpi-dot" aria-hidden="true"></span>' : '') + '</div>'
       + '<div class="v" id="' + t.id + '">—</div>'
       + '<div class="s">' + esc(t.s) + '</div></div>').join("");
   }
@@ -9504,7 +9601,7 @@ function renderRankList(id, rows, emptyText, sumElId){
     return '<div class="rank-row" data-tip="' + tip + '">'
       + '<span class="rank-name">' + esc(r.name) + '</span>'
       + '<span class="rank-val">' + fmt(r.tokens) + '</span>'
-      + '<span class="rank-bar"><i data-w="' + pct + '"></i></span></div>';
+      + '<span class="rank-bar"><i data-w="' + pct + '" style="width:' + (animate ? '0%' : pct + '%') + '"></i></span></div>';
   }).join("");
   box.querySelectorAll(".rank-bar > i").forEach((bar, i) => {
     const w = bar.dataset.w;

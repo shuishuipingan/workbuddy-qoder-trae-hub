@@ -32,7 +32,7 @@ ENGINE_META = {
     },
     "qd": {
         "label": "Qoder", "dir": "qd", "entry": "qoder_proxy.py",
-        "module": "qoder_proxy", "port": 8812, "version": "1.9.4", "icon": "qd",
+        "module": "qoder_proxy", "port": 8812, "version": "1.9.10", "icon": "qd",
         "service": "qoder-proxy",
     },
     "trae": {

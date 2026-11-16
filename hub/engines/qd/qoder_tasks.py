@@ -127,7 +127,7 @@ def fetch_task_view(account):
             "task_code": "daily_checkin_legacy",
             "name": "每日签到（旧活动批次）",
             "description": l_desc,
-            "jump_url": get_realm_config(account.realm)["website"] + "/",
+            "jump_url": qoder_accounts.account_realm_config(account)["website"] + "/",
             "status": l_status,
             "current": 1,
             "target": 1,
@@ -272,7 +272,7 @@ def _campaign_task_row(account, camp, summary):
       全部 CLAIMED              -> "claimed"  （今日已领取）
       其它/无活动               -> "not_accepted"
     """
-    website = get_realm_config(account.realm)["website"]
+    website = qoder_accounts.account_realm_config(account)["website"]
     jump = (camp.get("campaign_url") or website + "/activities") \
         if camp.get("ok") else website + "/activities"
     items = [{"key": c["campaign_key"] or c["campaign_id"],

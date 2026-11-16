@@ -1,0 +1,18 @@
+[Unit]
+Description=@HUB_NAME@ (fusion gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+Environment=HUB_DATA_ROOT=@HUB_DATA_ROOT@
+Environment=TZ=@TZ@
+ExecStart=@PROJECT_DIR@/.venv/bin/python -m hub.server --host @HOST@ --wb-port @WB_PORT@ --qd-port @QD_PORT@ --trae-port @TRAE_PORT@ --portal-port @PORTAL_PORT@
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
