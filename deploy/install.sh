@@ -34,6 +34,8 @@ TRAE_PORT=8792
 PORTAL_PORT=8810
 DATA_ROOT="/data/opt/hub-data"
 TZ_NAME="Asia/Shanghai"
+# wb 引擎默认出口：intl（国际版）/ cn（国内版）
+WB_REALM="intl"
 # 统一面板口令：非空时写入 HUB_WB/QD/TRAE_PASSWORD，让融合面板能登录各引擎；
 # 三个引擎自身口令仍由各自 settings.json 管理（可用面板或脚本单独修改）。
 PANEL_PASSWORD=""
@@ -55,6 +57,7 @@ while [ $# -gt 0 ]; do
         --portal-port) PORTAL_PORT="$2"; shift 2 ;;
         --data-root)   DATA_ROOT="$2"; shift 2 ;;
         --tz)          TZ_NAME="$2"; shift 2 ;;
+        --wb-realm)    WB_REALM="$2"; shift 2 ;;
         --panel-password) PANEL_PASSWORD="$2"; shift 2 ;;
         --dry-run)     DRY_RUN=1; shift ;;
         --no-start)    NO_START=1; shift ;;
@@ -112,6 +115,7 @@ render() {
         -e "s|@PROJECT_DIR@|$HERE|g" \
         -e "s|@HUB_DATA_ROOT@|$DATA_ROOT|g" \
         -e "s|@TZ@|$TZ_NAME|g" \
+        -e "s|@WB_REALM@|$WB_REALM|g" \
         -e "s|@HOST@|$HOST|g" \
         -e "s|@WB_PORT@|$WB_PORT|g" \
         -e "s|@QD_PORT@|$QD_PORT|g" \
@@ -178,6 +182,7 @@ cat <<EOF
   API 地址 : http://$HOST:$PORTAL_PORT/api/v1
   引擎端口 : wb=$WB_PORT qd=$QD_PORT trae=$TRAE_PORT（仅绑定 $HOST）
   面板口令 : ${PANEL_PASSWORD:+已写入 HUB_*_PASSWORD（统一口令）}${PANEL_PASSWORD:-未设置（各引擎默认 admin）}
+  wb 出口   : $WB_REALM（intl=国际版，cn=国内版）
 
   查看日志 : journalctl -u $SERVICE_NAME -f
   升级代码 : git pull && systemctl restart $SERVICE_NAME

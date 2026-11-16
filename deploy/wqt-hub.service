@@ -8,6 +8,7 @@ Type=simple
 WorkingDirectory=@PROJECT_DIR@
 Environment=HUB_DATA_ROOT=@HUB_DATA_ROOT@
 Environment=TZ=@TZ@
+Environment=WB_PROXY_DEFAULT_REALM=@WB_REALM@
 Environment=HUB_WB_PASSWORD=@PANEL_PASSWORD@
 Environment=HUB_QD_PASSWORD=@PANEL_PASSWORD@
 Environment=HUB_TRAE_PASSWORD=@PANEL_PASSWORD@
