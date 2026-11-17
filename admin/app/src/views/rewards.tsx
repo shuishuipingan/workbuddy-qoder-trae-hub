@@ -10,6 +10,7 @@ import {
 import { useLang } from '@/lib/i18n';
 import { get, post } from '@/lib/http';
 import { API } from '@/lib/api';
+import { SchedulerCard } from './rewards-scheduler';
 
 /**
  * 签到与福利：一条聚合端点 + 两套写动作。
@@ -316,6 +317,7 @@ export default function RewardsView() {
           onRetry={retry}
           t={t}
         />
+        <SchedulerCard t={t} />
       </div>
     </div>
   );

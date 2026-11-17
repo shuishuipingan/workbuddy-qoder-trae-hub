@@ -346,6 +346,33 @@ export const hubScheduler = () => get<SchedulerState>(API + "/hub/scheduler");
 export const engineSchedulerToggle = (eng: Engine, enabled: boolean) =>
   post<{ ok?: boolean; enabled?: boolean }>(API + "/" + eng + "/scheduler/toggle", { enabled });
 
+/** 立即跑一轮调度（手动补签 / 手动保活）。 */
+export const engineSchedulerTrigger = (eng: Engine) =>
+  post<Record<string, unknown>>(API + "/" + eng + "/scheduler/trigger", {}, { timeoutMs: 120000 });
+
+/**
+ * 修改 Qoder 引擎的排程。
+ *
+ * 时间格式是 `HH:MM` 逗号分隔（后端 `Scheduler.set_schedule` 解析），
+ * `cron` 非空时**覆盖** checkin_times；`jitter_secs` 是账号之间的随机间隔。
+ */
+export const saveQdSchedule = (patch: {
+  checkin_times?: string;
+  keepalive_times?: string;
+  cron?: string;
+  jitter_secs?: number;
+}) => post<{ ok?: boolean; scheduler?: Record<string, unknown> }>(
+  API + "/qd/scheduler/config", patch, { timeoutMs: 30000 });
+
+/**
+ * WorkBuddy 的排程走 /settings 的 `schedule` 字段。
+ *
+ * 注意：wb 只支持**整点**（小时数组），不像 qd 能到分钟。
+ */
+export const saveWbSchedule = (patch: {
+  checkin?: number[]; travel?: number[]; keepalive?: number[]; cat?: number[];
+}) => saveSettings("wb", { schedule: patch });
+
 /* ── 账号行级动作（旧面板主力功能，之前整个漏了） ───────────── */
 
 /** 试一条真实请求，验证这把账号还能不能用。 */

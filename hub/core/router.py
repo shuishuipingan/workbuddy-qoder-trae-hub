@@ -4,8 +4,8 @@
 
 一个合并 key 同时打国内/国际 × wb/qd 两引擎。路由矩阵由 portal 持有：
 
-  * 快照（TTL 8s）：两引擎 × 两区域的模型清单（/v1/models?realm=X）+ 总就绪
-    账号数（/health）—— 本地回环探测，失败不致命（该引擎/区域不参与候选）。
+  * 快照（TTL 30s，单飞探测）：各引擎 × 两区域的模型清单（/v1/models?realm=X）
+    + 总就绪账号数（/health）—— 本地回环探测，失败不致命（不参与候选）。
   * 候选序列 candidates_for(model)：
       区域优先：prefer_realm（默认 cn）先，另一区兜底；
       区域内引擎顺序：engine_prefer=auto 时按就绪账号多者先（并列 wb 先），
@@ -32,10 +32,30 @@ CHAT_PATHS = frozenset(p.strip("/") for p in (
     "/v1/messages", "/messages",
     "/v1/responses", "/responses",
 ))
-#: 未开始流式输出前的可重试状态（含 401：key 可能没注册到某台引擎，换一台）。
-RETRYABLE_STATUS = frozenset((401, 429, 502, 503, 504))
+#: 未开始流式输出前的可重试状态。
+#: 401 单独处理：只有当 hub 注入的是**引擎自己的 key**（客户端那把没在各引擎登记）
+#: 时，换引擎才可能有意义；如果发的是客户端那把 key，401 就是「key 错」，跨引擎
+#: 重试只会把真实原因埋掉。判定见 should_retry()。
+RETRYABLE_STATUS = frozenset((429, 502, 503, 504))
+KEY_RETRY_STATUS = frozenset((401,))
 
 SNAPSHOT_TTL = 30.0
+#: 探测串行化：同一时刻只让一个线程真正访问引擎，其余等它出结果（最多等这么久，
+#: 超时就用旧快照 —— 宁可短暂陈旧，也不要 N 个线程各探 6 次打出惊群）。
+_REFRESH_LOCK = threading.Lock()
+_REFRESH_WAIT = 15.0
+
+
+def should_retry(status, key_injected=False):
+    """这次失败值不值得换下一跳？
+
+    key_injected=True 表示本次发给引擎的是 hub 拼的引擎自有 key（不是客户端那把），
+    此时 401 说明「这台引擎的 key 不可用」，换引擎有救；否则 401 是客户端 key 问题，
+    直接返回给客户端，别把错误信息洗成 503。
+    """
+    if status in RETRYABLE_STATUS:
+        return True
+    return status in KEY_RETRY_STATUS and bool(key_injected)
 
 
 class RouteSnapshot(object):
@@ -83,10 +103,8 @@ def _key_for(key, engine):
     return key
 
 
-def refresh_snapshot(ports, key, snapshot, force=False):
-    """按 TTL 重建快照；并发调用只让一个线程真正探测。"""
-    if not force and snapshot.is_fresh():
-        return snapshot
+def _probe(ports, key):
+    """真正访问三台引擎，返回 (models, ready, errors)。"""
     models, ready, errors = {}, {}, {}
     for engine in ENGINES:
         port = (ports or {}).get(engine)
@@ -118,12 +136,33 @@ def refresh_snapshot(ports, key, snapshot, force=False):
             else:
                 errors[engine] = "models %s %s" % (realm, status)
             models[engine][realm] = ids
-    with snapshot.lock:
-        snapshot.models = models
-        snapshot.ready = ready
-        snapshot.errors = errors
-        snapshot.at = time.time()
-    return snapshot
+    return models, ready, errors
+
+
+def refresh_snapshot(ports, key, snapshot, force=False):
+    """按 TTL 重建快照；真正的探测由单飞锁串行化。
+
+    并发时只有一个线程访问引擎（3 引擎 × (1 次 /health + 2 次 /v1/models)），
+    其余线程等它写完直接复用；等锁超过 _REFRESH_WAIT 秒就带着旧快照返回 ——
+    短暂陈旧好过把引擎打出惊群。
+    """
+    if not force and snapshot.is_fresh():
+        return snapshot
+    if not _REFRESH_LOCK.acquire(timeout=_REFRESH_WAIT):
+        return snapshot
+    try:
+        # 等锁期间可能已有别的线程刷新过，二次确认避免重复探测
+        if not force and snapshot.is_fresh():
+            return snapshot
+        models, ready, errors = _probe(ports, key)
+        with snapshot.lock:
+            snapshot.models = models
+            snapshot.ready = ready
+            snapshot.errors = errors
+            snapshot.at = time.time()
+        return snapshot
+    finally:
+        _REFRESH_LOCK.release()
 
 
 def engine_holds(snapshot, engine, realm, model):

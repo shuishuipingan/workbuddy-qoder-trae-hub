@@ -1168,6 +1168,12 @@ def _apply_model_aliases(payload, aliases):
     if not isinstance(name, str):
         return
     target = aliases.get(name.strip().lower())
+    if not target and name.strip() != name.strip().lower():
+        # WorkBuddy 上游的模型 id 全部是小写 kebab-case（deepseek-v4.1-flash 等），
+        # 客户端若发大小写变体（DeepSeek-V4.1-Flash），上游会按字面返回
+        # 11102 "service info not found"。没有别名命中时统一降为小写再发；
+        # 真正不存在的名字仍然拿 11102，不会变得更差。
+        target = name.strip().lower()
     if not target or target == name:
         return
     payload["model"] = target
@@ -16956,7 +16962,7 @@ def schedule_window_probe(account, model, reset_at, cap=False, cap_at=0.0):
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
                   allow_product_switch=True,
                   pin_account=None, defer_egress_success=False,
-                  allowed_accounts=None):
+                  allowed_accounts=None, exclude_uids=None):
     # Refresh the daily guards before picking. The scan underneath is
     # incremental and TTL-cached, so this is a stat() plus a cached dict on
     # the hot path, and an account parked by any of the guards is skipped
@@ -17126,6 +17132,9 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # tried 记的是「这一轮试过且失败」的账号，busy 只是「此刻没空」，等它的请求
     # 结束后这个账号完全可用，不该被当成失败账号影响熔断或亲和。
     busy = set()
+    # 调用方明确要求「别再用这些账号」（零输出重试会传上一跳的 uid）：既不惩罚
+    # 也不计失败，只是这一轮不选它 —— 与 tried 的区别是它不影响后续请求。
+    pre_excluded = set(exclude_uids or ())
     # 当前这一轮已经占住、但还没交给调用方的账号名额。任何失败路径都要归还
     # （循环开头统一处理），成功路径把它绑到响应对象上后置空。
     slot_held = None
@@ -17136,7 +17145,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         """
         nonlocal busy
         while True:
-            exclude = tried | busy
+            exclude = tried | busy | pre_excluded
             kwargs = dict(realm=realm, session_key=session_key,
                           exclude=exclude, model=model, page=affinity_page)
             if allowed_accounts is not None:
@@ -26868,10 +26877,19 @@ class Handler(BaseHTTPRequestHandler):
                     prebuilt_body=forwarded, pin_account=account,
                     defer_egress_success=True,
                     **key_open_kwargs(getattr(self, "key_entry", None)))
+
+            def reopen_other_stream():
+                # 零输出重试用：换一个账号（当前这个只是零输出，不算失败账号，
+                # 所以不写进 tried、不涨熔断、不计冷却）。
+                return open_upstream(
+                    payload, session_key=session_key, target_realm=req_realm,
+                    prebuilt_body=forwarded, defer_egress_success=True,
+                    exclude_uids={account.uid},
+                    **key_open_kwargs(getattr(self, "key_entry", None)))
             if want_stream:
                 return self._chat_stream_response(
                     upstream, model, fp, account, t_start, effort=effort,
-                    reopen=reopen_stream)
+                    reopen=reopen_stream, reopen_other=reopen_other_stream)
             return self._chat_nonstream_response(
                 upstream, model, fp, account, t_start, effort=effort)
 
@@ -26987,7 +27005,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
                               reopen=None, headers_sent=False, retried=False,
-                              realm=None):
+                              realm=None, reopen_other=None, chunk_id=None):
             if not headers_sent:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -26998,7 +27016,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             # A retry reuses the headers already on the wire; the client has not
             # seen a single byte, so a fresh chunk id is safe.
-            stream_chunk_id = f"chatcmpl-wb-{uuid.uuid4().hex[:16]}"
+            # 零输出守卫的重试必须沿用同一个 id：那一跳可能已经把「role=assistant,
+            # 正文空」的首帧写出去了，换个 id 就等于两个流交错（见下面的 id 注释）。
+            stream_chunk_id = chunk_id or f"chatcmpl-wb-{uuid.uuid4().hex[:16]}"
             emitted = False
             last_usage = None
             first_ms = None
@@ -27120,17 +27140,71 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         write_chunk(cleaned)
                     release(leak_filter.flush())
-                    if synthesized_calls or pending_finish is not None:
-                        write_chunk(chat_finish_chunk(
-                            model, "tool_calls" if synthesized_calls else pending_finish, chunk_id=stream_chunk_id))
-                    if last_usage is not None:
-                        write_chunk(chat_usage_chunk(
-                            model, last_usage, chunk_id=stream_chunk_id))
-                    flush_out()
-                    if not emitted:
+                    # 零输出的唯一判据是「正文 / 思考 / 工具调用全空」。不能用
+                    # emitted：上游第一帧就是 role=assistant + content:""，那会让
+                    # emitted 立刻为 True，于是「200 + finish_reason=length + 全空」
+                    # 这种假成功永远判不出来。
+                    zero_output = not streamed_text and not synthesized_calls
+                    # 零输出守卫：上游假成功时客户端会当成空回复再重发一次，同一份
+                    # 25 万 token 的上下文被扣两次钱。此刻已经上线的只有那个空首帧，
+                    # 沿用同一个 chunk id 重发，客户端看到的就是一条连续流。
+                    # 这一跳既不算成功也不算失败：只落一条 outcome=zero_output 的
+                    # 用量行，不写 tried、不涨熔断、不进冷却（与 10605 排队同款语义：
+                    # 上游的问题不罚账号）。
+                    if zero_output and not retried and (reopen_other or reopen):
+                        wall = int((time.time() - t_start) * 1000)
+                        record_upstream_usage(
+                            upstream, model, last_usage, stream=True,
+                            elapsed_ms=wall, ttft_ms=None, gen_ms=None,
+                            fp=fp, account=account.uid, realm=realm,
+                            outcome="zero_output", key=self._key_id(),
+                            effort=effort)
+                        try:
+                            upstream.close()
+                        except Exception:
+                            pass
+                        retry_upstream = None
+                        retry_account, retry_effort = account, effort
+                        # 优先换号（另一把凭证可能不截断）；池里只有一个号时
+                        # 退回原地重连——零输出常常是单次抖动，重连一次就正常。
+                        for opener in (reopen_other, reopen):
+                            if opener is None:
+                                continue
+                            try:
+                                retry_upstream, retry_account, retry_effort = opener()
+                            except Exception:
+                                retry_upstream = None
+                            if retry_upstream is not None:
+                                break
+                        if retry_upstream is not None:
+                            try:
+                                return self._chat_stream_response(
+                                    retry_upstream, model, fp, retry_account, t_start,
+                                    effort=retry_effort, reopen=None,
+                                    reopen_other=None, headers_sent=True,
+                                    retried=True, realm=realm,
+                                    chunk_id=stream_chunk_id)
+                            finally:
+                                try:
+                                    retry_upstream.close()
+                                except Exception:
+                                    pass
+                    if not zero_output:
+                        if synthesized_calls or pending_finish is not None:
+                            write_chunk(chat_finish_chunk(
+                                model, "tool_calls" if synthesized_calls else pending_finish, chunk_id=stream_chunk_id))
+                        if last_usage is not None:
+                            write_chunk(chat_usage_chunk(
+                                model, last_usage, chunk_id=stream_chunk_id))
+                        flush_out()
+                    else:
+                        # 换过一次仍然全空（或没有第二跳可试）：不发 finish/usage，
+                        # 那会被客户端当成"正常但空的回答"；只回一个可判别的错误码。
+                        flush_out()
                         err = json.dumps({"error": {
                             "message": "empty upstream stream",
-                            "type": "server_error"}})
+                            "type": "server_error",
+                            "code": "zero_output_length"}})
                         heartbeat.write(f"data: {err}\n\n".encode("utf-8"))
                     heartbeat.write(b"data: [DONE]\n\n")
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

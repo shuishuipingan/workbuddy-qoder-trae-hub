@@ -91,6 +91,60 @@ def _request_fingerprint(body):
     return hashlib.sha1((head + blob).encode("utf-8", "replace")).hexdigest()[:16]
 
 
+#: 客户端可能带来的会话标识头（按优先级）。
+_SESSION_HEADERS = ("x-session-id", "x-conversation-id",
+                    "x-claude-code-session-id", "conversation-id", "session-id")
+
+
+def _session_identity(headers, body):
+    """会话亲和用的稳定标识。
+
+    优先级：显式头 > 请求体里的 session_id/conversation_id > 由
+    「model + system + 首条 user」派生的指纹（同一会话多轮不变，因此不会每轮
+    换引擎）。都拿不到就返回空串 —— 空串表示本次不做亲和。
+    """
+    for name in _SESSION_HEADERS:
+        try:
+            value = headers.get(name)
+        except Exception:
+            value = None
+        if value:
+            return "h:" + str(value).strip()[:180]
+    try:
+        doc = json.loads(body.decode("utf-8", "replace")) if body else {}
+    except Exception:
+        return ""
+    if not isinstance(doc, dict):
+        return ""
+    for field in ("session_id", "conversation_id", "prompt_cache_key"):
+        value = doc.get(field)
+        if isinstance(value, str) and value.strip():
+            return "b:" + value.strip()[:180]
+    meta = doc.get("metadata")
+    if isinstance(meta, dict) and isinstance(meta.get("session_id"), str) \
+            and meta["session_id"].strip():
+        return "b:" + meta["session_id"].strip()[:180]
+    parts = [str(doc.get("model") or "")]
+    system = doc.get("system")
+    if isinstance(system, list):
+        system = "".join(str(p.get("text") or "") if isinstance(p, dict) else str(p)
+                         for p in system)
+    if system:
+        parts.append(str(system))
+    for msg in (doc.get("messages") or []):
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join(str(p.get("text") or "") if isinstance(p, dict) else str(p)
+                              for p in content)
+        parts.append(str(content)[:400])
+        break
+    if len(parts) < 2:
+        return ""
+    return "d:" + hashlib.sha1("|".join(parts).encode("utf-8", "replace")).hexdigest()[:20]
+
+
 def _note_duplicate(fingerprint):
     """返回 (是否 5 秒内重复, 距上次的秒数)。"""
     if not fingerprint:
@@ -471,7 +525,8 @@ class PortalHandler(BaseHTTPRequestHandler):
                 list(ENGINES), list(router.REALMS),
                 snap.ready,
                 lambda e, r, m: router.engine_holds(snap, e, r, m),
-                lambda m, r: router.candidates_for(m, snap, settings.routing(), r))
+                lambda m, r: router.candidates_for(m, snap, settings.routing(), r),
+                session_key=str(body.get("session_id") or "").strip() or None)
             return self._json(200, result, head_only=head_only)
         if rest == "routing":
             engines = list(ENGINES)
@@ -487,7 +542,9 @@ class PortalHandler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     return self._json(400, {"error": str(exc)}, head_only=head_only)
                 return self._json(200, doc, head_only=head_only)
-            return self._json(200, orchestrator.load(engines, realms), head_only=head_only)
+            doc = orchestrator.load(engines, realms)
+            doc["affinity"] = orchestrator.affinity_stats()
+            return self._json(200, doc, head_only=head_only)
         if rest in ("health", ""):
             return self._json(200, aggregator.hub_health(ports), head_only=head_only)
         if rest == "engines":
@@ -1173,18 +1230,27 @@ class PortalHandler(BaseHTTPRequestHandler):
         # 但另一区仍留在链尾兜底（「显式优先，不把路走死」）。
         requested = (params.get("realm") or [None])[0] or self.headers.get("X-Realm")
         candidates = router.candidates_for(model, snapshot, cfg, requested)
-        # 路由编排（第 200 轮）：用户规则把默认候选链重排/收窄。命中就用规则的
-        # 顺序，未命中保持原链；规则里 stop_on_miss 才会 fail-closed。
+        # 路由编排：规则重排 + 可用性剪枝 + 会话亲和。preview 走同一个 decide()，
+        # 因此面板看到的链就是实际会走的链。
+        _session = _session_identity(self.headers, body)
+        _cfg, _rule, _bound = None, None, None
         try:
             _cfg = orchestrator.load(list(ENGINES), list(router.REALMS))
             _ready = set()
             for _c in candidates:
-                if router.engine_holds(snapshot, _c[0], _c[1], model):
+                # 「模型在该引擎」+「该引擎有就绪账号」才算真可用：没有账号的引擎
+                # 排在链首只会白吃一次 503。
+                if router.engine_holds(snapshot, _c[0], _c[1], model) \
+                        and int(snapshot.ready.get(_c[0]) or 0) > 0:
                     _ready.add(_c)
-            candidates, _rule = orchestrator.reorder(candidates, model, requested, _ready, _cfg)
-            if _rule:
-                sys.stderr.write("[portal] routing rule=%s model=%s hops=%d\n"
-                                 % (_rule.get("id"), model, len(candidates)))
+            _bound = orchestrator.affinity_for(_session)
+            candidates, _rule = orchestrator.reorder(
+                candidates, model, requested, _ready, _cfg, session_key=_session)
+            if _rule or _bound:
+                sys.stderr.write(
+                    "[portal] routing rule=%s model=%s hops=%d affinity=%s\n"
+                    % ((_rule or {}).get("id") or "-", model, len(candidates),
+                       ("%s:%s" % _bound) if _bound else "-"))
         except Exception as _exc:
             sys.stderr.write("[portal] routing skipped: %s\n" % (_exc,))
         if scope_engines:
@@ -1223,6 +1289,10 @@ class PortalHandler(BaseHTTPRequestHandler):
             if self._proxy_stream(_eng0, "/" + rest, _q0, method, body,
                                   upstream.get(_eng0), accept_retryable=False):
                 # 响应已经在 _proxy_stream 里发完了，这里只结束处理
+                try:
+                    orchestrator.rebind(_session, [(_eng0, _realm0)], _cfg)
+                except Exception:
+                    pass
                 return None
         # ★ 已经给客户端写过字节（流式半途失败）时**不能再重发**：
         #   否则客户端会收到「第一跳的部分流 + 第二跳的完整流」——
@@ -1242,7 +1312,11 @@ class PortalHandler(BaseHTTPRequestHandler):
                              "status": status})
             last = (status, payload, pairs)
             last_engine = engine
-            if status not in router.RETRYABLE_STATUS:
+            # key_injected：本次发出去的是 hub 拼的引擎自有 key，而不是客户端那把。
+            # 只有这种情况 401 才值得换引擎（另一台的 key 可能有效）；否则 401 就是
+            # 客户端的 key 错，跨引擎重试只会把真实原因洗成 503。
+            _injected = bool(upstream.get(engine)) and upstream.get(engine) != key
+            if not router.should_retry(status, key_injected=_injected):
                 break
         # 真实服务区：引擎回包里的 X-WB-Realm / X-Qoder-Realm 优先（它可能因引擎
         # 自身的 auto-realm 回退而与 hub 请求的区不同）；引擎没报就用 hub 请求的区。
@@ -1252,9 +1326,18 @@ class PortalHandler(BaseHTTPRequestHandler):
                 served_realm = value
                 break
         reported = served_realm or attempts[-1]["realm"] or "auto"
+        _affinity_hit = bool(_bound) and _bound[0] == last_engine
+        if last is not None and int(last[0]) < 400:
+            # 只在真的服务成功时回写亲和：失败的那一跳不应把会话钉死
+            try:
+                orchestrator.rebind(
+                    _session, [(last_engine, served_realm or attempts[-1]["realm"])], _cfg)
+            except Exception:
+                pass
         self._record_route(last_engine, reported, attempts, last[0], model)
         extra = [("X-Hub-Route", "%s:%s" % (last_engine, reported)),
-                 ("X-Hub-Route-Attempts", json.dumps(attempts, ensure_ascii=False))]
+                 ("X-Hub-Route-Attempts", json.dumps(attempts, ensure_ascii=False)),
+                 ("X-Hub-Affinity", "hit" if _affinity_hit else "miss")]
         return self._relay(last[0], last[1], last[2], last_engine,
                            extra_headers=extra)
 

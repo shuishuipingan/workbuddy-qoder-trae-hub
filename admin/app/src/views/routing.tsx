@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { hubRouting, hubRoutingSave, hubRoutePreview } from '@/lib/api';
 import type { RouteRule, RoutingDoc } from '@/lib/api';
+import { useT } from '@/lib/i18n';
 
 const S: Record<string, React.CSSProperties> = {
   page: { display: 'flex', flexDirection: 'column', gap: 16 },
@@ -33,8 +34,11 @@ function newRule(): RouteRule {
   };
 }
 
-export default function RoutingView(props: { t?: (k: string) => string }) {
-  const t = props.t || ((k: string) => k);
+export default function RoutingView() {
+  // 与其它视图一致：自己从 i18n provider 取 t。以前这里写成 props.t，
+  // 但路由处渲染的是 <RoutingView />（没传 t），fallback 是恒等函数，
+  // 结果整页显示原始键名（routing.title / routing.save …）。
+  const t = useT();
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ['hub-routing'], queryFn: hubRouting, staleTime: 10_000 });
   const doc: RoutingDoc = q.data || { rules: [], policy: { strategy: 'first-available', session_affinity: true, max_fallbacks: 2 }, revision: 0 };
