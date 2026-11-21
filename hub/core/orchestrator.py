@@ -29,7 +29,7 @@ _RR = {}          # (rule_id, model) -> 上次用的下标，round-robin 用
 
 
 def _path():
-    return os.path.join(paths.hub_dir(), "route-settings.json")
+    return os.path.join(paths.data_root() or paths.hub_dir(), "route-settings.json")
 
 
 def _clean_list(value, field, limit=64):
@@ -52,6 +52,10 @@ def normalize_rule(item, engines, realms):
     name = str(item.get("name") or "")[:80]
     match = item.get("match") or {}
     action = item.get("action") or {}
+    if not isinstance(match, dict) or not isinstance(action, dict):
+        raise ValueError("match/action must be objects")
+    if not isinstance(action.get("chain"), list):
+        raise ValueError("action.chain must be an array")
     models = _clean_list(match.get("models"), "match.models")
     mrealms = [r for r in _clean_list(match.get("realms"), "match.realms") if r in realms]
     mengines = [e for e in _clean_list(match.get("engines"), "match.engines") if e in engines]
@@ -80,6 +84,8 @@ def normalize_rule(item, engines, realms):
 
 def normalize_policy(value):
     value = value or {}
+    if not isinstance(value, dict):
+        raise ValueError("policy must be an object")
     strategy = str(value.get("strategy") or "first-available")
     if strategy not in STRATEGIES:
         strategy = "first-available"
@@ -125,13 +131,17 @@ def save(payload, engines, realms, expected_revision=None):
         if expected_revision is not None and int(expected_revision) != int(current["revision"]):
             raise ValueError("配置已被别处修改（revision %s → %s），请刷新后重试"
                              % (expected_revision, current["revision"]))
-        rules = [normalize_rule(x, engines, realms) for x in (payload.get("rules") or [])]
+        items = payload.get("rules")
+        if not isinstance(items, list) or len(items) > 128:
+            raise ValueError("rules must be an array of at most 128 items")
+        rules = [normalize_rule(x, engines, realms) for x in items]
         ids = [r["id"] for r in rules]
         if len(ids) != len(set(ids)):
             raise ValueError("规则 id 重复")
         rules.sort(key=lambda r: (r["priority"], r["name"]))
         doc = {"rules": rules, "policy": normalize_policy(payload.get("policy")),
                "revision": int(current["revision"]) + 1, "saved_at": int(time.time())}
+        os.makedirs(os.path.dirname(_path()), exist_ok=True)
         tmp = _path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, ensure_ascii=False, indent=2)
@@ -165,7 +175,7 @@ def match_rule(rules, model, realm, engine):
     return None
 
 
-def reorder(candidates, model, realm, available, cfg):
+def reorder(candidates, model, realm, available, cfg, advance=True):
     """把默认候选链按编排规则重排。
 
     candidates: [(engine, realm)] 来自 router.candidates_for
@@ -196,8 +206,10 @@ def reorder(candidates, model, realm, available, cfg):
     merged = chain + rest
     if policy.get("strategy") == "round-robin" and len(merged) > 1:
         key = (rule["id"], str(model or ""))
-        idx = _RR.get(key, 0) % len(merged)
-        _RR[key] = idx + 1
+        with _LOCK:
+            idx = _RR.get(key, 0) % len(merged)
+            if advance:
+                _RR[key] = idx + 1
         merged = merged[idx:] + merged[:idx]
     limit = int(policy.get("max_fallbacks") or 0) + 1
     return merged[:max(1, limit)], rule
@@ -208,7 +220,7 @@ def preview(model, realm, engines, realms, snapshot_ready, snapshot_holds, candi
     cfg = load(engines, realms)
     base = list(candidates_for(model, realm) or [])
     available = set((e, r) for (e, r) in base if snapshot_holds(e, r, model))
-    ordered, rule = reorder(base, model, realm, available, cfg)
+    ordered, rule = reorder(base, model, realm, available, cfg, advance=False)
     hops = []
     for eng, rl in ordered:
         hops.append({"engine": eng, "realm": rl,

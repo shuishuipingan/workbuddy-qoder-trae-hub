@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { hubRouting, hubRoutingSave, hubRoutePreview } from '@/lib/api';
 import type { RouteRule, RoutingDoc } from '@/lib/api';
+import { useLang } from '@/lib/i18n';
 
 const S: Record<string, React.CSSProperties> = {
   page: { display: 'flex', flexDirection: 'column', gap: 16 },
@@ -33,8 +34,8 @@ function newRule(): RouteRule {
   };
 }
 
-export default function RoutingView(props: { t?: (k: string) => string }) {
-  const t = props.t || ((k: string) => k);
+export default function RoutingView() {
+  const { t } = useLang();
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ['hub-routing'], queryFn: hubRouting, staleTime: 10_000 });
   const doc: RoutingDoc = q.data || { rules: [], policy: { strategy: 'first-available', session_affinity: true, max_fallbacks: 2 }, revision: 0 };

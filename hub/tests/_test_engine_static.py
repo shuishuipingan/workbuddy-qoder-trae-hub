@@ -109,7 +109,7 @@ def hub_side_md5(path):
     """hub/engines 侧的内容指纹：剥掉受控补丁块再算。"""
     import hashlib
     with open(path, "rb") as fh:
-        text = fh.read().decode("utf-8", "replace")
+        text = fh.read().decode("utf-8").replace("\r\n", "\n")
     return hashlib.md5(strip_hub_patches(text).encode("utf-8")).hexdigest()
 
 

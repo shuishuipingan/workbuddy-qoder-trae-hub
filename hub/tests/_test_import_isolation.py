@@ -50,7 +50,11 @@ H.check("I01 三家引擎目录的模块名两两交集为空", not bad, "重名
 H.info("wb=%d, qd=%d, trae=%d, 并集=%d"
        % (len(wb_names), len(qd_names), len(trae_names),
           len(wb_names | qd_names | trae_names)))
-H.check("I01b wb 侧模块名全部以 wb_ 开头", all(n.startswith("wb_") for n in wb_names))
+#: wb 上游自带的、本身不以 wb_ 开头的模块（2.1.x 新增 console_tail）。
+#: 它们不与 qd/trae 重名（I01 已保证），改名会破坏"上游一行未改"，所以放行。
+WB_UPSTREAM_UNPREFIXED = {"console_tail.py"}
+H.check("I01b wb 侧模块名全部以 wb_ 开头",
+        all(n.startswith("wb_") or n in WB_UPSTREAM_UNPREFIXED for n in wb_names))
 H.check("I01c qd 侧模块名全部以 qoder_ 开头", all(n.startswith("qoder_") for n in qd_names))
 H.check("I01d trae 侧模块名全部以 trae_ 开头", all(n.startswith("trae_") for n in trae_names))
 H.info("对照：Lead 口头说的是「实测 21 个模块」——21 是**运行时真正被导入**的模块数（见 I03），")

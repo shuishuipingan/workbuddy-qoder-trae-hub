@@ -95,8 +95,8 @@ def main(argv=None):
     checks, blockers, proc = [], [], None
     try:
         subprocess.run([PY, os.path.join(ROOT, "hub", "tools", "make_fixture.py"),
-                        "--out", root, "--scenario", "all"], cwd=ROOT,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+                        "--out", root, "--scenario", "all", "--synthetic", "--engine", "wb"], cwd=ROOT,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180, check=True)
         proc, up = boot(root)
         if not up:
             print("实例没起来（端口被占？）")
@@ -131,7 +131,7 @@ def main(argv=None):
         _, acc = call("GET", "/api/wb/accounts?realm=cn", tok=tok)
         lst = acc.get("accounts") or []
         if not lst:
-            checks.append(("B 账号写失败 -> 500 write_failed", None, "数据根里没有账号"))
+            checks.append(("B 账号写失败 -> 500 write_failed", False, "未能加载合成账号"))
         else:
             uid = lst[0].get("uid") or lst[0].get("id")
             target = os.path.join(acc_dir, "%s.json" % uid)

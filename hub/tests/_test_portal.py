@@ -75,7 +75,7 @@ if not os.path.exists(P.ADMIN_INDEX):
     H.finish()
 
 portal_port = H.free_port()
-wb_port, qd_port = H.free_port(), H.free_port()
+wb_port, qd_port, trae_port = H.free_port(), H.free_port(), H.free_port()
 work = tempfile.mkdtemp(prefix="hub-portal-")
 copy_root = os.path.join(work, "hub")
 H.copy_tree(P.HUB, copy_root)
@@ -87,7 +87,7 @@ proc = None
 
 if has_flag:
     cmd = [sys.executable, "-m", "hub.server", "--host", "127.0.0.1",
-           "--wb-port", str(wb_port), "--qd-port", str(qd_port), "--portal-port", str(portal_port)]
+           "--wb-port", str(wb_port), "--qd-port", str(qd_port), "--trae-port", str(trae_port), "--portal-port", str(portal_port)]
 else:
     cmd = [sys.executable, "-m", "hub.core.portal", "--port", str(portal_port)]
 
@@ -218,7 +218,9 @@ try:
             def redirect_request(self, *a, **k):
                 return None
         _opener = _u2.build_opener(_NoRedirect)
-        for _eng, _p in (("wb", wb_port), ("qd", qd_port)):
+        for _eng, _p in (("wb", wb_port), ("qd", qd_port), ("trae", trae_port)):
+            _status, _doc = H.http_json("http://127.0.0.1:%d/health" % _p, timeout=5)
+            H.check("P12a %s /health 不重定向" % _eng, _status == 200 and _doc.get("ok") is True)
             try:
                 with _opener.open("http://127.0.0.1:%d/" % _p, timeout=10) as _r:
                     _code, _loc = _r.status, ""
@@ -229,6 +231,38 @@ try:
                     "status=%s location=%s" % (_code, _loc))
     except Exception as exc:  # noqa: BLE001
         H.check("P12 引擎根路径重定向", False, "%s: %s" % (type(exc).__name__, exc))
+
+    # Scope the dashboard redirect to dashboard pages; exercise the actual shipped entry.
+    import re
+    _base = "http://127.0.0.1:%d" % portal_port
+    _st, _html = H.http_get(_base + "/", timeout=5)
+    _refs = re.findall(rb'(?:src|href)="\.?(/static/[^"?#]+)"', _html)
+    H.check("P12b 面板入口引用主脚本和样式", _st == 200 and len(_refs) >= 2)
+    for _ref in _refs:
+        _status, _asset = H.http_get(_base + _ref.decode("ascii"), timeout=5)
+        H.check("P12c 实际 HTTP 资源 " + _ref.decode("ascii"), _status == 200 and bool(_asset))
+
+    # Exercise the same POST method the workbench uses, on the isolated instance.
+    def _route_save(payload, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["X-Panel-Token"] = token
+        req = _u2.Request(_base + "/api/hub/routing", data=json.dumps(payload).encode(),
+                          headers=headers, method="POST")
+        try:
+            with _u2.urlopen(req, timeout=8) as reply:
+                return reply.status, json.load(reply)
+        except _u2.HTTPError as exc:
+            with exc:
+                return exc.code, json.load(exc)
+
+    _initial = H.http_json(_base + "/api/hub/routing", timeout=5)[1]
+    _status, _ = _route_save(_initial)
+    H.check("P12d 路由写入需要面板鉴权", _status == 401)
+    _status, _saved = _route_save(_initial, "admin")
+    H.check("P12e POST 保存路由并递增版本", _status == 200 and _saved.get("revision") == _initial["revision"] + 1)
+    _status, _ = _route_save(_initial, "admin")
+    H.check("P12f 过期版本不可覆盖路由", _status in (400, 409))
 
     # ---------- P13 客户端提前断开：不许崩、不许在日志里刷堆栈 ----------
     # 由来（第 64 轮）：套件输出里冒出一堆 ConnectionAbortedError(10053) ——

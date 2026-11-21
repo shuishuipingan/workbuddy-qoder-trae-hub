@@ -419,17 +419,6 @@ class Scheduler:
             self.log("账号池不可用，跳过本次巡检")
             return
         accounts = list(self.pool.accounts)
-        # 文本任务（国内签到 / 活动上报 / 猫猫旅行 / 国际每日活跃）只能跑
-        # 文本号池的账号；媒体号只参与图片 / 视频。Token 保活仍覆盖所有账号，
-        # 所以这里不把媒体号从循环里删掉，而是在下面各任务分支逐项过滤。
-        try:
-            import wb_pool_scope
-        except Exception:
-            wb_pool_scope = None
-
-        def text_task_account(acc):
-            return (wb_pool_scope is None
-                    or wb_pool_scope.account_scope(acc) == wb_pool_scope.SCOPE_TEXT)
 
         if not accounts and not (
                 self._codearts_checkin_pending(run_checkin)
@@ -458,12 +447,11 @@ class Scheduler:
                 # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
                 time.sleep(random.uniform(2.0, 5.0))
             uid8 = acc.uid[:8] if acc.uid else "?"
-            # 上游账号级风控限制（403 / code 11140）中的账号一律跳过：无人值守
+            # 上游账号级封禁（403 / code 11140）中的账号一律跳过：无人值守
             # 的巡检/打卡再去「试探」一次，只会让同一台设备上的其他账号连坐。
-            # 限制期限是持久化的（wb_accounts.note_restricted），重启后仍然有效。
-            if getattr(acc, "restricted_until", 0.0) > time.time():
-                self.log(f"跳过受限账号 [{uid8}]：上游风控限制剩余 "
-                         f"{int(acc.restricted_until - time.time())}s")
+            # 封禁是持久禁用，只有操作者手动启用才解除。
+            if getattr(acc, "account_banned", False):
+                self.log(f"跳过封禁账号 [{uid8}]：需在面板手动启用")
                 continue
             # 区域级连坐暂停期间（同一窗口内多个账号被限制）整轮都不碰上游。
             try:
@@ -496,7 +484,7 @@ class Scheduler:
                         self.log(f"! 账号 [{uid8}] Token 保活刷新失败: {acc.last_error}")
 
             # 2. 如果是国内版账号，检查每日签到与猫猫旅行
-            if acc.realm == "cn" and task_active and text_task_account(acc):
+            if acc.realm == "cn" and task_active:
                 if run_checkin:
                     if acc.can_checkin():
                         self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
@@ -558,8 +546,7 @@ class Scheduler:
                     time.sleep(1.0)
 
             # 3. 如果是国际版账号，检查每日活跃对话 (送 30/50 积分福利)
-            if (acc.realm == "intl" and task_active and run_daily_chat
-                    and text_task_account(acc)):
+            if acc.realm == "intl" and task_active and run_daily_chat:
                 if acc.can_daily_chat():
                     daily_chat_targets.append(acc)
 

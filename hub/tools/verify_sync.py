@@ -31,9 +31,9 @@ PATCH_CLOSE = "# <<< hub-patch:"
 
 #: 引擎 → (vendored 目录, 上游原件目录, 入口文件名)
 ENGINES = {
-    "wb": (os.path.join(HUB, "engines", "wb"), os.path.join(SIBLING, "wb"), "wb_proxy.py"),
-    "qd": (os.path.join(HUB, "engines", "qd"), REPO, "qoder_proxy.py"),
-    "trae": (os.path.join(HUB, "engines", "trae"), os.path.join(SIBLING, "trae2api-hub"), "trae_proxy.py"),
+    "wb": (os.path.join(HUB, "engines", "wb"), os.environ.get("HUB_WB_ORIGIN", os.path.join(SIBLING, "wb")), "wb_proxy.py"),
+    "qd": (os.path.join(HUB, "engines", "qd"), os.environ.get("HUB_QD_ORIGIN", REPO), "qoder_proxy.py"),
+    "trae": (os.path.join(HUB, "engines", "trae"), os.environ.get("HUB_TRAE_ORIGIN", os.path.join(SIBLING, "trae2api-hub")), "trae_proxy.py"),
 }
 
 #: 除了 *.py，还要比对的非源码文件（各引擎自带的数据/前端）
@@ -65,7 +65,7 @@ def digest(path, strip):
         raw = fh.read()
     if not strip:
         return hashlib.md5(raw).hexdigest()
-    text = raw.decode("utf-8", "replace")
+    text = raw.decode("utf-8").replace("\r\n", "\n")
     return hashlib.md5(strip_hub_patches(text).encode("utf-8")).hexdigest()
 
 

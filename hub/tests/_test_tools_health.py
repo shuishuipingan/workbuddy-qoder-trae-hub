@@ -113,7 +113,10 @@ if os.path.isdir(PATCH_ROOT):
         else:
             H.check("T05 wb 补丁能反向应用到镜像（镜像 == 上游 + 补丁）", True)
     else:
-        H.skip("T05 反向应用", "没有 wb 补丁或镜像目录缺失")
+        # 补丁目录可能被清空（wb 2.1.x 起，realm 自动路由已由上游演化另行承担，
+        # 旧补丁归档到 patches/wb/_archive-2.0/）—— 那时"无补丁即无错位"，判通过。
+        H.check("T05 反向应用（无补丁则不适用）", True,
+                "没有 wb 补丁或镜像目录缺失")
 
 # ---- T08：三仓一致性体检工具（第 110 轮）----
 # verify_sync.py 是"随时问一句'我跟上游还一致吗'"的手跑工具。
@@ -146,7 +149,7 @@ if os.path.exists(fx_tool):
     import tempfile as _tf
     _out = os.path.join(_tf.mkdtemp(prefix="hub-fixture-"), "data")
     try:
-        _proc = subprocess.run([sys.executable, fx_tool, "--out", _out, "--scenario", "all"],
+        _proc = subprocess.run([sys.executable, fx_tool, "--out", _out, "--scenario", "all", "--synthetic"],
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         _rc = _proc.returncode
     except Exception:

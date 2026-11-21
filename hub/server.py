@@ -219,6 +219,7 @@ def wait_health(port, host="127.0.0.1", timeout=25.0, expect=None):
     import json
     import urllib.request
     deadline = time.time() + timeout
+    host = "127.0.0.1" if host in ("0.0.0.0", "", None) else host
     url = "http://%s:%d/health" % (host, port)
     while time.time() < deadline:
         try:
@@ -282,6 +283,7 @@ def wait_portal(host, port, timeout=20.0):
     import json
     import urllib.request
     deadline = time.time() + timeout
+    host = "127.0.0.1" if host in ("0.0.0.0", "", None) else host
     url = "http://%s:%d/api/hub/health" % (host, port)
     while time.time() < deadline:
         try:

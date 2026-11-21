@@ -703,7 +703,7 @@ def _spawn_helper(cmd, version, failure):
         raise UpdateError("%s: %s" % (failure, exc))
 
 
-def request_install(tag, current_version, port=8788, lan=False, repo=None):
+def request_install(tag, current_version, port=8789, lan=False, repo=None):
     if not available():
         raise UpdateError("当前部署不支持便携版一键更新")
     target = _version_tuple(tag)
@@ -726,7 +726,7 @@ def request_install(tag, current_version, port=8788, lan=False, repo=None):
     return {"state": "queued", "version": version, "message": "更新任务已排队"}
 
 
-def request_rollback(version, current_version, port=8788, lan=False):
+def request_rollback(version, current_version, port=8789, lan=False):
     """Queue a restore from a retained backup for the detached helper."""
     if not available():
         raise UpdateError("当前部署不支持便携版一键回退")

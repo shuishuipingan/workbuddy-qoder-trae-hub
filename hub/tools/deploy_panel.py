@@ -16,6 +16,7 @@ import argparse
 import os
 import shutil
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HUB = os.path.dirname(HERE)
@@ -41,16 +42,30 @@ def main(argv=None):
         print("dist 不存在：%s（先 npx vite build）" % DIST)
         return 2
     new_files = _walk(DIST)
-    old_files = _walk(TARGET)
+    if "index.html" not in new_files or not any(f.startswith("static" + os.sep) for f in new_files):
+        print("dist 缺少入口或静态资源")
+        return 2
+    old_files = {os.path.join(d, f) for d in ("static", "assets")
+                 for f in _walk(os.path.join(TARGET, d))}
     copied = 0
-    for rel in sorted(new_files):
+    for rel in sorted(new_files, key=lambda f: (f == "index.html", f)):
         src = os.path.join(DIST, rel)
         dst = os.path.join(TARGET, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if args.dry_run:
             print("copy", rel)
             continue
-        shutil.copy2(src, dst)
+        if rel == "index.html":
+            fd, tmp = tempfile.mkstemp(prefix=".panel-", dir=TARGET)
+            os.close(fd)
+            try:
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        else:
+            shutil.copy2(src, dst)
         copied += 1
     stale = sorted(old_files - new_files)
     # 只清理构建产物目录，别碰 logo.jpg / 手工放进去的东西

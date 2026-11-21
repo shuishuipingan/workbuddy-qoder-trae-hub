@@ -19,9 +19,9 @@ ENTRY = {"wb": "wb_proxy.py", "qd": "qoder_proxy.py", "trae": "trae_proxy.py"}
 
 # 两个引擎的「原件」：搬入前的来源路径（静态契约要逐字节比对）
 ORIGIN = {
-    "wb": os.path.join(SIBLING, "wb"),                    # 合并damo/wb
-    "qd": REPO,                                           # qoder-proxy 仓根
-    "trae": os.path.join(SIBLING, "trae2api-hub"),        # 合并damo/trae2api-hub
+    "wb": os.environ.get("HUB_WB_ORIGIN", os.path.join(SIBLING, "wb")),                    # 合并damo/wb
+    "qd": os.environ.get("HUB_QD_ORIGIN", REPO),                                           # qoder-proxy 仓根
+    "trae": os.environ.get("HUB_TRAE_ORIGIN", os.path.join(SIBLING, "trae2api-hub")),        # 合并damo/trae2api-hub
 }
 ADMIN_INDEX = os.path.join(REPO, "admin", "index.html")
 

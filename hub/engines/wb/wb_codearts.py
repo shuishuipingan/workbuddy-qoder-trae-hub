@@ -17,6 +17,7 @@
 依赖：Python 3.9+ 标准库；密码学原语在 `wb_codearts_crypto.py`。
 """
 
+import io
 import json
 import os
 import secrets
@@ -28,6 +29,7 @@ import urllib.parse
 import urllib.request
 
 import wb_settings
+import wb_time
 import wb_codearts_crypto as crypto
 
 # ---------------------------------------------------------------------------
@@ -92,6 +94,17 @@ CATALOG_MIN_INTERVAL = 60.0
 ERR_THRESHOLD = 3
 ERR_COOLDOWN = 600.0
 SOFT_COOLDOWN = 60.0
+#: 积分耗尽不是瞬时错误：账号需要等用户补积分或活动到账，60 秒后重试
+#: 只会把同一个 400 再打一遍。给它一个更长的可恢复冷却，仍会自然解冻。
+CREDIT_COOLDOWN = 600.0
+#: 并发名额满时的最长等待（秒）。单账号并发上限默认 1，而客户端常常在同一
+#: 瞬间发出第二个请求（DSH 的自动标题请求就与首轮请求同时到达）。旧实现只
+#: 等约 100ms 就回「没有可用的 CodeArts 账号」，把一次几百毫秒的正常排队
+#: 说成了账号缺失，客户端把它当成配置错误、不会重试。这里改为在名额释放
+#: 前排队等待，等不到再回可重试的 429。10s 足够覆盖标题请求那 1~2s 的
+#: 占用；真被长请求占着时，继续等 20s 也未必能等到，不如早点回 429 让
+#: 客户端按退避重试。
+BUSY_WAIT_SECONDS = 10.0
 #: token 提前刷新窗口。
 REFRESH_SKEW = 1800.0
 #: OAuth 会话 TTL。
@@ -105,6 +118,7 @@ DEFAULTS = {
     "stream_timeout_seconds": 600.0,
     "models_ttl_seconds": 300.0,
     "max_concurrent": 1,
+    "busy_wait_seconds": BUSY_WAIT_SECONDS,
     "benefit_auto_claim": True,
     "credits_auto_claim": False,
 }
@@ -170,6 +184,15 @@ class CodeArtsUnavailable(CodeArtsError):
     pass
 
 
+class CodeArtsBusy(CodeArtsUnavailable):
+    """池里还有健康账号，只是并发名额暂时被别的请求占满。
+
+    与「一个账号都没有」必须分开：前者等一会儿就好，后者要用户去账号页
+    添加账号。客户端对两者的处理也不同（重试 vs 报配置错误）。
+    """
+    pass
+
+
 class CodeArtsAuthError(CodeArtsError):
     pass
 
@@ -227,6 +250,9 @@ def load_config(accounts_dir):
             60.0, 86400.0),
         "max_concurrent": _positive_int(
             raw.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20),
+        "busy_wait_seconds": _positive_float(
+            raw.get("busy_wait_seconds"), DEFAULTS["busy_wait_seconds"],
+            0.0, 120.0),
         "benefit_auto_claim": raw.get("benefit_auto_claim", True) is not False,
         "credits_auto_claim": raw.get("credits_auto_claim", False) is True,
         "accounts_dir": accounts_dir,
@@ -266,6 +292,9 @@ def save_config(accounts_dir, patch):
             60.0, 86400.0)
         merged["max_concurrent"] = _positive_int(
             merged.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20)
+        merged["busy_wait_seconds"] = _positive_float(
+            merged.get("busy_wait_seconds"), DEFAULTS["busy_wait_seconds"],
+            0.0, 120.0)
         merged["benefit_auto_claim"] = merged.get("benefit_auto_claim", True) is not False
         merged["credits_auto_claim"] = merged.get("credits_auto_claim", False) is True
         # 重新读 settings：`load_config` 只返回收敛后的 codearts 段，写回去要
@@ -402,6 +431,9 @@ class CodeArtsAccount(object):
         self.proxy = ""
         self.disabled = False
         self.disabled_reason = ""
+        # 面板手动停用是独立于上游健康状态的操作员意图。token 刷新、
+        # OAuth 重新登录和 note_error 都不能隐式把它清掉；只有 enable() 可以。
+        self.manual_disabled = False
         self.cool_until = 0.0
         self.err_count = 0
         self.last_error = ""
@@ -420,6 +452,16 @@ class CodeArtsAccount(object):
         self._refresh_lock = threading.Lock()
         self._models_lock = threading.Lock()
         self._info_lock = threading.Lock()
+        # Credit accounting samples the account's cumulative "used" counter
+        # before and after a request. Serialize only those two short lookups,
+        # never the chat stream itself. `_credit_settled_used` is the account
+        # wide high-water mark: overlapping requests may observe the same
+        # cumulative value, but only the first settlement may claim that delta.
+        # `_credit_explicit_pending` keeps a credit value returned directly by
+        # an upstream response from being counted again in the next delta.
+        self._credit_sample_lock = threading.RLock()
+        self._credit_settled_used = None
+        self._credit_explicit_pending = 0.0
 
     def chat_base_url(self):
         return SNAP_HOST
@@ -469,9 +511,10 @@ class CodeArtsAccount(object):
             "updated_at": int(time.time()),
         })
         self.auth = save_auth(self.pool.accounts_dir, self.auth)
-        self.disabled = False
-        self.disabled_reason = ""
-        self.last_error = ""
+        if not self.manual_disabled:
+            self.disabled = False
+            self.disabled_reason = ""
+            self.last_error = ""
 
     # ---- 状态快照 ----
     def view(self):
@@ -502,7 +545,7 @@ class CodeArtsAccount(object):
             "checkin": self.checkin,
             "disabled": self.disabled,
             "cooling": cooling,
-            "until": (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.cool_until))
+            "until": (wb_time.strftime("%Y-%m-%dT%H:%M:%S", wb_time.localtime(self.cool_until))
                       if cooling else ""),
             "err_count": self.err_count,
             "reason": reason,
@@ -510,8 +553,8 @@ class CodeArtsAccount(object):
             "active_concurrent": self.active_concurrent,
             "max_concurrent": self.max_concurrent,
             "token_remaining": _fmt_duration(self.token_remaining()),
-            "expires_at": (time.strftime("%Y-%m-%dT%H:%M:%S",
-                                         time.localtime(self.expires_at()))
+            "expires_at": (wb_time.strftime("%Y-%m-%dT%H:%M:%S",
+                                            wb_time.localtime(self.expires_at()))
                            if self.expires_at() else ""),
             "models": len(self.models),
             "proxy_slot": self.proxy_slot,
@@ -542,8 +585,7 @@ class CodeArtsAccount(object):
         text = str(entry.get("checked_at") or "")
         if len(text) < 10:
             return False
-        today = time.strftime("%Y-%m-%d",
-                              time.localtime(now if now is not None else time.time()))
+        today = wb_time.day_key(time.time() if now is None else now)
         return text[:10] == today
 
     def has_model(self, model):
@@ -570,6 +612,9 @@ class CodeArtsPool(object):
         self.config = dict(config)
         self.accounts = []
         self._lock = threading.RLock()
+        # 并发名额归还时唤醒等待中的请求。用独立的 Condition（不挂在
+        # `_lock` 上）避免 `release()` 在持有账号锁时再去抢池锁。
+        self._release_cond = threading.Condition()
         self.load()
 
     # ---- 持久化 ----
@@ -585,6 +630,15 @@ class CodeArtsPool(object):
             acct.disabled = bool(entry.get("disabled"))
             acct.disabled_reason = str(entry.get("reason") or "")
             acct.last_error = str(entry.get("last_error") or "")
+            if "manual_disabled" in entry:
+                acct.manual_disabled = entry.get("manual_disabled") is True
+            else:
+                # 兼容旧 state.json：早期没有 manual_disabled，只能从原因推断。
+                # 认证失败写的是上游错误正文，不会命中下面这些面板文案。
+                reason = (acct.disabled_reason + " " + acct.last_error).lower()
+                acct.manual_disabled = bool(acct.disabled) and any(
+                    marker in reason for marker in
+                    ("manual", "手动", "停用", "disabled by operator"))
             acct.note = str(entry.get("note") or "")[:200]
             acct.tasks_enabled = bool(entry.get("tasks_enabled", True))
             if isinstance(entry.get("checkin"), dict):
@@ -619,6 +673,7 @@ class CodeArtsPool(object):
                 "err_count": acct.err_count,
                 "cool_until": acct.cool_until,
                 "disabled": acct.disabled,
+                "manual_disabled": bool(acct.manual_disabled),
                 "reason": acct.disabled_reason,
                 "last_error": acct.last_error,
                 "checkin": acct.checkin,
@@ -693,11 +748,12 @@ class CodeArtsPool(object):
                     existing.auth = acct.auth
                     existing.proxy_slot = acct.proxy_slot
                     existing.nickname = acct.nickname
-                    existing.disabled = False
-                    existing.disabled_reason = ""
-                    existing.last_error = ""
-                    existing.err_count = 0
-                    existing.cool_until = 0
+                    if not existing.manual_disabled:
+                        existing.disabled = False
+                        existing.disabled_reason = ""
+                        existing.last_error = ""
+                        existing.err_count = 0
+                        existing.cool_until = 0
                     existing.models_fetched_at = 0
                     self.accounts[index] = existing
                     self.save_state()
@@ -724,6 +780,7 @@ class CodeArtsPool(object):
             return False
         acct.disabled = False
         acct.disabled_reason = ""
+        acct.manual_disabled = False
         acct.last_error = ""
         acct.err_count = 0
         acct.cool_until = 0
@@ -736,6 +793,7 @@ class CodeArtsPool(object):
             return False
         acct.disabled = True
         acct.disabled_reason = reason
+        acct.manual_disabled = True
         acct.last_error = reason
         self.save_state()
         return True
@@ -810,9 +868,41 @@ class CodeArtsPool(object):
             return True
 
     def release(self, acct):
+        released = False
         with acct._lock:
             if acct.active_concurrent > 0:
                 acct.active_concurrent -= 1
+                released = True
+        if released:
+            # 在账号锁外唤醒排队者：被唤醒的线程会立刻 `pick()`，那里要
+            # 遍历账号；持着 acct._lock 通知只会把唤醒拖到锁外，没有意义。
+            with self._release_cond:
+                self._release_cond.notify_all()
+
+    def wait_for_slot(self, timeout):
+        """等任一在飞请求归还名额；返回 True 表示被唤醒。
+
+        只当提示用：调用方醒来后必须重新 `pick()`，因为名额可能被另一个
+        等待者先抢走（也可能在进入 wait 前就已经归还）。
+        """
+        with self._release_cond:
+            return self._release_cond.wait(max(0.0, float(timeout)))
+
+    def busy_accounts(self, exclude=None, allowed_accounts=None):
+        """健康、允许使用、但并发名额已满的账号。
+
+        用来区分「账号池是空的/全在冷却」和「账号都在忙」：只有后者值得
+        排队等待。不看 `has_model()`，与 `pick()` 的兜底选号口径保持一致。
+        """
+        exclude = set(exclude or ())
+        now = time.time()
+        with self._lock:
+            accounts = list(self.accounts)
+        return [acct for acct in accounts
+                if acct.uid not in exclude
+                and (allowed_accounts is None or acct.uid in allowed_accounts)
+                and acct.healthy(now)
+                and acct.active_concurrent >= acct.max_concurrent]
 
     def note_success(self, acct):
         if acct.err_count or acct.cool_until or acct.last_error:
@@ -821,13 +911,15 @@ class CodeArtsPool(object):
             acct.last_error = ""
             self.save_state()
 
-    def note_error(self, acct, message, soft=False, terminal=False):
+    def note_error(self, acct, message, soft=False, terminal=False,
+                   cooldown=None):
         acct.last_error = str(message or "")[:200]
         if terminal:
             acct.disabled = True
             acct.disabled_reason = acct.last_error
         elif soft:
-            acct.cool_until = time.time() + SOFT_COOLDOWN
+            delay = SOFT_COOLDOWN if cooldown is None else max(0.0, float(cooldown))
+            acct.cool_until = time.time() + delay
         else:
             acct.err_count += 1
             if acct.err_count >= ERR_THRESHOLD:
@@ -1721,6 +1813,10 @@ class CodeArtsStream(object):
         self._last_text = ""
         self._usage = None
         self._created = int(time.time())
+        self._credit_baseline = None
+        self._credit_baseline_ready = False
+        self._credit_finalized = False
+        self._last_credit_usage = None
 
     def __enter__(self):
         return self
@@ -1738,6 +1834,104 @@ class CodeArtsStream(object):
             self.pool.release(self.acct)
         except Exception:
             pass
+
+    # ---- 积分结算 ----
+    def seed_credit_baseline(self, used):
+        """Attach the cumulative-used snapshot taken before the chat POST."""
+        try:
+            self._credit_baseline = None if used is None else float(used)
+            self._credit_baseline_ready = used is not None
+        except (TypeError, ValueError):
+            self._credit_baseline = None
+            self._credit_baseline_ready = False
+
+    def take_credit_baseline(self):
+        """Sample the account's cumulative used-credit counter before a POST."""
+        with self.acct._credit_sample_lock:
+            current = _sample_credit_used(self.acct)
+            if current is not None:
+                settled = self.acct._credit_settled_used
+                # A package renewal can reset the counter. Only adopt the
+                # lower value when this request is alone; a stale sample while
+                # other requests are in flight must not erase their charges.
+                if (settled is None
+                        or (current < settled
+                            and self.acct.active_concurrent <= 1)):
+                    self.acct._credit_settled_used = current
+                    self.acct._credit_explicit_pending = 0.0
+            self.seed_credit_baseline(current)
+        return self._credit_baseline
+
+    def finish_credit_sample(self, usage):
+        """把累计已用积分的前后差值写入本次 usage。
+
+        重复调用必须幂等；采样失败或计数回退（套餐切换/刷新）时，不改动
+        usage。上游直接返回非零 credit 时保留该值，并在下一次累计采样中
+        扣掉已声明的部分，避免重复记账。返回值是最终 usage。
+
+        同一账号的请求可能重叠，而上游只提供累计已用积分。用账号级
+        high-water mark 结算可以保证总量不重复：某个请求先结算后，其他请求
+        只能从已经结算到的水位继续计算；因此并发请求中可能有一个请求记 0，
+        但所有成功请求的 credit 总和与上游累计增量一致。
+        """
+        if self._credit_finalized:
+            return self._last_credit_usage
+        self._credit_finalized = True
+        self._last_credit_usage = usage
+        if not isinstance(usage, dict):
+            return usage
+        if not self._credit_baseline_ready or self._credit_baseline is None:
+            return usage
+        try:
+            explicit_credit = float(usage.get("credit") or 0)
+        except (TypeError, ValueError):
+            explicit_credit = 0.0
+        if explicit_credit > 0:
+            # The upstream supplied the amount for this request. Keep it as
+            # the row value, but remember it until a cumulative sample proves
+            # the charge has landed. A snapshot taken before this request
+            # settles must not be mistaken for a post-charge total.
+            with self.acct._credit_sample_lock:
+                if self.acct._credit_settled_used is not None:
+                    self.acct._credit_explicit_pending += explicit_credit
+            return usage
+        try:
+            _ensure_token(self.acct)
+            with self.acct._credit_sample_lock:
+                info = fetch_account_info(self.acct, timeout=5.0)
+                total = ((info.get("credits") or {}).get("total") or {})
+                used = total.get("used")
+                if used is None:
+                    return usage
+                used = float(used)
+                settled = self.acct._credit_settled_used
+                if settled is None:
+                    settled = float(self._credit_baseline)
+                    self.acct._credit_settled_used = settled
+                if used < settled:
+                    # The counter can go backwards after a package renewal.
+                    # A later request's baseline will adopt the new range.
+                    return usage
+                unaccounted = used - settled
+                pending = self.acct._credit_explicit_pending
+                if unaccounted >= pending:
+                    delta = unaccounted - pending
+                    self.acct._credit_settled_used = used
+                    self.acct._credit_explicit_pending = 0.0
+                else:
+                    # This sample predates the explicit charge. Keep the
+                    # pending amount for the next request instead of charging
+                    # it to a request that has no upstream credit of its own.
+                    delta = unaccounted
+                    self.acct._credit_settled_used = used
+                if delta <= 0:
+                    return usage
+                usage = dict(usage)
+                usage["credit"] = round(delta, 4)
+                self._last_credit_usage = usage
+                return usage
+        except Exception:
+            return usage
 
     def preflight(self):
         """读到首个 data 事件；HTTP 200 里内嵌的业务错误在这里抛出。"""
@@ -1770,6 +1964,9 @@ class CodeArtsStream(object):
             message = str(payload.get("error_msg") or payload.get("message")
                           or text)[:300]
             lowered = message.lower()
+            if _is_credit_exhausted_message(message):
+                raise CodeArtsUpstreamError(
+                    message, status=429, code="CREDIT_EXHAUSTED")
             if ("request param is invalid" in lowered
                     or "request model is not multimodal" in lowered
                     or "tool function cannot empty" in lowered):
@@ -1921,6 +2118,22 @@ def _is_concurrency_message(message):
             in text)
 
 
+def _is_credit_exhausted_message(message):
+    """Whether a 400 means the account's credit package is empty.
+
+    This is a recoverable account-level condition, not a malformed client
+    request. Treat it like a soft 429 so the router cools the account and
+    rotates instead of retrying the same zero-credit account forever.
+    """
+    text = str(message or "").lower()
+    return ("积分已耗尽" in text
+            or "积分不足" in text
+            or "credit exhausted" in text
+            or "credits exhausted" in text
+            or "insufficient credit" in text
+            or "insufficient credits" in text)
+
+
 def _model_output_limit(acct, model):
     """Advertised output limit for the canonical CodeArts model."""
     key = str(model or "").strip().lower()
@@ -1968,6 +2181,19 @@ def _clamp_output_tokens(acct, model, body):
         body[key] = limit
 
 
+def _sample_credit_used(acct):
+    """Best-effort cumulative credit snapshot; never raises into chat."""
+    try:
+        _ensure_token(acct)
+        with acct._credit_sample_lock:
+            info = fetch_account_info(acct, timeout=5.0)
+        total = ((info.get("credits") or {}).get("total") or {})
+        used = total.get("used")
+        return None if used is None else float(used)
+    except Exception:
+        return None
+
+
 def _client_chat(acct, body, session_key):
     model = _canonical_model(acct, body.get("model"))
     chat_id = body.get("chat_id") or _derive_chat_id(session_key, body.get("messages"))
@@ -1999,6 +2225,10 @@ def _client_chat(acct, body, session_key):
     timeout = float(acct.pool.config.get("stream_timeout_seconds")
                     or DEFAULTS["stream_timeout_seconds"])
     last_error = None
+    # Sample before the POST: CodeArts settles credits immediately, so a
+    # post-response baseline would already include this request's cost.
+    credit_baseline = CodeArtsStream(
+        io.BytesIO(b""), model, acct, acct.pool).take_credit_baseline()
     for attempt in range(3):
         req = urllib.request.Request(SNAP_HOST + EP_CHAT, data=raw,
                                      headers=headers, method="POST")
@@ -2020,6 +2250,9 @@ def _client_chat(acct, body, session_key):
                     continue
                 raise last_error
             if exc.code == 400:
+                if _is_credit_exhausted_message(message):
+                    raise CodeArtsUpstreamError(
+                        message, status=429, code="CREDIT_EXHAUSTED")
                 raise CodeArtsBadRequest(message, status=exc.code)
             if exc.code == 429:
                 raise CodeArtsUpstreamError(message, status=exc.code, code="429")
@@ -2030,6 +2263,7 @@ def _client_chat(acct, body, session_key):
             reason = getattr(exc, "reason", None) or exc
             raise CodeArtsUnavailable("连不上 CodeArts 聊天接口：%s" % reason)
         stream = CodeArtsStream(resp, model, acct, acct.pool)
+        stream.seed_credit_baseline(credit_baseline)
         try:
             stream.preflight()
         except CodeArtsUpstreamError as exc:
@@ -2037,6 +2271,8 @@ def _client_chat(acct, body, session_key):
             if _is_concurrency_message(str(exc)):
                 last_error = exc
                 if attempt < 2:
+                    # The failed attempt spent no credits; keep the original
+                    # baseline so the retry does not absorb a phantom delta.
                     time.sleep(2.0 * (attempt + 1))
                     continue
             raise
@@ -2047,8 +2283,27 @@ def _client_chat(acct, body, session_key):
     raise last_error or CodeArtsUpstreamError("CodeArts 并发会话已满")
 
 
+def _busy_wait_seconds(config):
+    """池内排队等待并发名额的上限（秒）。0 表示不等，立即回 429。"""
+    return _positive_float((config or {}).get("busy_wait_seconds"),
+                           BUSY_WAIT_SECONDS, 0.0, 120.0)
+
+
+def _busy_message(busy, waited):
+    names = "、".join(acct.nickname or acct.uid for acct in busy[:2])
+    return ("CodeArts 账号正忙：%s 的并发名额都被其它请求占用，"
+            "已等待 %.1fs；请稍后重试。" % (names, waited))
+
+
 def open_chat(config, body, session_key=None, allowed_accounts=None):
-    """选账号、续期、发现模型并打开 SSE；返回 (stream, account, model)。"""
+    """选账号、续期、发现模型并打开 SSE；返回 (stream, account, model)。
+
+    并发名额占满时在这里排队等待，而不是像旧实现那样只等约 100ms 就报
+    「没有可用的 CodeArts 账号」。单账号并发上限默认 1，而客户端往往在同一
+    瞬间发出第二个请求（DSH 的自动标题请求就与首轮请求同时到达）；把排队
+    说成账号缺失会让客户端把它当成配置错误，首轮直接失败——用户再发一次
+    「继续」时名额已经空出来，于是又正常了。
+    """
     if not config.get("enabled"):
         raise CodeArtsBadRequest(
             "CodeArts 出口未启用：请到设置页打开「启用 CodeArts 出口」。")
@@ -2057,13 +2312,27 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
     exclude = set()
     last_error = None
     attempts = max(2, len(pool.accounts) + 1)
+    wait_started = time.time()
+    wait_deadline = wait_started + _busy_wait_seconds(config)
     for _ in range(attempts):
-        acct = pool.pick(model, session_key=session_key, exclude=exclude,
-                         allowed_accounts=allowed_accounts)
+        acct = None
+        while True:
+            acct = pool.pick(model, session_key=session_key, exclude=exclude,
+                             allowed_accounts=allowed_accounts)
+            if acct is not None:
+                break
+            busy = pool.busy_accounts(exclude=exclude,
+                                      allowed_accounts=allowed_accounts)
+            if not busy:
+                # 池是空的 / 账号全被停用或冷却：排队也等不到名额。
+                break
+            remaining = wait_deadline - time.time()
+            if remaining <= 0:
+                raise CodeArtsBusy(
+                    _busy_message(busy, time.time() - wait_started))
+            # 上限 0.25s：即使 notify 丢了一次，也能很快重新检查名额。
+            pool.wait_for_slot(min(remaining, 0.25))
         if acct is None:
-            if pool.accounts and any(a.active_concurrent > 0 for a in pool.accounts):
-                time.sleep(0.05)
-                continue
             break
         if not pool.acquire(acct):
             exclude.add(acct.uid)
@@ -2088,7 +2357,8 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             last_error = exc
         except CodeArtsUpstreamError as exc:
             soft = (exc.status == 429 or "429" in str(exc.code or ""))
-            pool.note_error(acct, str(exc), soft=soft)
+            cooldown = CREDIT_COOLDOWN if exc.code == "CREDIT_EXHAUSTED" else None
+            pool.note_error(acct, str(exc), soft=soft, cooldown=cooldown)
             pool.release(acct)
             exclude.add(acct.uid)
             last_error = exc
@@ -2165,7 +2435,7 @@ def _gc_oauth(now=None):
             _OAUTH_SESSIONS.pop(key, None)
 
 
-def oauth_start(config, port=8788):
+def oauth_start(config, port=8789):
     _gc_oauth()
     ticket_id = crypto.random_hex(16)
     secret = crypto.random_hex(16)
@@ -2886,7 +3156,7 @@ def _checkin_account(acct, timeout=30.0):
               "credits": total_credits, "message": message,
               "campaigns": results}
     acct.checkin = {"ok": result["ok"], "message": message,
-                    "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                    "checked_at": wb_time.strftime("%Y-%m-%dT%H:%M:%S")}
     acct.info_fetched_at = 0.0
     acct.pool.save_state()
     return result
@@ -2985,7 +3255,7 @@ def _maybe_auto_checkin(pool):
             return                      # 本线程正在手动签到，别抢
         if not pool.config.get("credits_auto_claim", False):
             return
-        today = time.strftime("%Y-%m-%d")
+        today = wb_time.day_key(time.time())
         now = time.time()
         key = os.path.abspath(str(pool.accounts_dir or "."))
         pending = []

@@ -1,10 +1,11 @@
-"""本地 web 工具：让网关真正执行 web_search / web_fetch。
+"""Web 工具代跑：默认本地，可选择 Qoder 官方（CN / 国际版）或外部搜索后端。
 
 为什么需要：Codex 等客户端会声明内置工具（type=web_search / web_fetch），
 Qoder 上游只认 function 类型，这类声明此前被直接丢弃（#63）——客户端以为有
 搜索能力，实际永远调不到。开启本模块后，网关把它们改写成自己的同名 function，
 模型调用时由网关本地执行，再把结果回灌给模型继续生成。
 
+以下安全边界针对本地后端；官方后端的远端抓取边界见 docs/official-web-tools.md。
 安全边界（这是唯一会由**模型**驱动出网的地方）：
   · 只允许 http/https，禁止带凭据的 URL；
   · 目标域名解析后必须是公网地址（私网/环回/链路本地一律拒绝）；
@@ -12,6 +13,7 @@ Qoder 上游只认 function 类型，这类声明此前被直接丢弃（#63）�
   · 响应体与正文都有字节上限，超时固定；
   · 引擎链轮换 + TTL 缓存 + single-flight + 冷却，避免被限流。
 """
+import copy
 import ipaddress
 import http.client
 import html
@@ -405,6 +407,7 @@ def fetch(url):
         with _open(url) as resp:
             raw = resp.read(MAX_BODY_BYTES)
             ctype = (resp.headers.get("Content-Type") or "").lower()
+            final_url = getattr(resp, "url", url)
         text = raw.decode("utf-8", "replace")
         if "html" in ctype or "<html" in text[:2000].lower():
             title_m = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
@@ -417,7 +420,7 @@ def fetch(url):
             title = ""
             body = text
         body = body[:MAX_FETCH_CHARS]
-        out = {"ok": True, "url": url, "title": title, "text": body,
+        out = {"ok": True, "url": url, "final_url": final_url, "title": title, "text": body,
                "error": ""}
         _cache_put(key, out)
         return out
@@ -433,22 +436,41 @@ def tool_declarations():
     return [
         {"type": "function", "function": {
             "name": WEB_SEARCH_NAME,
-            "description": ("Search the public web. Use for fresh facts, docs, "
-                            "news or anything you are unsure about."),
+            "description": ("Search the public web. Returns titles, URLs, snippets "
+                            "and publication dates when available; snippets are not full pages."),
             "parameters": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "search query"}},
+                "query": {"type": "string", "description": "focused search query"},
+                "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                "blocked_domains": {"type": "array", "items": {"type": "string"}}},
                 "required": ["query"]}}},
         {"type": "function", "function": {
             "name": WEB_FETCH_NAME,
-            "description": ("Fetch one URL and return its readable text. "
-                            "Only http/https public addresses are allowed."),
+            "description": ("Fetch one public HTTP/HTTPS URL. Returns readable page text, "
+                            "the final URL and available links; long pages may be truncated."),
             "parameters": {"type": "object", "properties": {
                 "url": {"type": "string", "description": "absolute url"}},
                 "required": ["url"]}}},
     ]
 
 
-def run_tool(name, arguments):
+def backend_config(accounts_dir=None, ready=False):
+    """Snapshot settings once per API request; environment retains precedence."""
+    import qoder_settings
+    config = qoder_settings.web_tools_config(accounts_dir or os.environ.get("ACCOUNTS_DIR") or "accounts")
+    config["backend"] = str(os.environ.get("QD_WEB_TOOLS_BACKEND") or config["backend"]).strip().lower()
+    if config["backend"] not in ("local", "qoder", "external"):
+        raise ValueError("QD_WEB_TOOLS_BACKEND must be local, qoder or external")
+    if ready and config["backend"] == "external":
+        import qoder_external_web
+        config["external"] = qoder_external_web.normalize(config["external"], ready=True)
+    return config
+
+
+def backend_name(accounts_dir=None):
+    return backend_config(accounts_dir)["backend"]
+
+
+def run_tool(name, arguments, account=None, context=None, on_result=None, config=None):
     """执行一次工具调用，返回给模型的文本结果。"""
     args = arguments
     if isinstance(args, str):
@@ -457,22 +479,86 @@ def run_tool(name, arguments):
         except Exception:
             args = {}
     args = args if isinstance(args, dict) else {}
+    config = config if config is not None else backend_config()
+    backend = config["backend"]
+    official = None
+    if backend == "qoder" and name in (WEB_SEARCH_NAME, WEB_FETCH_NAME):
+        import qoder_official_web as official
+    origin = ""
+    if context and official:
+        # A background token refresh can update the account between rounds.
+        # Use the same credentials for the cache lookup and signed request.
+        account = copy.copy(account)
+        try:
+            origin = official.service_origin(account)
+        except (official.OfficialWebError, ValueError):
+            # Let the backend return its normal error without consulting the cache.
+            pass
+    cache_key = (context.cache_key(name, args, account, backend, origin)
+                 if context and (not official or origin) else None)
+
+    def observe(res):
+        if context:
+            res = context.observe(name, res)
+            if cache_key is not None and res.get("ok"):
+                context.cache[cache_key] = res
+        if on_result:
+            on_result(res)
+        return res
+
+    def search_result():
+        from qoder_web_response import domains, matches_domain
+        requested_allowed = domains(args.get("allowed_domains"))
+        allowed = requested_allowed
+        blocked = domains(args.get("blocked_domains"))
+        # Request filters cannot be widened by arguments chosen by the model.
+        if context and context.allowed:
+            allowed = context.allowed
+        if context:
+            blocked = list(dict.fromkeys(blocked + context.blocked))
+        if official:
+            res = official.search(account, args.get("query") or "",
+                                  allowed_domains=allowed, blocked_domains=blocked)
+        elif backend == "external":
+            import qoder_external_web
+            res = qoder_external_web.search(config["external"], args.get("query") or "")
+        else:
+            res = search(args.get("query") or "")
+        if res.get("ok"):
+            res = dict(res, results=[r for r in res.get("results") or []
+                                    if matches_domain(r.get("url") or "", allowed, blocked)
+                                    and matches_domain(r.get("url") or "", requested_allowed)])
+        return res
+
     if name == WEB_SEARCH_NAME:
-        res = search(args.get("query") or "")
+        res = observe(context.cache[cache_key] if context and cache_key in context.cache
+                      else search_result())
         if not res.get("ok"):
             return json.dumps({"error": res.get("error") or "search failed"},
                               ensure_ascii=False)
         lines = []
         for i, item in enumerate(res["results"], 1):
-            lines.append("%d. %s\n   %s\n   %s"
-                         % (i, item.get("title") or "", item.get("url") or "",
-                            item.get("snippet") or ""))
-        return "Search results (%s):\n" % res.get("engine") + "\n".join(lines)
+            lines.append("%d. %s%s\n   %s\n   %s\n   Published: %s"
+                         % (i, ("[%s] " % item["source_id"]) if item.get("source_id") else "",
+                            item.get("title") or "", item.get("url") or "",
+                            item.get("snippet") or "", item.get("published_time") or "unknown"))
+        return "Search results (%s; snippets):\n" % res.get("engine") + "\n".join(lines)
     if name == WEB_FETCH_NAME:
-        res = fetch(args.get("url") or "")
+        if context:
+            from qoder_web_response import matches_domain
+            if not matches_domain(args.get("url") or "", context.allowed, context.blocked):
+                observe({"ok": False, "error": "URL is outside the request's web domain filters"})
+                return json.dumps({"error": "URL is outside the request's web domain filters"})
+        res = observe(context.cache[cache_key] if context and cache_key in context.cache else
+                      (official.fetch(account, args.get("url") or "") if official
+                       else fetch(args.get("url") or "")))
         if not res.get("ok"):
             return json.dumps({"error": res.get("error") or "fetch failed"},
                               ensure_ascii=False)
-        return "Fetched %s\nTitle: %s\n\n%s" % (res["url"], res.get("title"),
-                                                 res.get("text") or "")
+        return ("Fetched %s%s\nTitle: %s\nFinal URL: %s\nTruncated: %s\n\n%s\n\n"
+                "Links on this page: %s"
+                % (("[%s] " % res["source_id"]) if res.get("source_id") else "",
+                   res["url"], res.get("title") or "", res.get("final_url") or res["url"],
+                   bool(res.get("truncated")), res.get("text") or "",
+                   json.dumps(res.get("links") or [], ensure_ascii=False)))
     return json.dumps({"error": "unknown tool %s" % name}, ensure_ascii=False)

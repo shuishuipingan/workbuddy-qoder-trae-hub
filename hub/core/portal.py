@@ -461,6 +461,8 @@ class PortalHandler(BaseHTTPRequestHandler):
                     return self._json(400, {"error": "invalid JSON body"}, head_only=head_only)
             else:
                 body = {"model": ""}
+            if not isinstance(body, dict):
+                return self._json(400, {"error": "body must be an object"})
             # 干跑必须基于**新快照**：面板点一次就看到真实链，不能依赖 30 秒缓存。
             _up = {e: (keys.upstream_key(e) or "") for e in ENGINES}
             snap = router.refresh_snapshot(self.server.ports, _up,
@@ -476,15 +478,19 @@ class PortalHandler(BaseHTTPRequestHandler):
         if rest == "routing":
             engines = list(ENGINES)
             realms = list(router.REALMS)
-            if method == "PUT":
+            if method in ("PUT", "POST"):
+                if not settings.verify_panel_password((self.headers.get("X-Panel-Token") or "").strip()):
+                    return self._json(401, {"error": "hub panel password required"})
                 try:
                     body = __import__('json').loads(self._read_body() or '{}')
                 except ValueError:
                     return self._json(400, {'error': 'invalid JSON body'}, head_only=head_only)
+                if not isinstance(body, dict) or type(body.get("revision")) is not int:
+                    return self._json(400, {"error": "body must be an object with an integer revision"})
                 try:
                     doc = orchestrator.save(body, engines, realms,
                                             expected_revision=body.get("revision"))
-                except ValueError as exc:
+                except (TypeError, ValueError) as exc:
                     return self._json(400, {"error": str(exc)}, head_only=head_only)
                 return self._json(200, doc, head_only=head_only)
             return self._json(200, orchestrator.load(engines, realms), head_only=head_only)
@@ -1173,6 +1179,9 @@ class PortalHandler(BaseHTTPRequestHandler):
         # 但另一区仍留在链尾兜底（「显式优先，不把路走死」）。
         requested = (params.get("realm") or [None])[0] or self.headers.get("X-Realm")
         candidates = router.candidates_for(model, snapshot, cfg, requested)
+        if scope_engines:
+            candidates = [c for c in candidates if str(c[0]).lower() in scope_engines]
+        _rule = None
         # 路由编排（第 200 轮）：用户规则把默认候选链重排/收窄。命中就用规则的
         # 顺序，未命中保持原链；规则里 stop_on_miss 才会 fail-closed。
         try:
@@ -1188,8 +1197,6 @@ class PortalHandler(BaseHTTPRequestHandler):
         except Exception as _exc:
             sys.stderr.write("[portal] routing skipped: %s\n" % (_exc,))
         if scope_engines:
-            _all = candidates
-            candidates = [c for c in candidates if str(c[0]).lower() in scope_engines]
             if not candidates:
                 return self._json(503, {
                     "error": {
@@ -1200,6 +1207,9 @@ class PortalHandler(BaseHTTPRequestHandler):
                         "allowed_engines": scope_engines,
                     }
                 })
+        if not candidates and _rule and _rule["action"]["stop_on_miss"]:
+            return self._json(503, {"error": {"message": "no available route matches the configured rule",
+                                                "code": "route_rule_unavailable", "type": "server_error"}})
         if not candidates:
             # 快照里没有这个模型（新模型/清单未取全）：退回默认引擎、区域让引擎
             # 自己定（引擎内的自动路由仍会兜底），至少别比旧行为差。

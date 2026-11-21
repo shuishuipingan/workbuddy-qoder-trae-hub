@@ -62,18 +62,28 @@ def skip(label, why=""):
     print("  [SKIP] %s%s" % (label, ("  —— " + why) if why else ""))
 
 
+_TAKEN = set()
+
+
 def free_port():
-    """挑一个空闲回环端口（避开线上实例常用的那几个）。"""
+    """挑一个空闲回环端口（避开线上实例常用的那几个）。
+
+    注意：bind(0) 拿到的端口在 close 之后**很可能被内核立刻复用**给下一次
+    bind(0) —— 连续调用三次会拿到同一个号，三个引擎撞在一个端口上，实例
+    起不来（R01 就是栽在这里）。所以用过的号要记下来，不能重复返回。
+    """
     reserved = (8789, 8790, 8791, 8811, 8812, 8817)
-    for _ in range(60):
+    for _ in range(120):
         s = socket.socket()
         try:
             s.bind(("127.0.0.1", 0))
             p = s.getsockname()[1]
         finally:
             s.close()
-        if p not in reserved:
-            return p
+        if p in reserved or p in _TAKEN:
+            continue
+        _TAKEN.add(p)
+        return p
     raise RuntimeError("no free port")
 
 
@@ -105,9 +115,9 @@ def http(base, path_, key=None, method="GET", body=None, token=None, timeout=60)
         return 0, repr(exc)
 
 
-def engine_key(engine):
+def engine_key(engine, root):
     """从引擎自己的 settings.json 里挑一把启用中的 key（只读）。"""
-    path_ = os.path.join(ENGINES, engine, "accounts", "settings.json")
+    path_ = os.path.join(root, engine, "accounts", "settings.json")
     try:
         with open(path_, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -121,11 +131,15 @@ def engine_key(engine):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="用真实数据的只读副本跑一遍三类 key 自证")
+    ap.add_argument("--fixture", action="store_true", help="使用隔离的测试密钥，不读取真实数据、不写报告")
     ap.add_argument("--keep", action="store_true", help="保留临时目录")
-    ap.add_argument("--timeout", type=float, default=75.0, help="等实例起来的上限（秒）")
+    # 75s 不够：真实账号池会先跑 model discovery / catalog 刷新，qd 侧连续 403 时
+    # 单轮就要 40s+，三引擎串起来经常逼近 90s。给足 180s，失败也更容易判断是"慢"还是"挂"。
+    ap.add_argument("--timeout", type=float, default=180.0, help="等实例起来的上限（秒）")
     args = ap.parse_args(argv)
 
-    print("真实数据自证 —— 源: %s" % ENGINES)
+    RESULTS.clear()
+    print("密钥自证 —— 源: %s" % ("测试夹具" if args.fixture else ENGINES))
     work = tempfile.mkdtemp(prefix="hub-realdata-")
     data_root = os.path.join(work, "data")
     log = os.path.join(work, "server.log")
@@ -136,11 +150,18 @@ def main(argv=None):
                 src = os.path.join(ENGINES, engine, sub)
                 dst = os.path.join(data_root, engine, sub)
                 os.makedirs(dst, exist_ok=True)
-                if os.path.isdir(src):
+                if not args.fixture and os.path.isdir(src):
                     for name in os.listdir(src):
                         s = os.path.join(src, name)
                         if os.path.isfile(s):
                             shutil.copy2(s, os.path.join(dst, name))
+        if args.fixture:
+            for engine in ("wb", "qd"):
+                path = os.path.join(data_root, engine, "accounts", "settings.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"api_keys": [{"id": "fixture-" + engine, "name": engine,
+                                             "key": "fixture-key-" + engine, "enabled": True}],
+                               "pricing_enabled": False}, fh)
         # 关掉 wb 的定价刷新，避免测试期真实外呼
         wb_settings = os.path.join(data_root, "wb", "accounts", "settings.json")
         if os.path.isfile(wb_settings):
@@ -151,7 +172,9 @@ def main(argv=None):
                 json.dump(doc, fh, ensure_ascii=False, indent=2)
         info("已把 accounts/usage 复制到临时数据根（源数据只读）")
 
-        wb_port, qd_port, portal_port = free_port(), free_port(), free_port()
+        # trae 也必须给一个独占端口：不传就用默认 8813，与线上实例/后续测试相撞，
+        # 表现为"隔离实例起不来"，跑完还占着 8813 让别的检查全红（踩过）。
+        wb_port, qd_port, trae_port, portal_port = free_port(), free_port(), free_port(), free_port()
         env = dict(os.environ)
         env["HUB_DATA_ROOT"] = data_root
         env["PYTHONIOENCODING"] = "utf-8"
@@ -159,13 +182,14 @@ def main(argv=None):
             proc = subprocess.Popen(
                 [sys.executable, "-u", "-m", "hub.server", "--host", "127.0.0.1",
                  "--wb-port", str(wb_port), "--qd-port", str(qd_port),
+                 "--trae-port", str(trae_port),
                  "--portal-port", str(portal_port)],
                 cwd=REPO, env=env, stdout=fh, stderr=subprocess.STDOUT)
         base = "http://127.0.0.1:%d" % portal_port
 
         health = None
         deadline = time.time() + args.timeout
-        while time.time() < deadline:
+        while proc.poll() is None and time.time() < deadline:
             status, doc = http(base, "/api/hub/health", timeout=3)
             if status == 200 and isinstance(doc, dict):
                 health = doc
@@ -173,11 +197,11 @@ def main(argv=None):
             time.sleep(0.6)
         if not check("R01 隔离实例起来了（真实数据副本）", health is not None,
                      "" if health else "见日志: %s" % log):
-            return finish(work, proc, log, args.keep)
+            return 1
 
         engines = (health or {}).get("engines") or {}
         up = [e for e, h in engines.items() if isinstance(h, dict) and h.get("ok")]
-        check("R02 两个引擎都在线", len(up) >= 1, "up=%s" % ",".join(up))
+        check("R02 三个引擎都在线", set(up) == {"wb", "qd", "trae"}, "up=%s" % ",".join(up))
 
         merged_key = "realdata-check-merged-key"
         status, _doc = http(base, "/api/hub/settings/save",
@@ -185,12 +209,12 @@ def main(argv=None):
                             body={"merged_keys": [{"name": "realdata", "key": merged_key,
                                                    "enabled": True}]})
         if not check("R03 建一把合并 key（默认口令 admin）", status == 200, "status=%s" % status):
-            return finish(work, proc, log, args.keep)
+            return 1
 
         counts = {}
         for label, key in (("merged", merged_key),
-                           ("wb", engine_key("wb")),
-                           ("qd", engine_key("qd"))):
+                           ("wb", engine_key("wb", data_root)),
+                           ("qd", engine_key("qd", data_root))):
             if not key:
                 skip("R%02d %s key 的模型清单" % (4 + len(counts), label), "没有可用的 %s key" % label)
                 continue
@@ -219,13 +243,15 @@ def main(argv=None):
         status, doc = http(base, "/api/hub/keys", token="admin")
         check("R08 三类 key 计数端点可用", status == 200 and isinstance(doc, dict), "status=%s" % status)
 
-        write_report(counts)
+        if not args.fixture:
+            write_report(counts)
         print("")
         print("  ── 数字 ──")
         info("合并 key 看到 %s 个模型；wb key %s 个；qd key %s 个"
              % (counts.get("merged", "?"), counts.get("wb", "?"), counts.get("qd", "?")))
     finally:
-        return finish(work, proc, log, args.keep)
+        result = finish(work, proc, log, args.keep)
+    return result
 
 
 def write_report(counts):

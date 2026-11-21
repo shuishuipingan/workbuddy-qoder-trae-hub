@@ -99,7 +99,7 @@ def main(argv=None):
                 os.path.join(root, "wb_proxy.py")):
             raise UpdateError("更新目标目录无效: %s" % root)
         pid = int(payload.get("pid") or 0)
-        port = int(payload.get("port") or 8788)
+        port = int(payload.get("port") or 8789)
         profile = str(payload.get("profile") or args.profile or "").strip().lower()
         if pid <= 0:
             raise UpdateError("更新请求缺少 pid")

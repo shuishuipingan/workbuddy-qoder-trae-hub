@@ -15,6 +15,8 @@ jobs:
           python-version: '3.12'
       - name: 语法检查（全仓 .py）
         run: python -m compileall -q hub
+      - name: 校验仓库内已构建面板（issue #2）
+        run: python hub/tests/_test_panel_assets.py
       - name: 静态名检查（防 NameError）
         run: python hub/tests/_test_static_names.py
       - name: 单元级套件（不需要起引擎的那些）
@@ -32,9 +34,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.8.1
+          package_json_file: admin/app/package.json
       - name: 安装依赖（pnpm 锁文件）
-        run: corepack enable && pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
       - name: 类型检查
         run: pnpm exec tsc --noEmit
       - name: 单测

@@ -14,6 +14,7 @@
 """
 import base64
 import collections
+import copy
 import datetime
 import hashlib
 import ipaddress
@@ -30,6 +31,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 import uuid
+import weakref
 
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
@@ -252,15 +254,157 @@ def normalize_quota_payload(payload, realm=""):
     return out
 
 
+VPC_DOMAIN_SUFFIX = "vpc.qoder.com.cn"
+
+
+def parse_vpc_endpoint(value):
+    """把 QD_CN_VPC_ENDPOINT 解析成企业 VPC 的三个官方主机。
+
+    接受实例名（acme）或三个按服务拆分的域名（acme.vpc.qoder.com.cn /
+    acme-openapi.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn）。
+    空值返回 None；路径、端口、凭据、query、fragment 或空白一律拒绝，
+    避免一个值只改掉流程里的一部分端点。
+    """
+    raw = str(value or "")
+    if not raw.strip():
+        return None
+    if raw != raw.strip() or any(ch in raw for ch in "\r\n\t"):
+        raise ValueError("invalid VPC endpoint: surrounding whitespace or "
+                         "control characters")
+    target = raw if "://" in raw else "https://" + raw
+    try:
+        parsed = urllib.parse.urlsplit(target)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid VPC endpoint: malformed host or port")
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or ":" in parsed.netloc or "?" in raw
+            or port is not None or parsed.username is not None
+            or parsed.password is not None or parsed.query
+            or parsed.fragment or "#" in raw
+            or parsed.path not in ("", "/")):
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    host = parsed.hostname.lower()
+    instance = host
+    if host.endswith("." + VPC_DOMAIN_SUFFIX):
+        instance = host[:-len("." + VPC_DOMAIN_SUFFIX)]
+        if instance.endswith("-openapi"):
+            instance = instance[:-len("-openapi")]
+        elif instance.endswith("-gateway"):
+            instance = instance[:-len("-gateway")]
+    elif "." in host:
+        raise ValueError("invalid VPC endpoint: expected an instance name or a "
+                         "domain under %s" % VPC_DOMAIN_SUFFIX)
+    # 最长服务后缀 -gateway 占 8 字节，推导后的 DNS label 不能超过 63。
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?", instance):
+        raise ValueError("invalid VPC endpoint: bad instance name %r" % instance)
+    domain = instance + "." + VPC_DOMAIN_SUFFIX
+    return {
+        "instance": instance,
+        "domain": domain,
+        "website": "https://" + domain,
+        "openapi": "https://" + instance + "-openapi." + VPC_DOMAIN_SUFFIX,
+        "gateway": "https://" + instance + "-gateway." + VPC_DOMAIN_SUFFIX,
+    }
+
+
+_VPC_CN = None
+VPC_CONFIG_ERROR = ""
+try:
+    _VPC_CN = parse_vpc_endpoint(os.environ.get("QD_CN_VPC_ENDPOINT"))
+except ValueError as exc:
+    VPC_CONFIG_ERROR = str(exc)
+
+_VPC_HOSTS = frozenset(
+    urllib.parse.urlsplit(_VPC_CN[key]).hostname.lower()
+    for key in ("website", "openapi", "gateway")
+    if _VPC_CN and urllib.parse.urlsplit(_VPC_CN[key]).hostname
+)
+
+
+def vpc_configured():
+    return _VPC_CN is not None
+
+
+def vpc_instance():
+    return (_VPC_CN or {}).get("instance", "")
+
+
+def vpc_config_error():
+    return VPC_CONFIG_ERROR
+
+
+_VPC_ACCOUNTS = weakref.WeakSet()
+_VPC_SCOPES = weakref.WeakSet()
+_VPC_LOCK = threading.RLock()
+
+
+def _vpc_hosts(config):
+    return frozenset(urllib.parse.urlsplit(config[key]).hostname
+                     for key in ("website", "openapi", "gateway"))
+
+
+class _VpcEndpointScope:
+    """Keep an instance registered while a pre-account credential flow runs."""
+    def __init__(self, config):
+        self.config = dict(config)
+        with _VPC_LOCK:
+            _VPC_SCOPES.add(self)
+
+
+def _configured_vpc_groups():
+    groups = []
+    if _VPC_CN:
+        groups.append(_vpc_hosts(_VPC_CN))
+    with _VPC_LOCK:
+        accounts = list(_VPC_ACCOUNTS)
+        scopes = list(_VPC_SCOPES)
+    for scope in scopes:
+        if scope.config.get("vpc_instance"):
+            groups.append(_vpc_hosts(scope.config))
+    for account in accounts:
+        cfg = account.realm_config()
+        if cfg.get("vpc_instance"):
+            groups.append(_vpc_hosts(cfg))
+    pool = globals().get("_ACTIVE_POOL")
+    if pool is not None:
+        with pool._lock:
+            pending = list(pool.logins.values())
+        for info in pending:
+            if time.time() - info.get("created", 0) <= LOGIN_TTL_SECONDS:
+                cfg = info.get("endpoint_config") or {}
+                if cfg.get("vpc_instance"):
+                    groups.append(_vpc_hosts(cfg))
+    return groups
+
+
+def vpc_endpoint_hosts():
+    return frozenset(host for group in _configured_vpc_groups() for host in group)
+
+
+def is_configured_vpc_host(host):
+    """仅对 QD_CN_VPC_ENDPOINT 推导出的三个主机放行解析级 SSRF 校验。
+
+    企业 VPC 域名通常解析到公司内网地址，通用规则会把它当内网目标拒绝；
+    但这是用户显式配置的固定主机，不是请求里可注入的 URL。
+    """
+    name = str(host or "").strip().strip("[]").lower()
+    return bool(name) and name in vpc_endpoint_hosts()
+
+
 REALM_CONFIGS = {
     "cn": {
         "name": "国内版 (China)",
-        "openapi": "https://openapi.qoder.com.cn",
-        "gateway": "https://gateway.qoder.com.cn",
-        "website": "https://qoder.com.cn",
+        "openapi": (_VPC_CN or {}).get("openapi")
+                   or "https://openapi.qoder.com.cn",
+        "gateway": (_VPC_CN or {}).get("gateway")
+                   or "https://gateway.qoder.com.cn",
+        "website": (_VPC_CN or {}).get("website") or "https://qoder.com.cn",
+        "domain": (_VPC_CN or {}).get("domain") or "qoder.com.cn",
+        "vpc_instance": (_VPC_CN or {}).get("instance", ""),
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
-        "domain": "qoder.com.cn",
         "ua": "QoderWork/1.1.75",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
@@ -303,7 +447,7 @@ REALM_CONFIGS = {
 CLIENT_UA = "Go-http-client/2.0"
 LOGIN_TTL_SECONDS = 600
 # 账号文件写入锁（/tasks 并行刷新时多个字段各自 save，必须串行落盘）
-_SAVE_LOCK = threading.Lock()
+_SAVE_LOCK = threading.RLock()
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 # 业务端点（全部挂 openapi 基址，纯 Bearer，无 COSY 签名）
@@ -1172,15 +1316,18 @@ def _machine_minimal_disabled():
     return raw in ("0", "off", "false", "no", "disable", "disabled")
 
 
-def openapi_candidates(realm):
+def openapi_candidates(realm, cfg=None):
     """该区域 openapi 基址候选（issue: 国际版签不到到）。
 
     官方把业务端点都挂在 openapi 基址上；国际版历史上是 openapi.qoder.sh，
     但该域名在部分网络/时期不可达，表现为「活动列表拿不到 -> 签到无效」。
     这里给出候选顺序，调用方**只在连接失败或 404 时**换下一个，业务错误不重试。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg if cfg is not None else get_realm_config(realm)
     r = str(realm or "cn")
+    # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
+    if cfg.get("vpc_instance"):
+        return [str(cfg["openapi"]).rstrip("/")]
     out = []
     env = str(os.environ.get("QD_%s_OPENAPI" % r.upper()) or "").strip()
     if env:
@@ -1203,16 +1350,74 @@ def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
 
 
-def gateway_candidates(realm):
+def normalize_vpc_override(value):
+    """None inherits the deployment default; empty string explicitly uses public CN."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("VPC endpoint must be a string or null")
+    parsed = parse_vpc_endpoint(value)
+    return parsed["instance"] if parsed else ""
+
+
+def realm_config_for(realm, vpc=None):
+    override = normalize_vpc_override(vpc)
+    if realm != "cn":
+        if override:
+            raise ValueError("VPC is only available for CN accounts")
+        return dict(get_realm_config(realm))
+    if override is None:
+        if VPC_CONFIG_ERROR:
+            raise ValueError(VPC_CONFIG_ERROR)
+        return dict(get_realm_config("cn"))
+    cfg = dict(get_realm_config("cn"))
+    parsed = parse_vpc_endpoint(override)
+    cfg.update({"openapi": "https://openapi.qoder.com.cn",
+                "gateway": "https://gateway.qoder.com.cn",
+                "website": "https://qoder.com.cn", "domain": "qoder.com.cn",
+                "vpc_instance": "", "gateway_fallbacks": ()})
+    if parsed:
+        cfg.update({key: parsed[key] for key in ("openapi", "gateway", "website", "domain")})
+        cfg["vpc_instance"] = parsed["instance"]
+    return cfg
+
+
+def account_realm_config(account):
+    # Legacy integrations may pass a minimal account stub without the method.
+    method = getattr(account, "realm_config", None)
+    return method() if callable(method) else get_realm_config(account.realm)
+
+
+def gateway_candidates(realm, cfg=None):
     """该区域的推理主机候选列表（官方客户端同款：主选 + 故障切换域名）。
 
     签名只覆盖 path，因此同一请求换主机后签名依旧有效。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg if cfg is not None else get_realm_config(realm)
     out = [cfg["gateway"]]
+    # 企业 VPC 只有实例专属推理域，公网 api1/api2/api3 不能作为故障回退。
+    if cfg.get("vpc_instance"):
+        return out
     for host in cfg.get("gateway_fallbacks") or ():
         if host and host not in out:
             out.append(host)
+    return out
+
+
+def cli_auth_dirs(realm, vpc=None):
+    """官方 CLI 的凭据目录：公网 ``.auth`` +（VPC 模式）实例专属 ``.auth``。
+
+    企业 VPC 账号可能由官方 CLI 登录在 ``~/.qoder-cn/.auth``，也可能按
+    实例隔离在 ``~/.qoder-cn/.vpc/<instance>/.auth``；扫描两者，导入时
+    的 realm 仍是 cn。
+    """
+    cfg = realm_config_for(realm, vpc)
+    root = os.path.join(os.path.expanduser("~"), cfg["home_dir"])
+    out = []
+    instance = str(cfg.get("vpc_instance") or "")
+    if instance:
+        out.append(os.path.join(root, ".vpc", instance, ".auth"))
+    out.append(os.path.join(root, ".auth"))
     return out
 
 
@@ -1470,6 +1675,19 @@ _FAKEIP_NETS = [
     ipaddress.ip_network("2001:2::/48"),
     ipaddress.ip_network("fdfe:dcba:9876::/48"),
 ]
+# macOS 的 getaddrinfo 会把 fake-IP 以 IPv4-translated 形式（::ffff:0:c612:2d）
+# 一并返回；只认纯 IPv4 会让 all(...) 失败，于是所有公网域名都被误判成内网。
+_FAKEIP_V4_TRANSLATED = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+def _is_fake_ip(ip):
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        elif ip in _FAKEIP_V4_TRANSLATED:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return any(addr in net for addr in candidates for net in _FAKEIP_NETS)
 
 
 def _host_boundary_violation(ip, allow_local):
@@ -1496,6 +1714,10 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
+    # 企业 VPC 专属域通常解析到公司内网，不能按公网目标拒绝；只放行
+    # QD_CN_VPC_ENDPOINT 推导出的固定主机。
+    if is_configured_vpc_host(host):
+        return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
         if not allow_local:
             raise ValueError("requests to localhost are not allowed")
@@ -1521,7 +1743,7 @@ def validate_public_http_url(url, allow_local=False):
             addrs.append(ipaddress.ip_address(addr))
         except ValueError:
             raise ValueError("URL host resolved to a non-IP address: %r" % addr)
-    if addrs and all(any(ip in net for net in _FAKEIP_NETS) for ip in addrs):
+    if addrs and all(_is_fake_ip(ip) for ip in addrs):
         return url  # fake-IP DNS：真实 IP 不可见，名称级校验已通过
     for ip in addrs:
         if _host_boundary_violation(ip, allow_local):
@@ -1584,14 +1806,42 @@ def _proxy_map_from_env():
     return out
 
 
-def _opener_for_request():
+class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """VPC 请求只允许在本实例的 HTTPS 默认端口之间重定向。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urllib.parse.urlsplit(req.full_url)
+        if is_configured_vpc_host(source.hostname):
+            target = urllib.parse.urlsplit(newurl)
+            try:
+                allowed = (target.scheme == "https"
+                           and target.port in (None, 443)
+                           and target.username is None and target.password is None
+                           and any(source.hostname in group and target.hostname in group
+                                   for group in _configured_vpc_groups()))
+            except ValueError:
+                allowed = False
+            if not allowed:
+                raise urllib.error.HTTPError(req.full_url, code,
+                                             "VPC redirect outside configured instance",
+                                             headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _opener_for_request(*, follow_redirects=True):
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
     「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
     """
     proxies = _proxy_map_from_env()
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    redirects = _VpcRedirectHandler() if follow_redirects else _NoRedirectHandler()
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), redirects)
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1602,7 +1852,8 @@ def upstream_clock_skew(timeout=4.0):
     """
     from email.utils import parsedate_to_datetime
     try:
-        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        base = openapi_candidates("cn")[0]
+        req = urllib.request.Request(base.rstrip("/") + "/", method="HEAD")
         with _opener_for_request().open(req, timeout=timeout) as resp:
             date_hdr = resp.headers.get("Date")
         if not date_hdr:
@@ -1613,7 +1864,7 @@ def upstream_clock_skew(timeout=4.0):
 
 
 def http_json(url, data=None, method=None, headers=None, timeout=30,
-              retries=3, backoff=1.0, log=None):
+              retries=3, backoff=1.0, log=None, *, follow_redirects=True):
     """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""
     validate_public_http_url(url)
     attempts = max(1, int(retries or 1))
@@ -1626,7 +1877,8 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with _opener_for_request().open(req, timeout=timeout) as resp:
+            opener = _opener_for_request(follow_redirects=follow_redirects)
+            with opener.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             last = exc
@@ -1675,8 +1927,24 @@ class Account(object):
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
             self.realm = "cn"
-        if not self.domain:
-            self.domain = get_realm_config(self.realm)["domain"]
+        self.vpc_source = "account"
+        if "vpcEndpoint" in data:
+            override = normalize_vpc_override(data["vpcEndpoint"])
+        elif self.realm == "cn" and self.domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+            override = normalize_vpc_override(self.domain)
+            self.vpc_source = "domain"
+        else:
+            override = None
+        self.vpc_override = override
+        cfg = realm_config_for(self.realm, override)
+        self.vpc_endpoint = cfg.get("vpc_instance", "")
+        if override is None:
+            self.vpc_source = "default" if self.vpc_endpoint else "public"
+        elif not override:
+            self.vpc_source = "public"
+        self.domain = cfg["domain"]
+        with _VPC_LOCK:
+            _VPC_ACCOUNTS.add(self)
         self.platform = str(data.get("platform") or "CLI")
         self.access_token = str(data.get("accessToken") or "")
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -1765,6 +2033,21 @@ class Account(object):
         self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
+    def realm_config(self):
+        return realm_config_for(self.realm, self.vpc_override)
+
+    def endpoint_scope(self):
+        cfg = self.realm_config()
+        return (self.realm + ":vpc:" + cfg["vpc_instance"]
+                if cfg.get("vpc_instance") else self.realm)
+
+    def _credits_source_allowed(self, host):
+        cfg = self.realm_config()
+        if cfg.get("vpc_instance"):
+            return host in (cfg["openapi"], cfg["website"])
+        name = (urllib.parse.urlsplit(host).hostname or "").lower()
+        return not name.endswith("." + VPC_DOMAIN_SUFFIX)
+
     def to_dict(self):
         return {
             "uid": self.uid,
@@ -1772,6 +2055,7 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_override,
             "platform": self.platform,
             "accessToken": self.access_token,
             "refreshToken": self.refresh_token,
@@ -1854,6 +2138,9 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_endpoint,
+            "vpcOverride": self.vpc_override,
+            "vpcSource": self.vpc_source,
             "platform": self.platform,
             "enabled": bool(self.enabled),
             "source": self.source,
@@ -1935,6 +2222,8 @@ class Account(object):
         # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
         # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
         with _SAVE_LOCK:
+            if getattr(self, "_superseded", False):
+                return str(path)  # obsolete refresh cannot overwrite endpoint edits
             tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
             os.replace(tmp, path)
@@ -2308,7 +2597,7 @@ class Account(object):
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         return {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
@@ -2416,7 +2705,7 @@ class Account(object):
 
         PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         base = cfg["openapi"]
         # 1) OAuth 设备族
         if self.refresh_token.startswith("drt-"):
@@ -2440,7 +2729,7 @@ class Account(object):
             "Content-Type": "application/json",
             "Accept": "application/json",
             # 与 headers() 同口径：token 刷新同样要发官方客户端 UA。
-            "User-Agent": get_realm_config(self.realm).get("ua") or CLIENT_UA,
+            "User-Agent": self.realm_config().get("ua") or CLIENT_UA,
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
@@ -2530,7 +2819,7 @@ class Account(object):
         if q is None:
             body = _err or ""
             if _code in (404, 405, 410):
-                mark_openapi_missing(self.realm, PATH_CHECKIN_STATUS)
+                mark_openapi_missing(self.endpoint_scope(), PATH_CHECKIN_STATUS)
                 self._mark_checkin_capability(
                     False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, _code))
                 return False, {
@@ -2720,10 +3009,10 @@ class Account(object):
         last = (None, 0, "no openapi candidate")
         # 已知 404：直接返回（否则 intl 的 legacy 端点每次都要 0.x~10s 才失败，
         # 签到因此慢到不可用；TTL 6h 后允许重探，端点上线仍能被发现）。
-        if openapi_missing(self.realm, path):
+        if openapi_missing(self.endpoint_scope(), path):
             return None, 404, "cached 404 (known missing in %s)" % self.realm
         tried = 0
-        _bases = openapi_candidates(self.realm)
+        _bases = openapi_candidates(self.realm, self.realm_config())
         if not fallback:
             _bases = _bases[:1]
         for base in _bases:
@@ -2742,7 +3031,7 @@ class Account(object):
                 last = (None, exc.code, "HTTP %d %s" % (exc.code, body[:120]))
                 if exc.code in (404, 405, 410):
                     if tried >= 2:
-                        mark_openapi_missing(self.realm, path)
+                        mark_openapi_missing(self.endpoint_scope(), path)
                         return last
                     continue          # 首个基址 404：再试一个候选
                 return last
@@ -2797,7 +3086,7 @@ class Account(object):
                 and getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED \
                 and not _machine_minimal_disabled():
             try:
-                q2 = http_json(get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS,
+                q2 = http_json(self.realm_config()["openapi"] + PATH_CAMPAIGNS,
                                method="GET",
                                headers=self.desktop_headers(minimal=True),
                                timeout=15, retries=1)
@@ -2898,7 +3187,7 @@ class Account(object):
 
     def campaign_reward(self, campaign_id):
         """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
@@ -2916,7 +3205,7 @@ class Account(object):
             （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
             隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
             headers = self.desktop_headers()
@@ -2930,18 +3219,24 @@ class Account(object):
                 body = ""
             code = ""
             try:
-                code = str((json.loads(body) or {}).get("errorCode") or "")
-            except Exception:
-                code = ""
-            if exc.code == 409 or code.upper() in ("ALREADY_CLAIMED", "REPLAYED"):
+                detail = json.loads(body)
+                code = str(detail.get("failureCode") or detail.get("errorCode") or "").upper()
+            except (AttributeError, ValueError):
+                pass
+            if code in ("ALREADY_CLAIMED", "REPLAYED"):
                 return {"ok": True, "status": "CLAIMED", "replayed": True,
                         "message": "今日已领取（上游幂等确认）"}
-            return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
+            if code == "SAME_PERSON_ALREADY_CLAIMED":
+                return {"ok": False, "blocked": True, "failure_code": code}
+            if code in _CAMPAIGN_FAILURE_CN:
+                return {"ok": False, "failure_code": code,
+                        "message": _CAMPAIGN_FAILURE_CN[code]}
+            return {"ok": False, "error": "活动领取请求被拒绝（HTTP %d）" % exc.code}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         status = str(r.get("status") or "").upper()
         failure = str(r.get("failureCode") or "").upper()
-        if failure == "SAME_PERSON_ALREADY_CLAIMED" or status == "BLOCKED":
+        if failure == "SAME_PERSON_ALREADY_CLAIMED":
             return {"ok": False, "blocked": True, "status": status or "BLOCKED",
                     "replayed": False, "failure_code": failure or "BLOCKED",
                     "amount": int(((r.get("benefit") or {})
@@ -2965,7 +3260,8 @@ class Account(object):
                     "redemption_code": code,
                     "message": _CAMPAIGN_FAILURE_CN[failure], "raw": r}
         return {
-            "ok": status in ("CLAIMED", "GRANTED", "SUCCESS"),
+            "ok": not failure and r.get("success") is not False
+                  and status in ("CLAIMED", "GRANTED", "SUCCESS"),
             "status": status,
             "replayed": bool(r.get("replayed")),
             "failure_code": failure or "",
@@ -3070,7 +3366,11 @@ class Account(object):
                 #   ACHIEVEMENT_NOT_COMPLETED=locked）
                 if reason == "REDEMPTION_CODE_OUT_OF_STOCK":
                     pending.append(c)
-                elif reason == "ACHIEVEMENT_NOT_COMPLETED"                         or c.get("achievement_completed") is False:
+                elif reason == "ACHIEVEMENT_NOT_COMPLETED":
+                    locked.append(c)
+                elif reason in _CAMPAIGN_FAILURE_CN:
+                    errors.append("%s: %s（%s）" % (cname, _CAMPAIGN_FAILURE_CN[reason], reason))
+                elif c.get("achievement_completed") is False:
                     locked.append(c)
                 continue
             if c["action_type"] and c["action_type"] != "CLAIM_BENEFIT":
@@ -3100,13 +3400,18 @@ class Account(object):
                     self.save(os.path.dirname(self.path))
                 blocked.append({"campaign": label,
                                 "failure_code": res.get("failure_code")})
-            elif res.get("failure_code") in _CAMPAIGN_FAILURE_CN:
-                # 领取瞬间名额发完 / 任务未完成等：按"待重试/被锁"分类，不算失败
-                slot = (pending if res["failure_code"] == "REDEMPTION_CODE_OUT_OF_STOCK"
-                        else locked)
-                slot.append(c)
+            elif res.get("failure_code") == "REDEMPTION_CODE_OUT_OF_STOCK":
+                pending.append(c)
+            elif res.get("failure_code") == "ACHIEVEMENT_NOT_COMPLETED":
+                locked.append(c)
             else:
-                errors.append("%s: %s" % (cname, res.get("error")))
+                code = res.get("failure_code")
+                detail = _CAMPAIGN_FAILURE_CN.get(code) or res.get("error")
+                if not detail:
+                    detail = "上游未确认领取（status=%s）" % (res.get("status") or "?")
+                if code in _CAMPAIGN_FAILURE_CN:
+                    detail += "（%s）" % code
+                errors.append("%s: %s" % (cname, detail))
             # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
             # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
             time.sleep(claim_gap)
@@ -3122,6 +3427,8 @@ class Account(object):
         elif already:
             msg = "今日活动奖励已领取（%s）" % "、".join(
                 self.campaign_label(c) for c in already)
+        elif errors:
+            msg = "活动领取未成功：%s" % "; ".join(errors)[:200]
         elif pending:
             msg = ("名额已发完，次日 10:00 后可再领：%s（活动 %s）" % (
                 "、".join(c["required_achievement_key"] or "无门槛任务"
@@ -3132,8 +3439,6 @@ class Account(object):
                 ", ".join(c["required_achievement_key"] or "?"
                           for c in locked),
                 ", ".join(c["campaign_key"] or c["campaign_id"] for c in locked)))
-        elif errors:
-            msg = "活动领取失败：%s" % "; ".join(errors)[:200]
         else:
             msg = "当前账号暂无可领取的官方活动"
         # 有待补货/待完成任务的活动时，把它们附在结论里（一键签到日志要能看到）
@@ -3209,6 +3514,9 @@ class Account(object):
         打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
         返回可读提示字符串；不属于该情形返回空串。
         """
+        if self.realm_config().get("vpc_instance") or get_realm_config(
+                "cn" if self.realm != "cn" else "intl").get("vpc_instance"):
+            return ""  # 不将任何令牌用于 VPC / 公网之间的跨区试探。
         other = "cn" if self.realm != "cn" else "intl"
         try:
             url = get_realm_config(other)["openapi"] + PATH_QUOTA
@@ -3232,16 +3540,17 @@ class Account(object):
         limit: 只探测前 N 个候选（None = 全部）。命中者写入
         accounts/credits-source.json，之后 fetch_credits 优先用它。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         hosts = []
         for h in (cfg.get("openapi"), cfg.get("website")):
             h = str(h or "").rstrip("/")
             if h and h not in hosts:
                 hosts.append(h)
         # 已知来源优先：命中过就第一个试，正常情况下 1 次请求就返回。
-        known = load_credits_sources(accounts_dir or "").get(str(self.realm or "cn"))
+        known = load_credits_sources(accounts_dir or "").get(self.endpoint_scope())
         order = []
-        if isinstance(known, dict) and known.get("host") and known.get("path"):
+        if (isinstance(known, dict) and known.get("host") and known.get("path")
+                and self._credits_source_allowed(str(known["host"]).rstrip("/"))):
             order.append((str(known["host"]).rstrip("/"), str(known["path"])))
         for host in hosts:
             for path in CREDITS_PATHS:
@@ -3287,7 +3596,7 @@ class Account(object):
             if limit is not None and tried >= limit:
                 break
         if hit and accounts_dir:
-            save_credits_source(accounts_dir, self.realm, hit[0], hit[1],
+            save_credits_source(accounts_dir, self.endpoint_scope(), hit[0], hit[1],
                                 hit[2]["fields"])
         return {"ok": bool(hit), "realm": self.realm, "rows": rows,
                 "hit": ({"host": hit[0], "path": hit[1],
@@ -3353,6 +3662,9 @@ class Account(object):
         path = str(src.get("path") or "")
         if not host or not path:
             return None
+        cfg = self.realm_config()
+        if not self._credits_source_allowed(host):
+            return None  # 忽略公网或其它实例遗留的额度来源缓存。
         try:
             body = http_json(host + path, method="GET", headers=self.headers(),
                              timeout=20, retries=0)
@@ -3374,12 +3686,12 @@ class Account(object):
         """
         _dir = os.path.dirname(self.path) if self.path else None
         _srcs = load_credits_sources(_dir) if _dir else {}
-        _src = _srcs.get(str(self.realm or "cn"))
+        _src = _srcs.get(self.endpoint_scope())
         if _src:
             _hit = self._fetch_credits_via_source(_dir, _src)
             if _hit:
                 return _hit
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_QUOTA
         hint = ""
         try:
@@ -3608,7 +3920,7 @@ class Account(object):
 
     def fetch_plan(self):
         """GET /api/v2/user/plan -> 套餐名（Pro Trial 等）。"""
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3624,7 +3936,7 @@ class Account(object):
 
     # -- Pro 升级包（一次性 +1800） ---------------------------------------
     def pro_eligibility(self):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
             m = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3639,7 +3951,7 @@ class Account(object):
             return False, str(exc)
 
     def pro_claim(self):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
             m = http_json(url, data=b"{}", method="POST", headers=self.headers(),
@@ -4081,6 +4393,8 @@ class AccountPool(object):
         with self._lock:
             existing = self.get(account.uid)
             if existing is not None:
+                if existing.realm_config()["domain"] != account.realm_config()["domain"]:
+                    raise ValueError("account uid already belongs to a different endpoint; use a distinct uid")
                 account.added_at = existing.added_at
                 account.path = existing.path
                 if not account.credits and existing.credits:
@@ -4419,6 +4733,38 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
+    def set_vpc(self, uid, value):
+        """Publish a snapshot so in-flight requests keep their original endpoint."""
+        override = normalize_vpc_override(value)
+        with self._lock:
+            existing = self.get(uid)
+            if existing is None:
+                return None
+            realm_config_for(existing.realm, override)
+            data = existing.to_dict()
+            data["vpcEndpoint"] = override
+            validated = Account(data, existing.path)
+            replacement = copy.copy(existing)
+            replacement.vpc_override = validated.vpc_override
+            replacement.vpc_endpoint = validated.vpc_endpoint
+            replacement.vpc_source = validated.vpc_source
+            replacement.domain = validated.domain
+            with _VPC_LOCK:
+                _VPC_ACCOUNTS.add(replacement)
+            if existing.realm_config()["domain"] != replacement.realm_config()["domain"]:
+                replacement.credits = replacement.plan = None
+                replacement.last_checkin = ""
+                replacement.last_error = ""
+                replacement.cooldown_until = 0
+            with _SAVE_LOCK:
+                replacement.save(self.dir)
+                existing._superseded = True
+                existing.path = None
+                self.accounts[self.accounts.index(existing)] = replacement
+            from qoder_sign import SESSIONS
+            SESSIONS.invalidate(uid)
+            return replacement.public()
+
     def set_all_enabled(self, enabled, realm=None):
         with self._lock:
             for account in self.accounts:
@@ -4493,21 +4839,20 @@ class AccountPool(object):
 
     # -- OAuth 设备授权登录 ------------------------------------------------
     @staticmethod
-    def _local_machine_id(realm):
+    def _local_machine_id(realm, vpc=None):
         """读取本机官方客户端的 machine_id（优先，保持设备一致），缺则生成。"""
-        cfg = get_realm_config(realm)
-        home = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        p = os.path.join(home, "machine_id")
-        try:
-            with open(p, encoding="utf-8") as fh:
-                mid = fh.read().strip()
-            if mid:
-                return mid
-        except Exception:
-            pass
+        for auth_dir in cli_auth_dirs(realm, vpc):
+            try:
+                with open(os.path.join(auth_dir, "machine_id"),
+                          encoding="utf-8") as fh:
+                    mid = fh.read().strip()
+                if mid:
+                    return mid
+            except Exception:
+                pass
         return str(uuid.uuid4())
 
-    def start_login(self, realm="cn", platform="CLI"):
+    def start_login(self, realm="cn", platform="CLI", vpc=None):
         """构造 PKCE 设备授权 URL（浏览器打开完成授权）。
 
         双区 URL 参数差异（官方逆向）：
@@ -4516,7 +4861,7 @@ class AccountPool(object):
           Intl : challenge, challenge_method, nonce(32-hex), client_id,
                  machine_id（新协议带 client_id/machine_id、不带 redirect_uri）
         """
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
         verifier, challenge = _make_pkce()
         nonce = uuid.uuid4().hex if not cfg["nonce_dashed"] else str(uuid.uuid4())
         q = {
@@ -4528,7 +4873,7 @@ class AccountPool(object):
             q["redirect_uri"] = cfg["redirect_uri"]
         if cfg.get("send_client_id"):
             q["client_id"] = cfg["client_id"]
-            q["machine_id"] = self._local_machine_id(realm)
+            q["machine_id"] = self._local_machine_id(realm, vpc)
         auth_url = cfg["website"] + "/device/selectAccounts?" + urllib.parse.urlencode(q)
         state = "qd-%d" % time.time_ns()
         with self._lock:
@@ -4538,9 +4883,11 @@ class AccountPool(object):
                 "nonce": nonce,
                 "region": realm,
                 "platform": platform,
+                "endpoint_config": dict(cfg),
+                "vpc_override": normalize_vpc_override(vpc),
             }
         return {"state": state, "authUrl": auth_url, "realm": realm,
-                "platform": platform}
+                "platform": platform, "vpcEndpoint": cfg.get("vpc_instance", "")}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -4554,7 +4901,7 @@ class AccountPool(object):
                 self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("region") or "cn"
-        cfg = get_realm_config(realm)
+        cfg = info.get("endpoint_config") or get_realm_config(realm)
         q = urllib.parse.urlencode({
             "nonce": info["nonce"],
             "verifier": info["verifier"],
@@ -4623,6 +4970,7 @@ class AccountPool(object):
             "nickname": nickname or ("u" + (uid[-8:] if uid else "")),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": info.get("vpc_override"),
             "platform": info.get("platform") or "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4633,8 +4981,10 @@ class AccountPool(object):
             "organizationId": org_id,
             "organizationName": org_name,
         })
-        self.add(account)
         with self._lock:
+            if self.logins.get(state) is not info:
+                return {"status": "cancelled", "message": "login was cancelled"}
+            self.add(account)
             self.logins.pop(state, None)
         return {"status": "ok", "account": account.public()}
 
@@ -4643,12 +4993,13 @@ class AccountPool(object):
             return self.logins.pop(state, None) is not None
 
     # -- PAT 导入 ----------------------------------------------------------
-    def import_pat(self, pat, realm="cn"):
+    def import_pat(self, pat, realm="cn", vpc=None):
         """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。"""
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
+        endpoint_scope = _VpcEndpointScope(cfg)  # retain until exchange and save finish
         data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
                          data=json.dumps({"personal_token": pat}).encode(),
                          method="POST",
@@ -4682,6 +5033,7 @@ class AccountPool(object):
             "nickname": nickname or ("u" + (uid[-8:] if uid else uid[:8])),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": normalize_vpc_override(vpc),
             "platform": "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4772,6 +5124,29 @@ def _load_cli_user(realm, path, machine_key):
     return json.loads(pt.decode("utf-8"))
 
 
+def _scan_cli_auth_dirs(realm):
+    """Only public and explicitly configured instance paths, never all home dirs."""
+    directories = list(cli_auth_dirs(realm))
+    pool = globals().get("_ACTIVE_POOL")
+    if realm == "cn" and pool is not None:
+        with pool._lock:
+            instances = {a.vpc_endpoint for a in pool.accounts
+                         if a.realm == "cn" and a.vpc_endpoint}
+        for instance in sorted(instances):
+            for directory in cli_auth_dirs(realm, instance):
+                if directory not in directories:
+                    directories.append(directory)
+    return directories
+
+
+def _cli_path_vpc(realm, directory):
+    root = os.path.join(os.path.expanduser("~"), get_realm_config(realm)["home_dir"])
+    relative = Path(os.path.relpath(directory, root)).parts
+    if realm == "cn" and len(relative) == 3 and relative[0] == ".vpc" and relative[2] == ".auth":
+        return normalize_vpc_override(relative[1])
+    return None
+
+
 def scan_desktop_credentials():
     """只读探测本机双区已登录凭证。返回候选列表（不含任何明文令牌）。"""
     found = []
@@ -4820,9 +5195,12 @@ def scan_desktop_credentials():
             item["error"] = str(exc)
         found.append(item)
 
-        # 2) CLI 端 user / user.{profile}
-        auth_dir = os.path.join(os.path.expanduser("~"), cfg["home_dir"], ".auth")
-        if os.path.isdir(auth_dir):
+        # 2) CLI 端 user / user.{profile}（含 VPC 实例专属目录）
+        for auth_dir in _scan_cli_auth_dirs(realm):
+            if not os.path.isdir(auth_dir):
+                continue
+            path_vpc = _cli_path_vpc(realm, auth_dir)
+            cli_cfg = realm_config_for(realm, path_vpc)
             machine_key = ""
             try:
                 with open(os.path.join(auth_dir, "machine_id"),
@@ -4843,7 +5221,8 @@ def scan_desktop_credentials():
                     "file": n,
                     "realm": realm,
                     "realmName": cfg["name"],
-                    "domain": cfg["domain"],
+                    "domain": cli_cfg["domain"],
+                    "vpcEndpoint": path_vpc,
                     "readable": False,
                     "valid": False,
                     "uid": "",
@@ -4895,10 +5274,14 @@ def import_desktop_credential(path=None, realm=None):
             break
     if target_realm not in REALM_CONFIGS:
         target_realm = "cn"
-    cfg = get_realm_config(target_realm)
+    imported_vpc = matched.get("vpcEndpoint") if matched else _cli_path_vpc(
+        target_realm, os.path.dirname(path))
+    cfg = realm_config_for(target_realm, imported_vpc)
 
     token = refresh = ""
     uid = nickname = ""
+    user_type = DEFAULT_USER_TYPE
+    org_id = org_name = ""
     exp = 0
     base = os.path.basename(path)
     if base == "auth.v1.dat":
@@ -4908,6 +5291,12 @@ def import_desktop_credential(path=None, realm=None):
         user = data.get("user") or {}
         uid = str(user.get("id") or "")
         nickname = str(user.get("name") or "")
+        user_type = (str(user.get("user_type") or user.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(user.get("organization_id")
+                     or user.get("organizationId") or "")
+        org_name = str(user.get("organization_name")
+                       or user.get("organizationName") or "")
         try:
             import datetime
             exp = int(datetime.datetime.strptime(
@@ -4929,6 +5318,12 @@ def import_desktop_credential(path=None, realm=None):
         refresh = str(data.get("refresh_token") or "")
         uid = str(data.get("uid") or "")
         nickname = str(data.get("name") or "")
+        user_type = (str(data.get("user_type") or data.get("userType") or "")
+                     or DEFAULT_USER_TYPE)
+        org_id = str(data.get("organization_id")
+                     or data.get("organizationId") or "")
+        org_name = str(data.get("organization_name")
+                       or data.get("organizationName") or "")
         exp = normalize_epoch(data.get("expire_time"))
 
     if not token:
@@ -4940,12 +5335,16 @@ def import_desktop_credential(path=None, realm=None):
         "nickname": nickname or uid[:8],
         "domain": cfg["domain"],
         "realm": target_realm,
+        "vpcEndpoint": imported_vpc,
         "platform": "CLI",
         "accessToken": token,
         "refreshToken": refresh,
         "expiresAt": exp or (int(time.time()) + 30 * 86400),
         "source": "desktop-app",
         "enabled": True,
+        "userType": user_type,
+        "organizationId": org_id,
+        "organizationName": org_name,
     })
     return add_to_pool(account)
 
@@ -5044,7 +5443,16 @@ def normalise_import_row(row, realm=None, group=None):
     detected = str(realm or pick("realm") or "").strip().lower()
     if detected not in ("cn", "intl"):
         detected = detect_realm_from_domain(pick("domain"))
-    cfg = get_realm_config(detected)
+    endpoint = None
+    for layer in (row, auth, profile):
+        if isinstance(layer, dict) and "vpcEndpoint" in layer:
+            endpoint = normalize_vpc_override(layer["vpcEndpoint"])
+            break
+    else:
+        domain = str(pick("domain") or "")
+        if detected == "cn" and domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+            endpoint = normalize_vpc_override(domain)
+    cfg = realm_config_for(detected, endpoint)
     raw_uid = str(pick("uid") or "").strip()
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
@@ -5061,8 +5469,9 @@ def normalise_import_row(row, realm=None, group=None):
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
         "group": str(group if group is not None else pick("group") or "").strip(),
-        "domain": str(pick("domain") or cfg["domain"]),
+        "domain": cfg["domain"],
         "realm": detected,
+        "vpcEndpoint": endpoint,
         "platform": str(pick("platform") or "CLI"),
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),

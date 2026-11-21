@@ -287,7 +287,7 @@ def _queue_request(fields):
         raise UpdateRequestError("提交更新任务失败")
 
 
-def request_install(tag, current_version, port=8788, lan=False, repo=None):
+def request_install(tag, current_version, port=8789, lan=False, repo=None):
     """Queue a stable tag for the root updater; caller must panel-authenticate."""
     if not install_enabled():
         raise UpdateRequestError("安装更新服务尚未配置")
@@ -316,7 +316,7 @@ def request_install(tag, current_version, port=8788, lan=False, repo=None):
             "message": "更新任务已排队"}
 
 
-def request_rollback(version, current_version, port=8788, lan=False):
+def request_rollback(version, current_version, port=8789, lan=False):
     """Queue a restore of a retained backup; caller must panel-authenticate.
 
     The target is checked against the backups this deployment actually has, so

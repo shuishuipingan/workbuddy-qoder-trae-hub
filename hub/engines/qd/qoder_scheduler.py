@@ -346,12 +346,16 @@ class Scheduler(object):
         self.log("后台定时调度器已暂停")
 
     def _run_loop(self):
-        # 启动后先休眠 10 秒等待主服务就绪，然后执行初次检查
-        time.sleep(10)
-        try:
-            self._execute_cycle("启动初次初始化巡检", CYCLE_STARTUP)
-        except Exception as exc:
-            self.log("初次巡检异常: %s" % exc)
+        # Startup delay is cancellable; a saved pause must suppress automatic claims.
+        if self._stop_event.wait(10):
+            return
+        if self.enabled:
+            try:
+                self._execute_cycle("启动初次初始化巡检", CYCLE_STARTUP)
+            except Exception as exc:
+                self.log("初次巡检异常: %s" % exc)
+        else:
+            self.log("自动签到与保活已暂停，跳过启动巡检；可在面板启用调度")
 
         # issue #70：不再靠「每分钟轮询 cur_min == 0」。旧写法有两个必漏点：
         #   1) 容器时区与宿主机不同 -> 命中的是 UTC 的 9 点，不是用户本地 9 点；
@@ -393,6 +397,8 @@ class Scheduler(object):
         return {"ok": True, "msg": "已触发后台调度执行"}
 
     def _execute_cycle(self, trigger_reason="周期巡检", cycle_kind=CYCLE_HOUR):
+        if cycle_kind != CYCLE_MANUAL and (not self.enabled or self._stop_event.is_set()):
+            return  # Recheck at execution time, including pause/stop during startup delay.
         if not self._run_lock.acquire(blocking=False):
             self.log("跳过本次巡检 (%s)：上一轮仍在执行" % trigger_reason)
             return
@@ -489,7 +495,7 @@ class Scheduler(object):
                 if line.startswith("✓") or line.startswith("!"):
                     self.log(line)
         elif checkin_due:
-            self.log("所有账号今日已签到")
+            self.log("没有符合本轮签到条件的账号")
 
         # 3. 刷新额度快照（看板积分卡片依赖）
         for acc in targets:
@@ -499,7 +505,7 @@ class Scheduler(object):
                 pass
             time.sleep(0.5)
 
-        self.log("巡检完成：Token 保活 %d 个，签到 %d 个，本次新增积分 +%d"
+        self.log("巡检完成：Token 保活 %d 个，已检查签到 %d 个账号，本次新增积分 +%d"
                  % (ka["refreshed"], checkin_count, earned))
         self._save_state()
 

@@ -18,6 +18,8 @@ import secrets
 import threading
 import time
 
+import wb_time
+
 DEFAULT_PANEL_PASSWORD = "admin"
 PBKDF2_ROUNDS = 120_000
 SESSION_TTL = 7 * 24 * 3600
@@ -110,6 +112,9 @@ UI_LANGUAGE_VALUES = ("zh", "zh-Hant", "en")
 # makes the gateway send a request on its own schedule.
 UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
 UPDATE_CHECK_PROXY_SLOT_KEY = "update_check_proxy_slot"
+# Sentinel stored in the slot field when the checker should use the host's
+# system/environment proxy discovery. An empty value still means direct.
+UPDATE_CHECK_PROXY_SYSTEM = "__system__"
 # The last-check bookkeeping for that daily check. One small object, never a
 # general update-state store: see update_check_state().
 UPDATE_CHECK_STATE_KEY = "update_check"
@@ -126,6 +131,11 @@ REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 # 计数，改记在出口上、退避降到秒级（见 wb_egress）。缺失键读作关：它改变的是
 # 派发路径上的失败归账与退避尺度，老安装保持原样（传输错误仍喂账号熔断）。
 EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
+
+# 文本 / 媒体号池隔离：默认关闭，所有账号都可同时服务文本与媒体请求。
+# 只有显式打开后才按账号的 poolScope 过滤；独立入口 WB_POOL_SCOPE 仍强制
+# 隔离（见 wb_pool_scope），因为那种部署本来就各带一套账号目录。
+POOL_SEPARATION_ENABLED_KEY = "pool_separation_enabled"
 
 # 跨出口回退（国际版 → 国内版）：国际版出口把某个模型限流 / 当日额度用满 /
 # 整池冷却时，允许拿同名的国内版出口再试一次。缺失键读作关 —— 两个出口是两套
@@ -202,14 +212,15 @@ def set_account_max_concurrent(accounts_dir, value):
 # （见 affinity_route）。把第 2 轮才出现的内容算进去之后，两个会话从第 2 轮起
 # 各走各的账号；前缀真的完全相同的会话仍会共用账号——那本来就是最优的缓存共享。
 #
-# 默认关：改的是派发路径上的会话识别，老安装必须保持原逻辑。关着时
-# affinity_route 与上游一字不差，可随时回退。
+# 默认开启：这是派发路径上的会话识别修复，避免同开场白的并发会话每轮
+# 互相抢账号。仍可在面板关闭，关闭后 affinity_route 与旧逻辑一致。
 AFFINITY_STABLE_KEY_ENABLED_KEY = "affinity_stable_key_enabled"
 
 
 def affinity_stable_key_enabled(accounts_dir):
     """Whether the conversation key also covers the first assistant turn."""
-    return load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY) is True
+    value = load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY)
+    return value is not False if isinstance(value, bool) else value is None
 
 
 def set_affinity_stable_key_enabled(accounts_dir, enabled):
@@ -246,6 +257,14 @@ DEFAULT_LOG_DB_MAX_DAYS = 7
 MAX_LOG_DB_MAX_ROWS = 100_000_000
 MAX_LOG_DB_MAX_DAYS = 36500
 MAX_LOG_DB_MAX_BYTES = 100 * 1024 ** 3
+
+# 统计时区：开启后日志时间戳、请求记录、撞线 / 重置时刻、用量日 / 小时分桶、
+# 签到日期、额度重置日、导出文件时间等所有对外可见的时间统一按固定 +08:00
+# （北京时间）计算。缺失键读作关 —— 关着的时候全部走宿主时区，与上游一字不差。
+# 固定偏移而不是 TZ=Asia/Shanghai + tzset()：中国自 1991 年起无夏令时，偏移是
+# 常量；常量偏移不需要 tzdata，Windows 没有 tzset、musl / OpenWrt 镜像常缺
+# zoneinfo，IANA 名在那里会静默退化成 UTC，反而把「北京时间」算错。
+STATS_TZ_BEIJING_KEY = "stats_tz_beijing"
 
 _lock = threading.RLock()
 
@@ -571,6 +590,14 @@ def key_allows_account(entry, uid):
     return str(uid or "").strip() in refs
 
 
+def _clean_daily_token_limit(value):
+    """日 token 限量归一：单位 M（百万 token），负数与脏值一律当 0（不限）。"""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable.
 
@@ -601,8 +628,9 @@ def _clean_key_entry(entry):
         "models": _clean_model_patterns(entry.get("models")),
         "accounts": _clean_account_refs(entry.get("accounts")),
         "concurrency_limit": concurrency,
+        "daily_token_limit": _clean_daily_token_limit(entry.get("daily_token_limit")),
         "enabled": False if deleted_at else entry.get("enabled", True) is not False,
-        "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
+        "created_at": entry.get("created_at") or wb_time.strftime("%Y/%m/%d %H:%M"),
         "deleted_at": deleted_at,
     }
 
@@ -696,7 +724,7 @@ def _retired_key_entry(old):
         "models": old.get("models") or [],
         "enabled": False,
         "created_at": old.get("created_at") or "",
-        "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
+        "deleted_at": old.get("deleted_at") or wb_time.strftime("%Y/%m/%d %H:%M"),
     }
 
 
@@ -1366,6 +1394,10 @@ def set_section_max_height(accounts_dir, value):
 # ——空清单会生成一个没有模型的 provider，客户端直接不可用。
 AGENT_MODELS_KEY = "agent_models"
 MODEL_ALIASES_KEY = "model_aliases"
+# 别名开关：关闭时别名既不进 /v1/models，也不改写请求；开启后别名与原名都可用。
+# 缺省（旧配置文件里没有这个键）按「关闭」处理——别名是运维自己加的映射，
+# 不该在升级后突然对所有客户端可见。
+MODEL_ALIASES_ENABLED_KEY = "model_aliases_enabled"
 
 
 def _clean_model_aliases(raw):
@@ -1396,9 +1428,72 @@ def _clean_model_aliases(raw):
 
 
 def model_aliases(accounts_dir):
-    """Read the operator-maintained model alias table."""
+    """Read the operator-maintained model alias table.
+
+    Returns the raw table regardless of the enable switch: the panel edits the
+    table even while the switch is off, and turning the switch back on must not
+    have lost the mapping. Callers that apply/advertise aliases go through
+    :func:`effective_model_aliases` instead.
+    """
     raw = load(accounts_dir).get(MODEL_ALIASES_KEY)
     return _clean_model_aliases(raw)
+
+
+def model_aliases_enabled(accounts_dir):
+    """Whether the alias table is applied. Missing key reads as off."""
+    value = load(accounts_dir).get(MODEL_ALIASES_ENABLED_KEY)
+    return value is True
+
+
+def set_model_aliases_enabled(accounts_dir, enabled):
+    """Persist the alias switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[MODEL_ALIASES_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def effective_model_aliases(accounts_dir):
+    """The aliases to actually honour: empty when the switch is off.
+
+    Every consumer (request rewrite, ``/v1/models`` advertising, key model
+    restriction) goes through this, so flipping the switch is the single place
+    that decides whether aliases exist at all. The original model names are
+    never affected either way: the table only ever adds an extra name.
+    """
+    if not model_aliases_enabled(accounts_dir):
+        return {}
+    return model_aliases(accounts_dir)
+
+
+# 手编一张几十行的别名表已经够用；上限只挡「把设置文件撑爆」这类误操作。
+MAX_MODEL_ALIASES = 200
+MAX_MODEL_ALIAS_LEN = 200
+
+
+def set_model_aliases(accounts_dir, raw):
+    """Persist the alias table and return the normalized mapping.
+
+    Accepts the object shape and the ``[{"from","to"}]`` spelling the reader
+    already understands, so the panel can send either. An alias that points at
+    itself is dropped by the cleaner; an alias longer than the cap is rejected
+    instead of silently truncated (a truncated name is a different model).
+    """
+    cleaned = _clean_model_aliases(raw)
+    if len(cleaned) > MAX_MODEL_ALIASES:
+        raise ValueError("model alias table holds at most %d entries"
+                         % MAX_MODEL_ALIASES)
+    for alias, target in cleaned.items():
+        if len(alias) > MAX_MODEL_ALIAS_LEN or len(target) > MAX_MODEL_ALIAS_LEN:
+            raise ValueError("model alias names must be at most %d characters"
+                             % MAX_MODEL_ALIAS_LEN)
+    with _lock:
+        data = load(accounts_dir)
+        data[MODEL_ALIASES_KEY] = cleaned
+        save(accounts_dir, data)
+    return cleaned
 # 清单写进客户端配置后会被逐条展开；200 条已远超任何出口的模型数，上限只挡
 # 手编 settings.json 把客户端配置撑爆。
 MAX_AGENT_MODELS = 200
@@ -2154,6 +2249,22 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
     return enabled
 
 
+def pool_separation_enabled(accounts_dir):
+    """Whether text/media pool separation is enforced (default: off)."""
+    return load(accounts_dir).get(POOL_SEPARATION_ENABLED_KEY) is True
+
+
+def set_pool_separation_enabled(accounts_dir, enabled):
+    """Persist the text/media pool separation switch."""
+    if not isinstance(enabled, bool):
+        raise ValueError("pool_separation_enabled must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data[POOL_SEPARATION_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 RESTRICTION_HOLD_SECONDS_KEY = "restriction_hold_seconds"
 DEFAULT_RESTRICTION_HOLD_SECONDS = 1800
 MAX_RESTRICTION_HOLD_SECONDS = 86400 * 7
@@ -2161,7 +2272,7 @@ MAX_RESTRICTION_HOLD_SECONDS = 86400 * 7
 
 def restriction_hold_seconds(accounts_dir):
     """How many seconds the gateway pauses dispatch when upstream reports an
-    unusual activity restriction (403 / 11140).
+    unusual activity account ban (403 / 11140).
 
     Defaults to 1800 seconds (30 minutes). When set to 0, restriction hold is
     disabled. Operator can configure custom duration via panel settings.
@@ -2243,6 +2354,26 @@ def set_log_db_enabled(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data[LOG_DB_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def stats_tz_beijing(accounts_dir):
+    """Whether all human-facing times use fixed +08:00 instead of the host tz.
+
+    Off unless the operator turns it on: with the switch off every timestamp and
+    bucket is computed in the host timezone, exactly as it is upstream, so an
+    existing install's history keeps its current meaning after an upgrade.
+    """
+    return load(accounts_dir).get(STATS_TZ_BEIJING_KEY) is True
+
+
+def set_stats_tz_beijing(accounts_dir, enabled):
+    """Persist the statistics-timezone switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[STATS_TZ_BEIJING_KEY] = enabled
         save(accounts_dir, data)
     return enabled
 
@@ -2625,6 +2756,7 @@ DAILY_CHAT_RANDOM_MINUTES = (5, 55)
 DAILY_CHAT_RANDOM_KEY = "daily_chat_random"
 DAILY_CHAT_STARTUP_CATCHUP_KEY = "daily_chat_startup_catchup"
 DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY = "daily_chat_web_fallback_activity"
+DAILY_CHAT_PREFER_FLASH_KEY = "daily_chat_prefer_flash"
 
 
 def _clean_models(value):
@@ -2691,6 +2823,26 @@ def set_daily_chat_models(accounts_dir, models):
     return cleaned
 
 
+def daily_chat_prefer_flash(accounts_dir):
+    """自动候选是否先试 DeepSeek Flash；默认开。
+
+    这是自动模式的选择策略，不会覆盖操作者手工配置的 daily_chat_models。
+    手改成非布尔值时按默认（开）处理，避免一份坏配置让每日活跃没有候选。
+    """
+    value = load(accounts_dir).get(DAILY_CHAT_PREFER_FLASH_KEY)
+    return value is not False
+
+
+def set_daily_chat_prefer_flash(accounts_dir, enabled):
+    if not isinstance(enabled, bool):
+        raise ValueError("daily_chat_prefer_flash must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data[DAILY_CHAT_PREFER_FLASH_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def daily_chat_budget(accounts_dir, default=None):
     """How long one account may spend on the web activity, in seconds.
 
@@ -2741,8 +2893,7 @@ def daily_chat_random_times(accounts_dir, now=None):
     around under the accounts that already ran, and "next slot in ..." would
     never converge. The stored date is the guard.
     """
-    moment = time.localtime(now) if now is not None else time.localtime()
-    today = time.strftime("%Y-%m-%d", moment)
+    today = wb_time.day_key(time.time() if now is None else now)
     data = load(accounts_dir)
     stored = data.get(DAILY_CHAT_RANDOM_KEY)
     if isinstance(stored, dict) and stored.get("date") == today:

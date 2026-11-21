@@ -16,9 +16,12 @@ import json
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 import wb_accounts as _accounts
+import wb_fingerprint
 import wb_identity
 
 # 默认 https://copilot.tencent.com；WB_CN_CHAT_UPSTREAM 可覆盖（见 wb_identity.CN_CHAT_BASE）。
@@ -56,6 +59,67 @@ MP_TASK_SPECS = {
     "school_season": {"name": "校园日活动", "target": 1, "reward": 100},
 }
 
+# 运营活动任务走独立的 /portal/activity/* 契约，不在成长任务清单里。
+# 星巴克协作与记者节活动的判据都已按官方小程序埋点实测校准。
+CAMPAIGN_BASE = "https://www.codebuddy.cn"
+CAMPAIGN_GAP = 3
+CAMPAIGN_POLL = 6
+CAMPAIGN_SLOW_GAP = 10
+CAMPAIGN_SLOW_POLL = 6
+CAMPAIGN_CLAIM_GAP = 4
+CAMPAIGN_CLAIM_POLL = 5
+CAMPAIGN_DESKTOP_WAIT = 60
+CAMPAIGN_DESKTOP_POLL = 6
+
+CAMPAIGN_SPECS = [
+    {
+        "code": "campaign_starbucks_2026",
+        "label": "星巴克协作",
+        "page": {
+            "pageURL": "subpackages/secondary/starbucks-activity-428/index",
+            "pageName": "starbucks_activity",
+        },
+        "tasks": [
+            {"task": "ai_chat", "label": "与 AI 对话3次", "kind": "chat",
+             "times": 3, "credit": 100},
+            {"task": "expert", "label": "召唤专家并对话", "kind": "expert",
+             "credit": 100},
+            {"task": "app", "label": "解锁 App 强大能力", "kind": "app",
+             "credit": 100},
+        ],
+    },
+    {
+        "code": "campaign_reporter_2026",
+        "label": "记者节福利活动",
+        "page": {
+            "pageURL": "subpackages/journalist-benefit/index",
+            "pageName": "journalist_benefit",
+        },
+        "tasks": [
+            {"task": "expert_chat", "label": "体验「媒体工作助理」专家",
+             "kind": "expert", "expert_id": "ex_NaiDbO06Adf3",
+             "expert_name": "媒体工作助理", "credit": 50},
+            {"task": "skill_use", "label": "体验「采访素材整理」技能",
+             "kind": "skill", "skill_id": "skill_2117491159283752960",
+             "skill_name": "interview-material-organizer", "credit": 50},
+            {"task": "desktop_same", "label": "体验「内容发布排期」灵感",
+             "kind": "desktop", "case_id": "content-calendar", "credit": 100},
+        ],
+    },
+]
+
+CAMPAIGN_CASES = {
+    "content-calendar": {
+        # 活动判据认产物目录名，不认注册表 slug 或中文名。
+        "event_id": "cnb-content-calendar",
+        "name": "内容发布排期表",
+        "type": "table",
+        "prompt_length": 359,
+    },
+}
+
+MP_EXPERT_CATEGORY = "16-BackToSchool"
+
 
 _log = lambda msg: None
 
@@ -90,6 +154,8 @@ TASK_SPECS = {
     # first_buddy 是 auto 类（上游不接受接取），完成后领奖才发放 Buddy 实例；
     # 它是所有 single 任务与猫猫旅行的前置（"prerequisite not met: first_buddy"）。
     "first_buddy": {"kind": "chat", "target": 1, "reward": 300, "name": "领取一只 Buddy"},
+    "skill_share": {"kind": "skill_share", "target": 1, "reward": 100,
+                    "name": "分享技能给好友"},
     # 活动任务：在专家页召唤「无畏契约拼豆专家」并完成一次对话。事件里的 id
     # 必须是这个专家的真实 id，否则上游只接受事件但不推进进度。
     "WorkBuddy_Valorant": {"kind": "expert", "target": 1, "reward": 100,
@@ -117,6 +183,32 @@ TASK_SPECS = {
                                     "name": "关注官方公众号"},
     "Expert_Philanthropy": {"unforgeable": True, "reason": "真实捐款动作", "reward": 0, "name": "公益爱心捐赠"},
 }
+
+# 成长任务里的真实分享/模板动作。两者都不是普通 /v2/report 单事件：
+# - skill_share 先在 Open Platform 创建真实分享渠道，再上报渠道动作；
+# - template_5 使用服务端场景 id，并按四事件组计数。
+SKILL_SHARE_CHANNEL_URL = (
+    "https://open.workbuddy.cn/api/v2/open-platform/"
+    "asset-shares/c2c/channels"
+)
+SKILL_MARKET_URL = (
+    "https://www.codebuddy.cn/v2/operation-platform/market/skill/list"
+)
+SKILL_SHARE_PREFERRED_ID = "skill_2097350077599879168"
+TEMPLATE_SCENES_URL = (
+    "https://www.workbuddy.cn/console/as/support/scenes?locale=zh-CN"
+)
+TEMPLATE_FALLBACK_SCENES = [
+    ("0", "幻灯片"),
+    ("4", "深度研究"),
+    ("8", "数据分析"),
+    ("16", "设计"),
+    ("20", "日常开发"),
+]
+SKILL_SHARE_POLL_TRIES = 4
+SKILL_SHARE_POLL_GAP = 3.0
+TEMPLATE_POLL_TRIES = 4
+TEMPLATE_POLL_GAP = 2.0
 
 # ---------------------------------------------------------------------------
 # 逆向修复常量 (2026-09 实测校准)
@@ -466,26 +558,82 @@ def mp_base(uid, nick):
     }
 
 
-def report_mp_events(account, events, base=None):
-    if base is None:
-        base = CHAT_BASE
-    url = base + "/v2/report"
+def _post_mp_events(account, events, base, env_extra=None, headers=None):
+    """Post mini-program events with an optional page context.
+
+    Campaign tasks are keyed by the page that emitted the event, while the
+    regular mini-program growth tasks are not. Keeping this envelope helper
+    shared avoids two subtly different event shapes.
+    """
     base_ev = mp_base(account.uid, getattr(account, "nickname", ""))
+    if env_extra:
+        base_ev.update(env_extra)
     arr = []
     for e in events:
         m = dict(base_ev)
         m.update(e)
         arr.append(m)
     body = json.dumps(arr).encode("utf-8")
-    headers = account.headers("chat")
-    headers.update(MP_REPORT_HEADERS)
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    request_headers = dict(headers or account.headers("chat"))
+    request_headers.update(MP_REPORT_HEADERS)
+    request_headers["X-User-Id"] = account.uid
+    url = base + "/v2/report"
+    req = urllib.request.Request(
+        url, data=body, method="POST", headers=request_headers)
     try:
         with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             return d.get("code") == 0
     except Exception as exc:
         _log(f"report_mp_events failed: {exc}")
+        return False
+
+
+def report_mp_events(account, events, base=None):
+    return _post_mp_events(account, events, base or CHAT_BASE)
+
+
+def _report_desktop_events(account, events, base=None):
+    """Post desktop-domain events to the desktop client's report endpoint.
+
+    ``report_events`` uses the chat base (copilot.tencent.com by default).
+    Desktop events use the same upstream contract, not the web console host;
+    keeping the base parameter makes the endpoint testable and preserves the
+    ``WB_CN_CHAT_UPSTREAM`` override.
+    """
+    envelope = wb_fingerprint.get_desktop_fingerprint(
+        account.uid, getattr(account, "nickname", ""))
+    envelope["ideVersion"] = wb_identity.DESKTOP_VERSION_CN
+    envelope["extVersion"] = wb_identity.DESKTOP_VERSION_CN
+    arr = []
+    for event in events:
+        item = dict(envelope)
+        item.update(event)
+        arr.append(item)
+    headers = account.headers("chat")
+    headers.update({
+        "Content-Type": "application/json;charset=UTF-8",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": DESKTOP_UA,
+        "X-Domain": "copilot.tencent.com",
+        "X-Product": "SaaS",
+        "X-Request-ID": wb_fingerprint.generate_request_id(account.uid),
+        "X-User-Id": account.uid,
+    })
+    url = (base or CHAT_BASE).rstrip("/") + "/v2/report"
+    req = urllib.request.Request(
+        url, data=json.dumps(arr).encode("utf-8"),
+        method="POST", headers=headers)
+    try:
+        with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+            # The desktop endpoint commonly returns an empty body. A 2xx
+            # response is the transport contract; parsing JSON here would
+            # incorrectly turn a successful report into a retryable failure.
+            status = getattr(resp, "status", 200)
+            resp.read()
+            return 200 <= status < 300
+    except Exception as exc:
+        _log(f"report_desktop_events failed: {exc}")
         return False
 
 
@@ -706,6 +854,294 @@ def do_cat_travel(account):
     return {"ok": True, "action": state, "msg": f"当前状态: {state}"}
 
 
+def _task_json_request(account, method, url, body=None, headers=None,
+                       timeout=20):
+    """Call one JSON endpoint and return ``(status, payload)``.
+
+    Growth-task helpers deliberately do not use ``wb_accounts.http_json``:
+    that helper raises on HTTP errors, while these callers need the status
+    and body to distinguish "endpoint rejected us" from "task not issued".
+    """
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request_headers = dict(headers or account.headers("chat"))
+    request_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(
+        url, data=data, method=method, headers=request_headers)
+    try:
+        with _accounts.urlopen(req, timeout=timeout,
+                               proxy=account.proxy) as resp:
+            raw = resp.read()
+            status = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        try:
+            raw = exc.read(1000)
+        except Exception:
+            raw = b""
+    except Exception as exc:
+        _log(f"task request failed: {method} {url}: {exc}")
+        return 0, {}
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+    except (TypeError, ValueError):
+        payload = {"msg": raw[:200].decode("utf-8", "replace")}
+    return status, payload if isinstance(payload, dict) else {}
+
+
+def _skill_share_market_skill(account):
+    """Read the first shareable market skill, preferring the measured one."""
+    status, payload = _task_json_request(
+        account, "POST", SKILL_MARKET_URL,
+        body={"page": 1, "page_size": 20})
+    if status < 200 or status >= 300 or payload.get("code") not in (
+            0, 200, "0", "200"):
+        _log("skill market list rejected: HTTP %s %s"
+             % (status, str(payload.get("msg") or "")[:120]))
+        return None
+    skills = (payload.get("data") or {}).get("skills") or []
+    candidates = []
+    for row in skills:
+        if not isinstance(row, dict):
+            continue
+        skill_id = str(row.get("skill_id") or row.get("id") or "").strip()
+        if not skill_id:
+            continue
+        name = str(row.get("display_name_zh") or row.get("name")
+                   or row.get("display_name_en") or "").strip()
+        if not name:
+            continue
+        candidates.append({
+            "id": skill_id,
+            "name": name,
+            "description": str(
+                row.get("description_zh") or row.get("description")
+                or row.get("description_en") or "").strip()[:60],
+        })
+    if not candidates:
+        return None
+    return next((row for row in candidates
+                 if row["id"] == SKILL_SHARE_PREFERRED_ID),
+                candidates[0])
+
+
+def _create_skill_share_channel(account, skill):
+    """Create a real asset-share channel; return a normalized result."""
+    skill_id = str(skill.get("id") or "").strip()
+    if not skill_id:
+        return {"ok": False, "msg": "市场技能 ID 为空"}
+    body = {
+        "asset_kind": "skill",
+        "asset_source": "market",
+        "asset_ref": json.dumps({"asset_id": skill_id},
+                                separators=(",", ":")),
+        "ways": ["link", "wxacode", "wxapath"],
+        "extra": {
+            "name": skill.get("name") or "技能",
+            "description": skill.get("description") or "",
+            "shareKey": skill_id,
+            "marketplaceSource": "builtin-market",
+        },
+    }
+    headers = account.headers("chat")
+    headers.update({
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": DESKTOP_UA,
+        "X-User-Id": account.uid,
+        "X-Domain": "copilot.tencent.com",
+    })
+    status, payload = _task_json_request(
+        account, "POST", SKILL_SHARE_CHANNEL_URL, body=body,
+        headers=headers, timeout=30)
+    code = payload.get("code")
+    if status < 200 or status >= 300 or code not in (0, 200, "0", "200"):
+        return {"ok": False, "status": status, "code": code,
+                "msg": str(payload.get("msg") or "创建分享渠道失败")[:160]}
+    data = payload.get("data") or {}
+    share_code = str(data.get("share_code") or "").strip()
+    link = ""
+    for way in data.get("ways") or []:
+        if isinstance(way, dict) and way.get("share_way") == "link":
+            link = str(way.get("resource_ref") or "").strip()
+            break
+    if not share_code or not link:
+        return {"ok": False, "status": status,
+                "msg": "分享接口缺少 share_code 或 link"}
+    return {"ok": True, "share_code": share_code,
+            "channel_id": str(data.get("channel_id") or "")}
+
+
+def _skill_share_channel_events(skill_id, skill_name, share_code):
+    common = {
+        "skillId": skill_id,
+        "skillName": skill_name,
+        "skillType": "market",
+    }
+    now = int(time.time() * 1000)
+    return [
+        dict(common, eventCode="skill_share_channel_action",
+             action="link", panelAction="click", panelType="clipboard",
+             isSuccessful=True, cost=0, id=share_code, actionAt=now),
+        dict(common, eventCode="skill_share_channel_action",
+             action="link", panelAction="success", panelType="clipboard",
+             isSuccessful=True, cost=0, id=share_code, actionAt=now),
+    ]
+
+
+def _refresh_growth_task(account, code):
+    return next((x for x in fetch_growth_tasks(account)
+                 if x.get("task_code") == code), None)
+
+
+def _wait_for_growth_task(account, code, target, tries, gap):
+    """Poll until the server confirms the target or the bounded wait expires."""
+    fresh = None
+    for i in range(max(1, tries)):
+        if i:
+            time.sleep(gap)
+        fresh = _refresh_growth_task(account, code)
+        if not fresh:
+            continue
+        if (fresh.get("status") in ("completed", "claimed")
+                or fresh.get("current", 0) >= target):
+            return fresh
+    return fresh
+
+
+def _finish_special_task(account, t, fresh, logs, gap, claim):
+    """Claim only after server-side completion is visible."""
+    name = t.get("name") or t["task_code"]
+    target = t.get("target", 1)
+    if not fresh or (fresh.get("status") not in ("completed", "claimed")
+                     and fresh.get("current", 0) < target):
+        current = fresh.get("current", 0) if fresh else t.get("current", 0)
+        logs.append("? 任务 [%s] 进度 %s/%s 未确认，领奖顺延到下次运行"
+                    % (name, current, target))
+        return 0
+    if fresh.get("status") == "claimed":
+        logs.append("✓ 任务 [%s] 已领奖" % name)
+        return 0
+    if not claim:
+        logs.append("⏸ 任务 [%s] 已达成，等待手动领取" % name)
+        return 0
+    res = claim_task(account, t["task_code"])
+    if res.get("ok"):
+        credit = res.get("credit", 0)
+        logs.append("✓ 任务 [%s] 领奖成功: +%s 积分" % (name, credit))
+        time.sleep(gap)
+        return credit
+    logs.append("! 任务 [%s] 进度已达成但领奖失败: %s"
+                % (name, res.get("msg") or "未知原因"))
+    return 0
+
+
+def _run_skill_share_task(account, t, logs, gap, claim=True):
+    """Create a real share channel, report its events, then verify progress."""
+    name = t.get("name") or "分享技能给好友"
+    skill = _skill_share_market_skill(account)
+    if skill is None:
+        logs.append("⏭ 任务 [%s] 市场未返回可分享技能，不伪造分享" % name)
+        return 0
+    channel = _create_skill_share_channel(account, skill)
+    if not channel.get("ok"):
+        logs.append("! 任务 [%s] 创建分享渠道失败: %s"
+                    % (name, channel.get("msg") or "未知原因"))
+        return 0
+    events = _skill_share_channel_events(
+        skill["id"], skill["name"], channel["share_code"])
+    if not _report_desktop_events(account, events):
+        logs.append("! 任务 [%s] 渠道已创建但事件上报失败，不领奖" % name)
+        return 0
+    logs.append("正在等待任务 [%s] 服务端进度落账..." % name)
+    fresh = _wait_for_growth_task(
+        account, t["task_code"], t.get("target", 1),
+        SKILL_SHARE_POLL_TRIES, SKILL_SHARE_POLL_GAP)
+    return _finish_special_task(account, t, fresh, logs, gap, claim)
+
+
+def _fetch_template_scenes(account):
+    """Fetch real scene IDs; the static table is only a transport fallback."""
+    status, payload = _task_json_request(
+        account, "GET", TEMPLATE_SCENES_URL)
+    if 200 <= status < 300:
+        rows = (payload.get("data") or {}).get("scenes") or []
+        scenes = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("id") is None:
+                continue
+            scenes.append((str(row["id"]), str(row.get("name") or "")))
+        if scenes:
+            return scenes
+    return list(TEMPLATE_FALLBACK_SCENES)
+
+
+def _template_events(scene_id, scene_name):
+    """One real template-creation group advances ``template_5`` by one."""
+    request_id = _new_message_id()
+    conversation_id = _new_conversation_id()
+    return [
+        {"eventCode": "agent_task_created", "source": "CLOUD", "name": "",
+         "mode": "craft", "requestModelId": "default", "action": scene_id,
+         "has_template": True, "template_id": scene_id,
+         "template_name": scene_name, "requestId": request_id,
+         "conversationId": conversation_id},
+        {"eventCode": "agent_task_created_with_template",
+         "templateId": scene_id, "templateName": scene_name,
+         "template_id": scene_id, "mode": "working", "isCustomModel": True,
+         "id": scene_id, "name": scene_name, "requestId": request_id,
+         "conversationId": conversation_id},
+        {"eventCode": "template_used", "template_id": scene_id,
+         "templateId": scene_id, "templateName": scene_name,
+         "task_mode": "working", "id": scene_id, "name": scene_name,
+         "source": "growth-center", "conversationId": conversation_id},
+        {"eventCode": "playbook_prompt_send", "ext1": str(uuid.uuid4()),
+         "requestId": request_id, "id": scene_id, "name": scene_name,
+         "type": "other", "promptLength": 30, "isOfficial": 1,
+         "source": "growth-center", "conversationId": conversation_id},
+    ]
+
+
+def _run_template_task(account, t, logs, gap, claim=True):
+    """Advance only the missing template count using server scene IDs."""
+    name = t.get("name") or "模板创建任务"
+    target = int(t.get("target") or 5)
+    current = int(t.get("current") or 0)
+    scenes = _fetch_template_scenes(account)
+    if not scenes:
+        logs.append("⏭ 任务 [%s] 取不到模板场景，跳过" % name)
+        return 0
+    fresh = None
+    while current < target:
+        scene_id, scene_name = scenes[current % len(scenes)]
+        before = current
+        if not _report_desktop_events(
+                account, _template_events(scene_id, scene_name)):
+            logs.append("! 任务 [%s] 场景 %s 事件上报失败"
+                        % (name, scene_name or scene_id))
+            return 0
+        fresh = _wait_for_growth_task(
+            account, t["task_code"], target,
+            TEMPLATE_POLL_TRIES, TEMPLATE_POLL_GAP)
+        if not fresh:
+            break
+        next_current = int(fresh.get("current") or 0)
+        if (fresh.get("status") in ("completed", "claimed")
+                or next_current >= target):
+            current = max(current, next_current)
+            break
+        # One report group must advance the server-side counter before the
+        # next group is sent. If the counter did not move, leave the task for
+        # the next run instead of spraying duplicate events.
+        if next_current <= before:
+            logs.append("任务 [%s] 服务端进度未增长，停止本轮补发" % name)
+            break
+        current = next_current
+    logs.append("任务 [%s] 当前服务端进度 %s/%s" % (name, current, target))
+    return _finish_special_task(account, t, fresh, logs, gap, claim)
+
+
 def _progress_one(account, t, logs, gap, claim=True):
     """推进单个任务并返回本次到账积分。
 
@@ -766,10 +1202,15 @@ def _progress_one(account, t, logs, gap, claim=True):
         logs.append(f"⏭ 任务 [{spec['name']}] 仍未接取, 跳过 (先解决接取失败)")
         return 0
 
+    kind = spec.get("kind")
+    if kind == "skill_share":
+        return _run_skill_share_task(account, t, logs, gap, claim=claim)
+    if kind == "template":
+        return _run_template_task(account, t, logs, gap, claim=claim)
+
     # 需点亮上报 —— 专家/团队事件必须使用互不相同的 id, 否则上游按
     # (eventCode, id) 去重, 进度永远不动。
     need = max(1, tgt - cur)
-    kind = spec.get("kind")
     logs.append(f"正在点亮任务 [{spec['name']}] (需上报 {need} 次)...")
     report_ok = True
     id_pool = None
@@ -990,10 +1431,402 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
     return {"ok": True, "logs": logs, "earned_credit": total_earned}
 
 
+def _campaign_headers(account):
+    """Activity APIs use the mini-program identity, not the desktop profile."""
+    headers = dict(MP_REPORT_HEADERS)
+    headers["Authorization"] = account.headers("chat").get("Authorization", "")
+    if account.uid:
+        headers["X-User-Id"] = account.uid
+    return headers
+
+
+def _campaign_call(account, method, path, body=None):
+    """Call a portal activity endpoint; return ``(status, payload)``."""
+    data = None
+    if method != "GET":
+        data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        CAMPAIGN_BASE + path, data=data, method=method,
+        headers=_campaign_headers(account))
+    try:
+        with _accounts.urlopen(req, timeout=20, proxy=account.proxy) as resp:
+            raw = resp.read()
+            return getattr(resp, "status", 200), (
+                json.loads(raw.decode("utf-8")) if raw else {})
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read(500).decode("utf-8", "replace")
+        except Exception:
+            pass
+        try:
+            payload = json.loads(detail) if detail else {}
+        except Exception:
+            payload = {"msg": detail[:200]}
+        return exc.code, payload
+    except Exception as exc:
+        _log(f"campaign request failed: {path}: {exc}")
+        return 0, {}
+
+
+def fetch_campaign_tasks(account, campaign, log=None):
+    """Read activity task definitions and progress.
+
+    Returns a ``{task_code: row}`` mapping. A failed request is deliberately
+    distinguishable from "activity not issued" in the log: silently treating a
+    401 or 500 as an ended campaign hides credential and upstream failures.
+    """
+    path = ("/portal/activity/tasks?activity_code="
+            + urllib.parse.quote(str(campaign), safe=""))
+    status, payload = _campaign_call(account, "GET", path)
+    code = (payload or {}).get("code")
+    if status != 200 or code not in (None, 0):
+        if log:
+            log("      ⚠️ 活动任务读取失败[%s]: HTTP %s %s"
+                % (campaign, status, str(payload)[:80]))
+        return {}
+    data = (payload or {}).get("data") or {}
+    progress = {p.get("task_code"): p
+                for p in (data.get("progress") or [])
+                if isinstance(p, dict)}
+    rows = {}
+    for task in data.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        task_code = task.get("task_code")
+        if not task_code:
+            continue
+        prog = progress.get(task_code) or {}
+        rows[task_code] = {
+            "target": task.get("target_count") or 0,
+            "progress": prog.get("progress") or 0,
+            "completed_at": prog.get("completed_at"),
+            "claimed_at": prog.get("claimed_at"),
+            "need_view": task.get("need_view"),
+            "credit": task.get("reward_credit") or 0,
+        }
+    return rows
+
+
+def _campaign_view(account, campaign, task):
+    path = ("/portal/activity/tasks/%s/viewed?activity_code=%s"
+            % (urllib.parse.quote(str(task), safe=""),
+               urllib.parse.quote(str(campaign), safe="")))
+    status, payload = _campaign_call(account, "POST", path)
+    return status == 200 and (payload or {}).get("code") in (None, 0)
+
+
+def _campaign_claim(account, campaign, task, log, credit=0,
+                    tries=None, gap=None):
+    """Claim and verify ``claimed_at``; a successful POST alone is not enough."""
+    path = ("/portal/activity/tasks/%s/claim?activity_code=%s"
+            % (urllib.parse.quote(str(task), safe=""),
+               urllib.parse.quote(str(campaign), safe="")))
+    status, payload = _campaign_call(account, "POST", path)
+    if not (status == 200 and (payload or {}).get("code") == 0):
+        log("      ⚠️ 领奖[%s/%s]: HTTP %s %s"
+            % (campaign, task, status, str(payload)[:80]))
+        return False
+    tries = CAMPAIGN_CLAIM_POLL if tries is None else tries
+    gap = CAMPAIGN_CLAIM_GAP if gap is None else gap
+    for i in range(max(1, tries)):
+        if i:
+            time.sleep(gap)
+        row = fetch_campaign_tasks(account, campaign, log).get(task) or {}
+        if row.get("claimed_at"):
+            log("      🎁 领奖[%s/%s]: +%s 积分"
+                % (campaign, task, credit))
+            return True
+    log("      ⚠️ 领奖[%s/%s]: 已提交但未回读到 claimed_at，下轮重试"
+        % (campaign, task))
+    return False
+
+
+def _campaign_poll(account, campaign, task, target,
+                   tries=None, gap=None, log=None):
+    """Poll asynchronous activity progress and return the latest value."""
+    current = 0
+    for _ in range(tries if tries is not None else CAMPAIGN_POLL):
+        time.sleep(gap if gap is not None else CAMPAIGN_GAP)
+        row = fetch_campaign_tasks(account, campaign, log).get(task) or {}
+        current = row.get("progress") or 0
+        if row.get("completed_at") or current >= target:
+            return max(current, target)
+    return current
+
+
+def _new_conversation_id():
+    return str(uuid.uuid4())
+
+
+def _new_message_id():
+    return "%012x%s" % (int(time.time() * 1000), uuid.uuid4().hex[:20])
+
+
+def _campaign_chat_event():
+    conv = _new_conversation_id()
+    rid = _new_message_id()
+    return {
+        "eventCode": "chat_request_send", "mode": "chat", "inputLength": 12,
+        "isPlan": False, "isAutoExecuteTerminal": False, "isAutoModify": False,
+        "codebaseEnable": False, "maxToken": 0, "maxSteps": 500,
+        "temperature": 0, "maxRetries": 0, "mentionContexts": [],
+        "knowledgeId": [], "knowledgeName": [], "codebaseId": "",
+        "mentionContextCount": 0, "command": "", "recommendId": "",
+        "skillId": "", "skillCount": 0, "totalCount": 0,
+        "requestId": rid, "traceId": rid, "rootRequestId": rid,
+        "parentConversationId": conv, "conversationId": conv,
+        "messageId": "msg-" + rid[-8:], "agentName": "mp",
+        "agentType": "main", "codebuddy.session_id": conv,
+        "codebuddy.conversation_request_id": rid,
+    }
+
+
+def _campaign_expert_events(expert_id, expert_name):
+    conv = _new_conversation_id()
+    rid = _new_message_id()
+    category = MP_EXPERT_CATEGORY
+    return [
+        {"eventCode": "expert_summon_click", "id": expert_id,
+         "name": expert_id, "expertTitle": expert_name, "type": category,
+         "position": 0},
+        {"eventCode": "expert_summoned", "id": expert_id,
+         "name": expert_id, "expertTitle": expert_name},
+        {"eventCode": "expert_actual_use", "id": expert_id,
+         "name": expert_id, "expertTitle": expert_name, "type": category,
+         "characterCount": 14, "expertType": "builtin"},
+        {"eventCode": "chat_request_send", "inputLength": 14,
+         "isPlan": False, "isAutoExecuteTerminal": False,
+         "isAutoModify": False, "codebaseEnable": False, "maxToken": 0,
+         "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+         "mentionContexts": [], "knowledgeId": [], "knowledgeName": [],
+         "codebaseId": "", "mentionContextCount": 0, "command": "",
+         "recommendId": "", "skillId": "", "skillCount": 0,
+         "totalCount": 0, "traceId": rid, "rootRequestId": rid,
+         "parentConversationId": conv, "conversationId": conv,
+         "messageId": "msg-" + rid[-8:], "agentName": "mp",
+         "agentType": "main", "expertId": expert_id,
+         "expertName": expert_name, "codebuddy.session_id": conv,
+         "codebuddy.conversation_request_id": rid},
+    ]
+
+
+def _campaign_skill_events(skill_id, skill_name):
+    conv = _new_conversation_id()
+    rid = _new_message_id()
+    return [
+        {"eventCode": "skill_info", "id": skill_name, "skillId": skill_id,
+         "skillName": skill_name, "skillType": "market",
+         "skillSource": "market", "position": 0,
+         "conversationId": conv},
+        {"eventCode": "chat_request_send", "inputLength": 14,
+         "isPlan": False, "isAutoExecuteTerminal": False,
+         "isAutoModify": False, "codebaseEnable": False, "maxToken": 0,
+         "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+         "mentionContexts": [], "knowledgeId": [], "knowledgeName": [],
+         "codebaseId": "", "mentionContextCount": 0, "command": "",
+         "recommendId": "", "skillId": skill_id, "skillCount": 1,
+         "totalCount": 0, "traceId": rid, "rootRequestId": rid,
+         "parentConversationId": conv, "conversationId": conv,
+         "messageId": "msg-" + rid[-8:], "agentName": "mp",
+         "agentType": "main", "codebuddy.session_id": conv,
+         "codebuddy.conversation_request_id": rid},
+    ]
+
+
+def _campaign_desktop_events(case):
+    return [{
+        "eventCode": "playbook_prompt_send",
+        "id": case.get("event_id") or "",
+        "name": case.get("name") or "",
+        "type": case.get("type") or "other",
+        "promptLength": case.get("prompt_length") or 0,
+        "isOfficial": 1,
+        "source": "discover",
+        "query": "",
+        "ext1": "discover",
+        "requestId": _new_message_id(),
+        "conversationId": _new_conversation_id(),
+    }]
+
+
+def _campaign_pick_expert(account):
+    """Resolve a real expert; fall back to the stable mini-program expert."""
+    body = json.dumps({
+        "edition_mode": "all,domestic", "page": 1, "page_size": 20,
+        "sort_by": "use_count", "sort_order": "desc",
+        "categories": [MP_EXPERT_CATEGORY], "expert_type": "agent",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        CAMPAIGN_BASE + "/v2/operation-platform/market/expert/list",
+        data=body, method="POST", headers=account.headers("chat"))
+    try:
+        with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        experts = ((payload.get("data") or {}).get("experts") or [])
+        for expert in experts:
+            expert_id = expert.get("expert_id")
+            if not expert_id:
+                continue
+            display = expert.get("display_name_zh") or {}
+            name = ((display.get("zh") if isinstance(display, dict) else display)
+                    or expert.get("name") or expert_id)
+            return expert_id, name
+    except Exception:
+        pass
+    return "WorkspaceBuilder", "工作台搭建师"
+
+
+def _campaign_fire(account, spec, task, log):
+    """Emit one campaign criterion; ``app`` is intentionally not forgeable."""
+    kind = task.get("kind")
+    page = spec.get("page")
+    if kind == "app":
+        log("      ⏳ %s: 需手机端 App 登录后与 AI 对话一次，脚本不伪造"
+            % task.get("label"))
+        return False
+    if kind == "desktop":
+        case = CAMPAIGN_CASES.get(task.get("case_id")) or {}
+        if not case:
+            log("      ⚠️ %s: 未内置案例 %s"
+                % (task.get("label"), task.get("case_id")))
+            return False
+        return _report_desktop_events(account, _campaign_desktop_events(case))
+    if kind == "chat":
+        return _post_mp_events(
+            account, [_campaign_chat_event()], CAMPAIGN_BASE, page,
+            headers=_campaign_headers(account))
+    if kind == "expert":
+        expert_id = task.get("expert_id")
+        expert_name = task.get("expert_name")
+        if not expert_id:
+            expert_id, expert_name = _campaign_pick_expert(account)
+        if not expert_id:
+            log("      ✗ %s: 取不到专家 id，跳过" % task.get("label"))
+            return False
+        return _post_mp_events(
+            account, _campaign_expert_events(expert_id, expert_name),
+            CAMPAIGN_BASE, page, headers=_campaign_headers(account))
+    if kind == "skill":
+        return _post_mp_events(
+            account,
+            _campaign_skill_events(task.get("skill_id"),
+                                   task.get("skill_name")),
+            CAMPAIGN_BASE, page, headers=_campaign_headers(account))
+    return False
+
+
+def run_campaign_tasks(account, claim=True):
+    """Run issued campaign tasks, then claim and verify their receipts.
+
+    Campaign definitions are separate from the growth-task list. The task
+    criteria are asynchronous, so each event is followed by bounded polling;
+    an event that has not landed yet is left for the next run rather than
+    being sprayed repeatedly.
+    """
+    if account.realm != "cn" or getattr(account, "is_enterprise",
+                                        lambda: False)():
+        return {"ok": True, "logs": [], "earned_credit": 0}
+    logs = []
+    earned = 0
+    available = 0
+    failed = False
+    for spec in CAMPAIGN_SPECS:
+        campaign = spec["code"]
+        read_errors = []
+        rows = fetch_campaign_tasks(account, campaign, read_errors.append)
+        if read_errors:
+            failed = True
+            logs.extend(read_errors)
+        if not rows:
+            logs.append("🎪 %s: 活动任务未下发/已结束或读取失败" % spec["label"])
+            continue
+        available += 1
+        logs.append("🎪 %s（%s）" % (spec["label"], campaign))
+        for task in spec.get("tasks") or []:
+            code = task.get("task")
+            row = rows.get(code) or {}
+            if not row:
+                logs.append("   ⏭ %s: 未下发/已下线" % task.get("label"))
+                continue
+            target = row.get("target") or task.get("times") or 1
+            credit = row.get("credit") or task.get("credit") or 0
+            if row.get("claimed_at"):
+                logs.append("   ✅ %s: 已领奖（%s/%s）"
+                            % (task.get("label"), target, target))
+                continue
+            if row.get("completed_at"):
+                if claim and _campaign_claim(
+                        account, campaign, code, logs.append, credit):
+                    earned += credit
+                elif claim:
+                    failed = True
+                elif not claim:
+                    logs.append("   ⏸ %s: 已达成，等待手动领取"
+                                % task.get("label"))
+                continue
+            if row.get("need_view", True):
+                _campaign_view(account, campaign, code)
+            current = row.get("progress") or 0
+            kind = task.get("kind")
+            if kind == "app":
+                _campaign_fire(account, spec, task, logs.append)
+                logs.append("   ⏳ %s: 尚未完成（%s/%s），真机完成后重跑会自动领奖"
+                            % (task.get("label"), current, target))
+                continue
+            if kind == "desktop":
+                if not _campaign_fire(account, spec, task, logs.append):
+                    logs.append("   ⚠️ %s: 上报失败" % task.get("label"))
+                    continue
+                current = _campaign_poll(
+                    account, campaign, code, target,
+                    tries=max(2, CAMPAIGN_DESKTOP_WAIT // CAMPAIGN_DESKTOP_POLL),
+                    gap=CAMPAIGN_DESKTOP_POLL, log=logs.append)
+            else:
+                for _ in range(max(1, target - current)):
+                    if current >= target:
+                        break
+                    if not _campaign_fire(account, spec, task, logs.append):
+                        break
+                    current = _campaign_poll(
+                        account, campaign, code, target, log=logs.append)
+                if current < target:
+                    current = _campaign_poll(
+                        account, campaign, code, target,
+                        tries=CAMPAIGN_SLOW_POLL, gap=CAMPAIGN_SLOW_GAP,
+                        log=logs.append)
+            row = fetch_campaign_tasks(
+                account, campaign, logs.append).get(code) or {}
+            credit = row.get("credit") or task.get("credit") or 0
+            if not (row.get("completed_at") or current >= target):
+                logs.append("   ⏳ %s: 判据延迟未落库（%s/%s），下轮自动补领"
+                            % (task.get("label"), current, target))
+                continue
+            logs.append("   ✅ %s: completed %s/%s"
+                        % (task.get("label"), target, target))
+            if claim and _campaign_claim(
+                    account, campaign, code, logs.append, credit):
+                earned += credit
+            elif claim:
+                failed = True
+            elif not claim:
+                logs.append("   ⏸ %s: 已达成，等待手动领取"
+                            % task.get("label"))
+    if earned:
+        logs.append("🎪 活动任务本轮入账 %s 积分" % earned)
+    return {"ok": not failed, "logs": logs, "earned_credit": earned,
+            "available": available, "failed": failed}
+
+
 def run_growth_tasks(account, gap=1.0, claim=True):
-    """完整执行批量成长任务点亮与领奖。
+    """执行一次性 / 活动成长任务，不含任何每日福利副作用。
 
     claim=False 只推进进度、不领奖，让用户自己挑时间领取（#507）。
+
+    猫猫旅行、Buddy 盲盒、连登管家、抽奖与夜猫子都属于每日任务，由
+    do_cat_travel() / do_buddy_open() / run_streak_bonus() / run_night_growth()
+    分别执行。这里只处理成长任务清单里的一次性任务和活动任务，避免用户点
+    「一次性任务」时顺带消耗每日额度。
     """
     if account.realm != "cn":
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": []}
@@ -1002,24 +1835,26 @@ def run_growth_tasks(account, gap=1.0, claim=True):
 
     logs = []
     logs.append(f"开始为账号 {account.nickname or account.uid[:8]} 运行成长任务自动化...")
-    tasks = fetch_growth_tasks(account)
-    if not tasks:
-        logs.append("未能获取到任务清单，请检查网络或账号状态")
-        return {"ok": False, "logs": logs, "earned_credit": 0}
-
     total_earned = 0
+    tasks = fetch_growth_tasks(account)
+    growth_available = bool(tasks)
+    if not growth_available:
+        logs.append("未能获取到成长任务清单，继续尝试运营活动任务")
 
-    # 0. auto 类任务（如 first_buddy）不需要接取，且可能是其他任务与猫猫旅行
-    #    的前置：必须先把它们点亮并领奖（first_buddy 的奖励就是 Buddy 实例），
-    #    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
+    # 0. auto 类任务（如 first_buddy）不需要接取，且可能是其他任务的前置：
+    #    必须先把它们点亮并领奖（first_buddy 的奖励就是 Buddy 实例），否则
+    #    single 任务接取会报 "prerequisite not met: first_buddy"。
+    #    夜猫子是每日任务，不在这里处理。
     for t in tasks:
-        if t.get("task_type") == "auto":
+        if (t.get("task_type") == "auto"
+                and t.get("task_code") not in NIGHT_TASK_CODES):
             total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
     # 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
     def _needs_accept(x):
         return (x["status"] == "not_accepted" and not x.get("unforgeable")
-                and x.get("task_type") != "auto")
+                and x.get("task_type") != "auto"
+                and x.get("task_code") not in NIGHT_TASK_CODES)
 
     unaccepted = [t["task_code"] for t in tasks if _needs_accept(t)]
     if unaccepted:
@@ -1045,8 +1880,10 @@ def run_growth_tasks(account, gap=1.0, claim=True):
             time.sleep(gap)
             tasks = fetch_growth_tasks(account)
         if not tasks:
-            logs.append("! 接取后无法获取任务清单，本轮中止")
-            return {"ok": False, "logs": logs, "earned_credit": total_earned}
+            # The activity portal is a separate contract. A temporary empty
+            # growth list must not prevent campaign tasks from running.
+            logs.append("! 接取后无法获取成长任务清单，继续尝试运营活动任务")
+            tasks = []
         still_pending = [t["task_code"] for t in tasks if _needs_accept(t)]
         if still_pending:
             logs.append(f"! 仍有 {len(still_pending)} 个任务处于未接取状态，"
@@ -1054,7 +1891,8 @@ def run_growth_tasks(account, gap=1.0, claim=True):
 
     # 2. 处理每个任务（auto 已在第 0 步处理过）
     for t in tasks:
-        if t.get("task_type") == "auto":
+        if (t.get("task_type") == "auto"
+                or t.get("task_code") in NIGHT_TASK_CODES):
             continue
         total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
@@ -1066,30 +1904,25 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     except Exception as exc:
         logs.append(f"! 小程序成长任务执行异常: {exc}")
 
-    # 3. 顺手检查猫猫旅行与 Buddy 盲盒
-    tr_res = do_cat_travel(account)
-    if tr_res.get("msg"):
-        logs.append(f"猫猫日常: {tr_res.get('msg')}")
-        if tr_res.get("credit"):
-            total_earned += tr_res.get("credit", 0)
-    if tr_res.get("action") == "claim":
-        time.sleep(gap)
-        bo_res = do_buddy_open(account)
-        if bo_res.get("action") == "open":
-            logs.append(f"Buddy 盲盒: {bo_res.get('msg')}")
-        time.sleep(gap)
-        tr2 = do_cat_travel(account)
-        if tr2.get("msg") and tr2.get("action") == "depart":
-            logs.append(f"猫猫日常: {tr2.get('msg')}")
-    else:
-        bo_res = do_buddy_open(account)
-        if bo_res.get("action") == "open":
-            logs.append(f"Buddy 盲盒: {bo_res.get('msg')}")
+    # 2c. 运营活动任务（星巴克协作 / 记者节福利）走独立的 portal 契约。
+    campaign_available = 0
+    campaign_ok = True
+    try:
+        campaign_res = run_campaign_tasks(account, claim=claim)
+        total_earned += campaign_res.get("earned_credit", 0)
+        campaign_available = campaign_res.get("available", 0)
+        campaign_ok = campaign_res.get("ok") is not False
+        logs.extend(campaign_res.get("logs") or [])
+    except Exception as exc:
+        campaign_ok = False
+        logs.append(f"! 运营活动任务执行异常: {exc}")
 
-    # 4. 刷新积分余额
+    # 3. 刷新积分余额。每日福利不在这里执行。
     account.fetch_credits()
-    logs.append(f"🎉 全部完成！本次累计新增到账: +{total_earned} 积分，当前总剩余: {account.credits.get('remain', 0)} 积分")
-    return {"ok": True, "logs": logs, "earned_credit": total_earned, "credits": account.credits}
+    logs.append(f"🎉 一次性 / 活动任务执行完毕！本次累计新增到账: +{total_earned} 积分，当前总剩余: {account.credits.get('remain', 0)} 积分")
+    return {"ok": (growth_available or bool(campaign_available)) and campaign_ok,
+        "logs": logs, "earned_credit": total_earned,
+        "credits": account.credits}
 
 
 def run_night_growth(account):

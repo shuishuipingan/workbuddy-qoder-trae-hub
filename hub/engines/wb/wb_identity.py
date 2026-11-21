@@ -121,6 +121,46 @@ def _identity_arch():
         machine, machine or "x64")
 
 
+
+#: X-Custom-Channel-Id -- the WorkBuddy desktop client sends this UNCONDITIONALLY.
+#: Proof (local install, %LOCALAPPDATA%/Programs/WorkBuddy 5.8.3, resources/app.asar):
+#:
+#:   var ee=`X-Device-Token`, te=`X-Custom-Channel-Id`, ne=`X-Device-Id-List`,
+#:       A=`unknown`, j=Symbol(`AuthStateQimei36Resolver`),
+#:   WorkbuddyAuthStateHeaderProvider=class{async provide(){let e={[te]:A}, ...
+#:
+#: provide() puts {[te]: A} down as the first thing it does -- when the channel /
+#: device is not resolved, the official baseline value is the literal string
+#: "unknown", NOT "omit the header". Upstream channel verification treats a request
+#: without this header as an unapproved channel and answers
+#:
+#:   400 / code 11128 "Illegal API invocation from an unapproved channel"
+#:   (displayTips: this call failed channel verification, possibly because it was
+#:    not sent from an official client).
+#:
+#: The other two headers from the same provider are CONDITIONAL, and the gateway
+#: already matches the official behaviour for both -- do not "fix" them too:
+#:
+#:   - X-Device-Token: only added when a Turing device token was obtained;
+#:   - X-Device-Id-List: only added when qimei36 resolves. On failure the client
+#:     itself logs "qimei36 unavailable, X-Device-Id-List omitted", so the hub (no
+#:     QIMEI native SDK) not sending it IS the official failure state.
+CHANNEL_ID_HEADER = "X-Custom-Channel-Id"
+CHANNEL_ID_DEFAULT = "unknown"
+
+
+def channel_id():
+    """Channel id sent as X-Custom-Channel-Id; default is the official "unknown".
+
+    WB_CHANNEL_ID is the only escape hatch: set it to a captured real channel value
+    to replace the baseline, or to an empty string to drop the header entirely
+    (pre-fix behaviour, kept for A/B verification against upstream).
+    """
+    raw = os.environ.get("WB_CHANNEL_ID")
+    if raw is None:
+        return CHANNEL_ID_DEFAULT
+    return raw.strip()
+
 def desktop_chat_compat_enabled(accounts_dir=None):
     """Opt in to desktop chat headers without changing billing or other products."""
     value = os.environ.get("WB_DESKTOP_CHAT_COMPAT")
@@ -537,6 +577,10 @@ def build_identity_headers(product, realm, uid, token,
             "X-Conversation-Message-ID": msg_id,
             "X-Request-ID": msg_id,
         }
+        cid = channel_id()
+        if cid:
+            # 官方 provider 一进 provide() 就放下这个头，缺了会被判未批准渠道
+            headers[CHANNEL_ID_HEADER] = cid
         compat = desktop_chat_compat_enabled(accounts_dir)
         headers.update(trace_headers(with_parent=compat))
         if compat:

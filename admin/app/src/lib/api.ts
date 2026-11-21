@@ -617,6 +617,6 @@ export type RoutePreview = {
 
 export const hubRouting = () => get<RoutingDoc>(API + "/hub/routing", { timeoutMs: 20000 });
 export const hubRoutingSave = (doc: RoutingDoc) =>
-  post<RoutingDoc>(API + "/hub/routing", doc, { timeoutMs: 20000 });
+  post<RoutingDoc>(API + "/hub/routing", doc, { token: getPanelPassword(), timeoutMs: 20000 });
 export const hubRoutePreview = (model: string, realm?: string) =>
   post<RoutePreview>(API + "/hub/routing/preview", { model, realm: realm || null }, { timeoutMs: 60000 });

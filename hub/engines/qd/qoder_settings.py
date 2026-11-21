@@ -380,6 +380,25 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+def omit_default_system_prompt(accounts_dir):
+    return load(accounts_dir).get("omit_default_system_prompt") is True
+
+
+def set_omit_default_system_prompt(accounts_dir, enabled):
+    with _lock:
+        try:
+            with open(settings_path(accounts_dir), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = {}
+        except (ValueError, UnicodeError) as exc:
+            raise OSError("settings.json is invalid; refusing to overwrite it") from exc
+        if not isinstance(data, dict):
+            raise OSError("settings.json must contain an object; refusing to overwrite it")
+        data["omit_default_system_prompt"] = enabled
+        save(accounts_dir, data)
+
+
 def web_tools_enabled(accounts_dir):
     """本地 web 工具开关（面板「设置 → 本地 web 工具」）。
 
@@ -394,6 +413,60 @@ def set_web_tools_enabled(accounts_dir, enabled):
         data = load(accounts_dir)
         data["web_tools"] = bool(enabled)
         save(accounts_dir, data)
+
+
+def web_tools_config(accounts_dir):
+    """Persisted backend and separate provider profiles; internal, includes keys."""
+    import qoder_external_web as external
+    data = load(accounts_dir)
+    provider = data.get("web_tools_external_provider") or "searxng"
+    if provider not in external.PROVIDERS:
+        provider = "searxng"
+    saved = data.get("web_tools_external_profiles") or {}
+    profiles = {name: external.normalize(saved.get(name) or {}, name)
+                for name in external.PROVIDERS}
+    return {"backend": data.get("web_tools_backend") or "local",
+            "external": profiles[provider], "external_profiles": profiles}
+
+
+def set_web_tools_config(accounts_dir, updates):
+    """Validate the whole patch before atomically persisting any field."""
+    import qoder_external_web as external
+    if not isinstance(updates, dict):
+        raise ValueError("web tools settings must be an object")
+    if set(updates) - {"enabled", "backend", "external"}:
+        raise ValueError("unknown web tools setting")
+    with _lock:
+        data = load(accounts_dir)
+        if "enabled" in updates:
+            if type(updates["enabled"]) is not bool:
+                raise ValueError("enabled must be a boolean")
+            data["web_tools"] = updates["enabled"]
+        if "backend" in updates:
+            if updates["backend"] not in ("local", "qoder", "external"):
+                raise ValueError("backend must be local, qoder or external")
+            data["web_tools_backend"] = updates["backend"]
+        if "external" in updates:
+            patch = updates["external"]
+            if not isinstance(patch, dict):
+                raise ValueError("external search configuration must be an object")
+            provider = patch.get("provider") or data.get("web_tools_external_provider") or "searxng"
+            profiles = dict(data.get("web_tools_external_profiles") or {})
+            # Keys omitted by a masked form are retained only for this provider.
+            profile = dict(profiles.get(provider) or {})
+            unknown = set(patch) - set(external.defaults(provider))
+            if unknown:
+                raise ValueError("unknown external search setting")
+            profile.update(patch)
+            profiles[provider] = external.normalize(profile, provider)
+            data["web_tools_external_profiles"] = profiles
+            data["web_tools_external_provider"] = provider
+        if data.get("web_tools") is True and data.get("web_tools_backend") == "external":
+            provider = data.get("web_tools_external_provider") or "searxng"
+            external.normalize((data.get("web_tools_external_profiles") or {}).get(provider) or {},
+                               provider, ready=True)
+        save(accounts_dir, data)
+    return web_tools_config(accounts_dir)
 
 
 # ------------------------------------------------------------- model gates

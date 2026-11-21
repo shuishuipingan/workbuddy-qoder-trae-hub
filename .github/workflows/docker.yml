@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 校验已构建面板
+        run: python hub/tests/_test_panel_assets.py
+
       - name: 登录 ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
@@ -44,17 +47,41 @@ jobs:
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
             --label "org.opencontainers.image.licenses=MIT" \
-            -t "$IMAGE:${{ steps.ver.outputs.tag }}" -t "$IMAGE:latest" .
+            -t "$IMAGE:${{ steps.ver.outputs.tag }}" .
 
-      - name: 推送（先带版本号，再 latest）
+      - name: 镜像启动验收
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          for i in 1 2 3; do
-            docker push "$IMAGE:${{ steps.ver.outputs.tag }}" && break || { echo "第 $i 次失败，10s 后重试"; sleep 10; }
+          id=$(docker run -d -p 127.0.0.1::8817 "$IMAGE:$TAG")
+          trap 'docker rm -f "$id" >/dev/null' EXIT
+          endpoint=$(docker port "$id" 8817/tcp)
+          for i in $(seq 1 80); do
+            if curl -fsS --max-time 3 "http://$endpoint/api/hub/health" | jq -e '.engines | length == 3 and all(.[]; .ok == true)'; then
+              curl -fsS "http://$endpoint/" -o /tmp/panel-index.html
+              python -c 'import re,sys,urllib.request as u; refs=re.findall(r"(?:src|href)=\x22\.?(/static/[^\x22]+)\x22",open("/tmp/panel-index.html").read()); assert len(refs)>=2; [u.urlopen("http://"+sys.argv[1]+p, timeout=5).close() for p in refs]' "$endpoint"
+              exit 0
+            fi
+            sleep 2
           done
-          for i in 1 2 3; do
-            docker push "$IMAGE:latest" && break || { echo "第 $i 次失败，10s 后重试"; sleep 10; }
-          done
+          docker logs "$id"
+          exit 1
 
-      - name: 校验标签
+      - name: 推送并核对远端标签
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          docker buildx imagetools inspect "$IMAGE:${{ steps.ver.outputs.tag }}" || true
+          push() {
+            for attempt in 1 2 3; do
+              if docker push "$1"; then return 0; fi
+              sleep 10
+            done
+            return 1
+          }
+          push "$IMAGE:$TAG"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$TAG" != *-* ]]; then
+            docker tag "$IMAGE:$TAG" "$IMAGE:latest"
+            push "$IMAGE:latest"
+            docker buildx imagetools inspect "$IMAGE:latest"
+          fi

@@ -58,6 +58,16 @@ def copy_engine(engine, out_root):
     return n
 
 
+def seed_account(engine, out_root):
+    """Create a disabled test account; no token, no access to any upstream."""
+    directory = os.path.join(out_root, engine, "accounts")
+    os.makedirs(directory, exist_ok=True)
+    uid = "fixture-" + engine
+    with open(os.path.join(directory, uid + ".json"), "w", encoding="utf-8") as fh:
+        json.dump({"uid": uid, "realm": "cn", "enabled": False, "nickname": "Fixture"}, fh)
+    return 1
+
+
 def account_files(engine, out_root):
     d = os.path.join(out_root, engine, "accounts")
     if not os.path.isdir(d):
@@ -166,6 +176,7 @@ def main(argv=None):
                     choices=("all", "account-error", "usage-fail", "cooldown"),
                     help="account-error=写上次错误；usage-fail=追加失败行；cooldown=写未来冷却时间戳；all=前两者")
     ap.add_argument("--engine", action="append", choices=ENGINES, help="只处理某几家（默认三家）")
+    ap.add_argument("--synthetic", action="store_true", help="只使用合成账号，不读取真实数据")
     ap.add_argument("--keep", action="store_true", help="输出目录已存在时不删除")
     args = ap.parse_args(argv)
 
@@ -182,7 +193,7 @@ def main(argv=None):
     picked = args.engine or list(ENGINES)
     log("夹具输出: %s" % out)
     for engine in picked:
-        copied = copy_engine(engine, out)
+        copied = seed_account(engine, out) if args.synthetic else copy_engine(engine, out)
         if not copied:
             log("  [%s] 没有可复制的数据（hub/engines/%s）" % (engine, engine))
             continue

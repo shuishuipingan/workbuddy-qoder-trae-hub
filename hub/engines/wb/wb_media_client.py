@@ -26,7 +26,7 @@ WorkBuddy 官方 CLI 的 `ImageService` / `VideoService`，取证记录见 `docs
 ## 输入图的下载为什么自己写一段
 
 `urllib` 默认跟随 3xx。对一个由客户端控制的 URL 来说，"跟随重定向"是 SSRF 的标准
-绕过方式：公网 URL 302 到 `http://127.0.0.1:8788/accounts` 就绕过了前一道公网地址
+绕过方式：公网 URL 302 到 `http://127.0.0.1:8789/accounts` 就绕过了前一道公网地址
 校验。所以这里用一个禁掉重定向的 opener，并且**逐跳校验解析出来的每个 IP**。
 """
 import base64
@@ -356,7 +356,7 @@ def assert_public_url(url, label="输入图"):
 
     防的是 SSRF：网关可能监听在 LAN 上（`start-wb-proxy-lan.bat`），一个
     `image: "http://192.168.1.10:8080/admin"` 就能拿它当内网扫描器；
-    `http://127.0.0.1:8788/accounts` 更直接——自己打自己。
+    `http://127.0.0.1:8789/accounts` 更直接——自己打自己。
 
     `label` 只影响报错文案。参考视频/音频走同一个判据，但把它们说成"输入图"
     会让调用方查错地方——传了本地 mp4 收到"输入图 URL 只支持 http/https"，

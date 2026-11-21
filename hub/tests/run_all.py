@@ -133,7 +133,7 @@ def main(argv):
         else:
             for k in grand:
                 grand[k] += stat[k]
-            if stat["skipped"] or stat["missing"]:
+            if (stat["skipped"] or stat["missing"]):
                 skipped_suites.append(name)
             print("  %-28s %-12s checks=%-4d skipped=%d%s" % (
                 name, "PASS" if rc == 0 else "FAIL(rc=%d)" % rc, stat["total"], stat["skipped"],
