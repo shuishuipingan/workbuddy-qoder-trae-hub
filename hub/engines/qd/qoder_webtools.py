@@ -470,6 +470,16 @@ def backend_name(accounts_dir=None):
     return backend_config(accounts_dir)["backend"]
 
 
+def format_search_result(result):
+    lines = []
+    for i, item in enumerate(result["results"], 1):
+        lines.append("%d. %s%s\n   %s\n   %s\n   Published: %s"
+                     % (i, ("[%s] " % item["source_id"]) if item.get("source_id") else "",
+                        item.get("title") or "", item.get("url") or "",
+                        item.get("snippet") or "", item.get("published_time") or "unknown"))
+    return "Search results (%s; snippets):\n" % result.get("engine") + "\n".join(lines)
+
+
 def run_tool(name, arguments, account=None, context=None, on_result=None, config=None):
     """执行一次工具调用，返回给模型的文本结果。"""
     args = arguments
@@ -512,10 +522,10 @@ def run_tool(name, arguments, account=None, context=None, on_result=None, config
         allowed = requested_allowed
         blocked = domains(args.get("blocked_domains"))
         # Request filters cannot be widened by arguments chosen by the model.
-        if context and context.allowed:
-            allowed = context.allowed
         if context:
-            blocked = list(dict.fromkeys(blocked + context.blocked))
+            required_allowed, required_blocked = context.filters_for(name)
+            allowed = required_allowed or allowed
+            blocked = list(dict.fromkeys(blocked + required_blocked))
         if official:
             res = official.search(account, args.get("query") or "",
                                   allowed_domains=allowed, blocked_domains=blocked)
@@ -536,17 +546,11 @@ def run_tool(name, arguments, account=None, context=None, on_result=None, config
         if not res.get("ok"):
             return json.dumps({"error": res.get("error") or "search failed"},
                               ensure_ascii=False)
-        lines = []
-        for i, item in enumerate(res["results"], 1):
-            lines.append("%d. %s%s\n   %s\n   %s\n   Published: %s"
-                         % (i, ("[%s] " % item["source_id"]) if item.get("source_id") else "",
-                            item.get("title") or "", item.get("url") or "",
-                            item.get("snippet") or "", item.get("published_time") or "unknown"))
-        return "Search results (%s; snippets):\n" % res.get("engine") + "\n".join(lines)
+        return format_search_result(res)
     if name == WEB_FETCH_NAME:
         if context:
             from qoder_web_response import matches_domain
-            if not matches_domain(args.get("url") or "", context.allowed, context.blocked):
+            if not matches_domain(args.get("url") or "", *context.filters_for(name)):
                 observe({"ok": False, "error": "URL is outside the request's web domain filters"})
                 return json.dumps({"error": "URL is outside the request's web domain filters"})
         res = observe(context.cache[cache_key] if context and cache_key in context.cache else

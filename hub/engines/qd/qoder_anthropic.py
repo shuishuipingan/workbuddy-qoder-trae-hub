@@ -480,6 +480,10 @@ def validate_request(payload):
         return False, "request body must be a JSON object"
     if not payload.get("messages"):
         return False, "messages is required"
+    if not isinstance(payload["messages"], list):
+        return False, "messages must be an array"
+    if payload.get("tools") is not None and not isinstance(payload["tools"], list):
+        return False, "tools must be an array"
     if payload.get("max_tokens") is None:
         return False, "max_tokens is required"
     try:

@@ -81,7 +81,8 @@ copy_root = os.path.join(work, "hub")
 H.copy_tree(P.HUB, copy_root)
 # portal 的静态根默认是 <repo>/admin（hub/core/portal.py:53-54：REPO_ROOT = dirname(dirname(HERE))），
 # 所以临时树里必须同时有 hub/ 与 admin/，否则 GET / 必然 404 —— 那是我的隔离做漏了，不是门户的缺陷。
-H.copy_tree(os.path.join(P.REPO, "admin"), os.path.join(work, "admin"))
+H.copy_tree(os.path.join(P.REPO, "admin"), os.path.join(work, "admin"),
+            skip_names=("app", "__pycache__"))
 log = os.path.join(work, "portal.log")
 proc = None
 
@@ -106,12 +107,13 @@ try:
     #
     # 判据本身没改（还是"能不能在预算内给出 200"）—— 改的是**等待方式**和**预算**。
     # 这两条都属于"判据没错、判据的实现让它自己不可靠"。
-    PORTAL_UP_TIMEOUT = 45.0
-    deadline = time.time() + PORTAL_UP_TIMEOUT
+    # hub.server waits for three engine health probes and then the portal.
+    PORTAL_UP_TIMEOUT = 100.0
+    deadline = time.monotonic() + PORTAL_UP_TIMEOUT
     up = False
     status_seen = None
     body = b""
-    while time.time() < deadline:
+    while proc.poll() is None and time.monotonic() < deadline:
         try:
             status_seen, body = H.http_get("http://127.0.0.1:%d/" % portal_port, timeout=2)
             up = True
@@ -124,8 +126,9 @@ try:
             "从未应答 | 日志尾部: %s" % H.tail(log, 6))
     H.check("P04b GET / 返回 200（不是 404/403）", status_seen == 200,
             "实得 status=%s | 日志尾部: %s" % (status_seen, H.tail(log, 4)))
-    if not up:
+    if status_seen != 200:
         H.info("门户日志尾部:\n    " + "\n    ".join(H.tail(log, 25)))
+        H.finish()
     else:
         with open(P.ADMIN_INDEX, "rb") as fh:
             expected = fh.read()

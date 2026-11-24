@@ -30,6 +30,7 @@ trae_client 存在时优先使用它（协议客户端），缺失时回落到�
     python trae_proxy.py --api-key sk-local  # require a bearer token
 """
 import argparse
+import base64
 import hashlib
 import shutil
 import tarfile
@@ -85,7 +86,7 @@ except Exception:                           # ImportError / 语法错误都回�
 
 TRAE_CLIENT_SOURCE = "trae_client" if _trae_client is not None else "embedded"
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 SOLO_MODEL_ALIASES = {
     "Seed-Code": "Doubao-Seed-Code",
@@ -6171,6 +6172,40 @@ def _solo_tools(payload):
     return out
 
 
+_SOLO_IMAGE_LIMIT = 5 * 1024 * 1024
+_SOLO_IMAGE_TOTAL_LIMIT = 10 * 1024 * 1024
+_SOLO_IMAGE_HEADERS = frozenset("data:" + mime + ";base64" for mime in
+                               ("image/png", "image/jpeg", "image/webp", "image/gif"))
+
+
+class SoloImageError(ValueError):
+    """An invalid or unsupported image in the request, not an upstream error."""
+
+
+def _solo_inline_image(part, role, remaining):
+    if role != "user":
+        raise SoloImageError("SOLO images are supported only in user messages")
+    image = part.get("image_url")
+    url = image.get("url") if isinstance(image, dict) else None
+    if part.get("type") != "image_url" or not isinstance(url, str):
+        raise SoloImageError("SOLO images require an image_url part with image_url.url")
+    header, sep, encoded = url.partition(",")
+    if not sep or header not in _SOLO_IMAGE_HEADERS or not encoded:
+        raise SoloImageError("SOLO supports only inline base64 PNG, JPEG, WebP or GIF images; remote URLs are not supported")
+    limit = min(_SOLO_IMAGE_LIMIT, remaining)
+    if len(encoded) > 4 * ((limit + 2) // 3):
+        raise SoloImageError("SOLO image size limit exceeded (5 MiB per image, 10 MiB per request)")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        raise SoloImageError("Invalid base64 data in SOLO image") from None
+    if not decoded:
+        raise SoloImageError("Invalid base64 data in SOLO image")
+    if len(decoded) > limit:
+        raise SoloImageError("SOLO image size limit exceeded (5 MiB per image, 10 MiB per request)")
+    return {"type": "image_url", "image_url": {"url": url}}, len(decoded)
+
+
 def _solo_messages(payload):
     """调用方 messages -> SOLO messages（保留工具往返需要的消息结构）。
 
@@ -6192,6 +6227,7 @@ def _solo_messages(payload):
             if call_id and fn.get("name"):
                 id_to_name[call_id] = str(fn["name"])
     messages = []
+    remaining_image_bytes = _SOLO_IMAGE_TOTAL_LIMIT
     for item in payload.get("messages") or []:
         if not isinstance(item, dict):
             continue
@@ -6206,6 +6242,12 @@ def _solo_messages(payload):
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     blocks.append({"type": "text", "text": str(part.get("text") or "")})
+                elif isinstance(part, dict) and (
+                        part.get("type") in ("image_url", "image", "input_image")
+                        or "image_url" in part):
+                    image, size = _solo_inline_image(part, item.get("role"), remaining_image_bytes)
+                    blocks.append(image)
+                    remaining_image_bytes -= size
         elif content is None:
             blocks = []
         else:
@@ -10950,6 +10992,8 @@ class Handler(BaseHTTPRequestHandler):
         request_id = uuid.uuid4().hex
         try:
             result = trae_solo_chat(account, {**payload, "model": model})
+        except SoloImageError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
         except Exception as exc:
             record_error(model, 502, str(exc)[:200],
                          elapsed_ms=int((time.monotonic()-started)*1000))
@@ -10972,9 +11016,16 @@ class Handler(BaseHTTPRequestHandler):
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
                      "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
             self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            done = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}]}
+            done = {**chunk, "choices": [{"index": 0, "delta": {},
+                                           "finish_reason": result["finish_reason"]}]}
             self._sse_write(("data: " + json.dumps(done, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            # Report provider usage separately after the finish chunk. No usage
+            # chunk when the provider did not report counts.
+            usage = result.get("usage")
+            if isinstance(usage, dict) and usage:
+                uframe = {**done, "choices": [], "usage": usage}
+                self._sse_write(("data: " + json.dumps(uframe, ensure_ascii=False)
+                                 + "\n\n").encode("utf-8"))
             self._sse_write(b"data: [DONE]\n\n")
             self._sse_end()
             return

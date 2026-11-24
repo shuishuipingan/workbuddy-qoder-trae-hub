@@ -5,8 +5,8 @@
 | 引擎 | 版本 |
 | --- | --- |
 | WorkBuddy | 2.1.3（指定的本地源码快照） |
-| Qoder | [1.9.13](https://github.com/shuishuipingan/qoder2api-hub/releases/tag/v1.9.13) |
-| Trae | [1.7.1](https://github.com/shuishuipingan/trae2api-hub/releases/tag/v1.7.1) |
+| Qoder | [1.9.14](https://github.com/shuishuipingan/qoder2api-hub/releases/tag/v1.9.14) |
+| Trae | [1.7.2](https://github.com/shuishuipingan/trae2api-hub/releases/tag/v1.7.2) |
 
 ## 启动
 

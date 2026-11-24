@@ -84,11 +84,12 @@ def parse_arguments(arguments):
 class WebEvidence:
     """Private to one API request: never shares account results across tenants."""
 
-    def __init__(self, tools=()):
+    def __init__(self, tools=(), tool_filters=None):
         self.sources = {}
         self.cache = {}
         self.allowed = []
         self.blocked = []
+        self.tool_filters = tool_filters or {}
         allow_sets = []
         for tool in tools:
             if not isinstance(tool, dict) or tool.get("type") not in (
@@ -110,6 +111,9 @@ class WebEvidence:
             raise ValueError("conflicting allowed_domains across web search declarations")
         self.allowed = allow_sets[0] if allow_sets else []
 
+    def filters_for(self, name):
+        return self.tool_filters.get(name, (self.allowed, self.blocked))
+
     def remember(self, url, title="", published_time="", fetched=False):
         if not public_link(url):
             return None
@@ -129,11 +133,12 @@ class WebEvidence:
         result = copy.deepcopy(result)
         if not result.get("ok"):
             return result
+        allowed, blocked = self.filters_for(name)
         if name == "web_search":
             kept = []
             for item in result.get("results") or []:
                 url = item.get("url")
-                if not public_link(url) or not matches_domain(url, self.allowed, self.blocked):
+                if not public_link(url) or not matches_domain(url, allowed, blocked):
                     continue
                 source = self.remember(url, item.get("title"), item.get("published_time"))
                 item["source_id"] = source["id"]
@@ -141,7 +146,7 @@ class WebEvidence:
             result["results"] = kept
         elif name == "web_fetch":
             url = result.get("final_url") or result.get("url")
-            if not matches_domain(url, self.allowed, self.blocked):
+            if not matches_domain(url, allowed, blocked):
                 return {"ok": False, "error": "Final URL is outside the request's web domain filters"}
             source = self.remember(url, result.get("title"), fetched=True)
             if source:
@@ -300,11 +305,13 @@ class ResponsesWebOutput:
             self.emit(kind, **data)
         self.ended = True
 
-    def fail(self, message):
-        for item in self.items:
+    def fail(self, message, status=502):
+        for index, item in enumerate(self.items):
             if item["status"] == "in_progress":
                 item["status"] = "failed"
+                self.emit("response.output_item.done", output_index=index, item=copy.deepcopy(item))
         response = self.response("failed")
-        response["error"] = {"code": "server_error", "message": message}
+        code = "rate_limit_exceeded" if status == 429 else "server_error"
+        response["error"] = {"code": code, "message": message}
         self.emit("response.failed", response=response)
         self.ended = True

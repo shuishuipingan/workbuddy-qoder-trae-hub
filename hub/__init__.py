@@ -12,7 +12,7 @@
 版本：单一真源在这里。
 """
 
-HUB_VERSION = "1.2.0"
+HUB_VERSION = "1.2.1"
 # 产品名：三家合一个（第 100 轮起把 Trae 也并进来）。日志前缀与启动横幅都用它。
 HUB_NAME = "WorkBuddy x Qoder x Trae-hub"
 
@@ -32,12 +32,12 @@ ENGINE_META = {
     },
     "qd": {
         "label": "Qoder", "dir": "qd", "entry": "qoder_proxy.py",
-        "module": "qoder_proxy", "port": 8812, "version": "1.9.13", "icon": "qd",
+        "module": "qoder_proxy", "port": 8812, "version": "1.9.14", "icon": "qd",
         "service": "qoder-proxy",
     },
     "trae": {
         "label": "Trae", "dir": "trae", "entry": "trae_proxy.py",
-        "module": "trae_proxy", "port": 8813, "version": "1.7.1", "icon": "trae",
+        "module": "trae_proxy", "port": 8813, "version": "1.7.2", "icon": "trae",
         "service": "trae2api-hub",
     },
 }

@@ -14278,6 +14278,131 @@ def sanitize_text(text, identity=True, billing=True):
     return text.strip()
 
 
+# LOCAL-ZCODE-FILE-COMPAT: WorkBuddy rejects file parts with HTTP 400 / 11101.
+# LOCAL-ZCODE-REFS-V2: resolve only explicit attachments in a request-bound scope.
+from contextvars import ContextVar
+import wb_attachment_extract
+import wb_attachment_refs
+
+_ATTACHMENT_RESOLVER = ContextVar("wb_attachment_resolver", default=None)
+_ATTACHMENT_ITEM_ROUTE = re.compile(r"/(?:v1/)?files/file-[0-9a-f]{32}\Z")
+_INLINE_ATTACHMENT_TYPES = ("file", "input_file")
+_INLINE_ATTACHMENT_MAX = 256 * 1024  # decoded bytes per text attachment
+_ATTACHMENT_TEXT_MIME = frozenset((
+    "application/json", "application/ld+json", "application/xml",
+    "application/yaml", "application/x-yaml", "application/toml",
+    "application/javascript", "application/sql",
+))
+_ATTACHMENT_TEXT_EXT = frozenset((
+    "txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml",
+    "toml", "ini", "cfg", "log", "sql", "py", "js", "ts", "jsx", "tsx", "css",
+    "html", "sh", "ps1", "bat", "c", "h", "cpp", "hpp", "java", "go", "rs",
+    "rb", "php", "kt", "swift", "vue", "svelte", "conf", "diff", "patch",
+))
+
+
+def _attachment_text_part(part):
+    nested = part.get("file")
+    fields = {**part, **nested} if isinstance(nested, dict) else dict(part)
+    if isinstance(nested, str):
+        if nested.startswith("file-"):
+            fields.setdefault("file_id", nested)
+        else:
+            fields.setdefault("path", nested)
+    filename = wb_attachment_refs.filename_of(fields.get("filename") or fields.get("name"))
+    resolver = _ATTACHMENT_RESOLVER.get()
+
+    def label():
+        return "[File attachment: %s]" % json.dumps(filename or "attachment", ensure_ascii=False)
+
+    def unavailable(reason):
+        return {"type": "text", "text": (
+            label() + " Content unavailable (" + reason + "). "
+            "If the file is needed, ask the user to paste its text or upload a readable copy.")}
+
+    mime = (fields.get("mime_type") or fields.get("mimeType")
+            or fields.get("media_type") or fields.get("mediaType"))
+    mime = mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else ""
+    inline = fields.get("file_data") or fields.get("data")
+    if isinstance(inline, str) and (inline.lower().startswith(("https://", "http://", "file://"))
+                                    or re.match(r"^[a-zA-Z]:[\\/]", inline)):
+        fields = dict(fields, file_url=inline)
+        inline = None
+    for key in ("url", "file_url"):
+        if not inline and isinstance(fields.get(key), str) and fields[key][:5].lower() == "data:":
+            inline = fields[key]
+    try:
+        if isinstance(inline, str) and inline:
+            max_file = wb_attachment_refs.MAX_FILE
+            if len(inline) > ((max_file + 2) // 3 * 4 + 512):
+                return unavailable("file exceeds the 8 MiB byte limit")
+            if inline[:5].lower() == "data:":
+                meta, sep, inline = inline[5:].partition(",")
+                if not sep or not meta.lower().endswith(";base64"):
+                    return unavailable("unsupported data URL encoding")
+                mime = meta.split(";", 1)[0].strip().lower() or mime
+            if resolver is not None:
+                resolver.begin_inline(len(inline))
+            raw = base64.b64decode(inline, validate=True)
+            if len(raw) > max_file:
+                return unavailable("file exceeds the 8 MiB byte limit")
+        elif resolver is not None:
+            source_name, source_mime, raw = resolver.resolve(fields)
+            filename = filename or source_name
+            mime = (source_mime or mime).split(";", 1)[0].strip().lower()
+        else:
+            return unavailable("attachment references require an authenticated API request")
+        kind = wb_attachment_extract.kind_for(filename, mime, raw)
+        if kind:
+            if resolver is not None:
+                resolver.begin_extraction()
+            text = wb_attachment_extract.extract(kind, raw)
+        else:
+            suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if not (mime.startswith("text/") or mime in _ATTACHMENT_TEXT_MIME or
+                    (mime in ("", "application/octet-stream") and suffix in _ATTACHMENT_TEXT_EXT)):
+                return unavailable("not a supported inline text or document format")
+            if len(raw) > _INLINE_ATTACHMENT_MAX:
+                return unavailable("file exceeds the 256 KiB text limit")
+            text = raw.decode("utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig")
+            if any(ord(c) < 32 and c not in (chr(9), chr(10), chr(13)) for c in text):
+                return unavailable("binary data is not supported")
+        if resolver is not None:
+            resolver.reserve(len(text.encode("utf-8", "replace")))
+    except (wb_attachment_refs.ReferenceError, wb_attachment_extract.ExtractionError) as exc:
+        return unavailable(str(exc))
+    except (OSError, wb_attachment_refs.sqlite3.Error):
+        return unavailable("attachment storage temporarily unavailable")
+    except (ValueError, UnicodeError):
+        return unavailable("invalid Base64 or unsupported text encoding")
+    if not text:
+        return {"type": "text", "text": label() + " The file is empty."}
+    return {"type": "text", "text": label() + chr(10) + text + chr(10) + "[End file attachment]"}
+
+
+def _normalize_attachment_messages(messages):
+    """Cover all turns, including JSON-string parts recognized by WorkBuddy."""
+    out = []
+    for message in messages:
+        if isinstance(message, dict):
+            content = message.get("content")
+            parts = content if isinstance(content, list) else None
+            if isinstance(content, str) and content.lstrip().startswith("["):
+                parts = _sniffed_parts(content)
+            if parts is not None:
+                normalized = [
+                    _attachment_text_part(part) if isinstance(part, dict)
+                    and part.get("type") in _INLINE_ATTACHMENT_TYPES else part
+                    for part in parts
+                ]
+                if any(a is not b for a, b in zip(parts, normalized)):
+                    message = dict(message)
+                    message["content"] = (normalized if isinstance(content, list)
+                                          else json.dumps(normalized, ensure_ascii=False))
+        out.append(message)
+    return out
+
+
 def sanitize_content(content, identity=True, billing=False):
     if isinstance(content, str):
         return sanitize_message_text(content, identity=identity, billing=billing)
@@ -16137,6 +16262,7 @@ def build_upstream_body(payload):
         elif thinking_type != "disabled" and str(effort or "").strip().lower() != "none":
             thinking_enabled = True
     messages = normalize_roles(payload.get("messages") or [])
+    messages = _normalize_attachment_messages(messages)
     # Prompt mode runs before sanitize/backfill so the gateway prompt is the
     # one the upstream sees, with the client's fingerprint-y system text gone.
     messages = apply_prompt_mode(messages)
@@ -19353,6 +19479,10 @@ def _flatten_content(content):
             t = piece.get("text") or ""
             texts.append(t)
             parts.append({"type": "text", "text": t})
+        elif ptype in _INLINE_ATTACHMENT_TYPES:
+            part = _attachment_text_part(piece)
+            texts.append(part["text"])
+            parts.append(part)
         elif ptype in ("input_image", "image_url", "image") or "image_url" in piece:
             url = piece.get("image_url") or piece.get("url")
             if isinstance(url, dict):
@@ -19986,6 +20116,10 @@ def _responses_input_to_messages(payload):
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
+            if itype in _INLINE_ATTACHMENT_TYPES:
+                messages.append({"role": "user", "content": [_attachment_text_part(item)]})
+                pending_reasoning = ""
+                continue
             if itype in (None, "message", "user"):
                 body = _flatten_content(item.get("content"))
                 role = item.get("role") or "user"
@@ -22691,6 +22825,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if _ATTACHMENT_ITEM_ROUTE.fullmatch(path):
+            return self._attachment_http("GET", path)
         # 媒体任务/目录/产物与文本模型清单、文本统计各走各的入口。
         # 媒体入口上的 /v1/models 必须拒绝，否则客户端会以为这个实例也能对话；
         # 文本入口上的媒体查询同样拒绝，避免把「没有媒体号」误报成媒体功能坏了。
@@ -27796,10 +27932,95 @@ class Handler(BaseHTTPRequestHandler):
                      key=self._key_id(), effort=effort)
         return
 
+    def _attachment_directory(self):
+        return os.path.join(ACCOUNTS_DIR, "attachment_store")
+
+    def _attachment_owner(self):
+        if self.key_entry:
+            return wb_attachment_refs.owner_for(self._supplied_key())
+        return ""
+
+    def _attachment_dispatch(self, handler, *args):
+        directory = self._attachment_directory()
+        owner = self._attachment_owner()
+        peer = (self.client_address or ("",))[0]
+        token = _ATTACHMENT_RESOLVER.set(wb_attachment_refs.Resolver(directory, owner, peer))
+        try:
+            return handler(*args)
+        finally:
+            _ATTACHMENT_RESOLVER.reset(token)
+
+    def _attachment_http(self, method, path):
+        # Files use a real API key (not an anonymous or panel session). On
+        # early upload rejection close rather than draining untrusted framing.
+        self.key_entry = identify_key(self._supplied_key())
+        owner = self._attachment_owner()
+        if method == "POST":
+            self.close_connection = True
+            self._body_consumed = True
+        if not owner:
+            return self._error(401, "a valid API key is required for attachments", "invalid_request_error")
+        store = wb_attachment_refs.Store(self._attachment_directory())
+        try:
+            if method == "GET" or method == "DELETE":
+                ident = path.rsplit("/", 1)[-1]
+                info = store.info(owner, ident)
+                if info is None:
+                    return self._error(404, "file not found or expired", "invalid_request_error")
+                if method == "GET":
+                    return self._json(200, info)
+                if not store.delete(owner, ident):
+                    return self._error(404, "file not found or expired", "invalid_request_error")
+                return self._json(200, {"id": ident, "object": "file", "deleted": True})
+            kind = self.headers.get("Content-Type") or ""
+            limit = wb_attachment_refs.UPLOAD_LIMIT
+            if kind.split(";", 1)[0].lower() == "application/json":
+                limit += wb_attachment_refs.MAX_FILE // 3 + 4
+            lengths = self.headers.get_all("Content-Length") or []
+            if self.headers.get("Transfer-Encoding") or len(lengths) != 1:
+                return self._error(411, "attachment uploads require one Content-Length", "invalid_request_error")
+            if not re.fullmatch(r"[0-9]{1,12}", lengths[0]):
+                return self._error(400, "invalid Content-Length", "invalid_request_error")
+            length = int(lengths[0])
+            if length > limit:
+                return self._error(413, "attachment upload exceeds the 8 MiB file limit", "invalid_request_error")
+            self._handle_expect_continue()
+            data = bytearray()
+            done = time.monotonic() + 20
+            old_timeout = self.connection.gettimeout()
+            try:
+                while len(data) < length:
+                    left = done - time.monotonic()
+                    if left <= 0:
+                        raise TimeoutError()
+                    self.connection.settimeout(min(5, left))
+                    chunk = self.rfile.read1(min(length - len(data), 65536))
+                    if not chunk:
+                        raise wb_attachment_refs.ReferenceError("incomplete upload body")
+                    data.extend(chunk)
+            finally:
+                self.connection.settimeout(old_timeout)
+            name, mime, purpose, raw = wb_attachment_refs.parse_upload(kind, bytes(data))
+            return self._json(200, store.put(owner, name, mime, purpose, raw))
+        except TimeoutError:
+            return self._error(408, "attachment upload timed out", "invalid_request_error")
+        except wb_attachment_refs.ReferenceError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except (OSError, wb_attachment_refs.sqlite3.Error):
+            return self._error(503, "attachment store temporarily unavailable", "server_error")
+
+    def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        if _ATTACHMENT_ITEM_ROUTE.fullmatch(path):
+            return self._attachment_http("DELETE", path)
+        return self._error(404, "not found", "invalid_request_error")
+
     def do_POST(self):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        if path in ("/v1/files", "/files"):
+            return self._attachment_http("POST", path)
         # Arrival trace for the model routes only, before any body work: the
         # chat log line is written after the body is in hand, so a request whose
         # upload is slow (or that a CDN in front of us is still buffering) left
@@ -28077,7 +28298,7 @@ class Handler(BaseHTTPRequestHandler):
                                  stream=payload.get("stream"), key=self._key_id())
                     return self._anthropic_error(503, message, "overloaded_error")
                 try:
-                    return self._handle_messages(payload)
+                    return self._attachment_dispatch(self._handle_messages, payload)
                 finally:
                     _chat_slots.release()
             # Both OpenAI-shaped routes below can hold a thread for up to 600s.
@@ -28087,7 +28308,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, "gateway is at its concurrent chat limit "
                                         "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
             try:
-                return self._dispatch_chat_post(path, payload)
+                return self._attachment_dispatch(self._dispatch_chat_post, path, payload)
             finally:
                 _chat_slots.release()
         finally:
